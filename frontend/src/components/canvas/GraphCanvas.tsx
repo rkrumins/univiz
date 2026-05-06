@@ -69,6 +69,7 @@ import { useSemanticZoom } from '@/hooks/useSemanticZoom'
 import { useCanvasInteractions } from '@/hooks/useCanvasInteractions'
 import { useCanvasKeyboard } from '@/hooks/useCanvasKeyboard'
 import { useLoadingToast } from '@/components/ui/toast'
+import { useNavigateToEntity } from '@/hooks/useNavigateToEntity'
 
 // Stores
 import { useSchemaStore, normalizeEdgeType, useEdgeTypeMetadataMap } from '@/store/schema'
@@ -1030,6 +1031,10 @@ export function GraphCanvas({ className }: { className?: string }) {
   useCanvasKeyboard({ enabled: true, handlers: interactions.keyboardHandlers })
   interactionsRef.current = interactions
 
+  // Backend-driven entity-search navigation.
+  const navigateToEntity = useNavigateToEntity()
+  const primaryContainmentEdgeType = containmentEdgeTypes[0] ?? 'CONTAINS'
+
   // 20. Minimap color
   const minimapNodeColor = useCallback(
     (node: LineageNode) => {
@@ -1336,6 +1341,8 @@ export function GraphCanvas({ className }: { className?: string }) {
       <CommandPalette
         isOpen={interactions.state.commandPalette.isOpen}
         onClose={interactions.closeCommandPalette}
+        initialMode="find"
+        searchScope="global"
         onCreateEntity={(_typeId) => {
           interactions.closeCommandPalette()
           interactions.openQuickCreate({
@@ -1344,6 +1351,14 @@ export function GraphCanvas({ className }: { className?: string }) {
           })
         }}
         onSelectEntity={(entityId) => selectNode(entityId)}
+        onSelectHit={(hit) => {
+          navigateToEntity(hit, {
+            strategy: 'graph',
+            containmentEdgeType: primaryContainmentEdgeType,
+            setExpandedNodes,
+            rfInstance,
+          })
+        }}
       />
 
       {/* Edge Type Picker — ontology-driven relationship selection */}

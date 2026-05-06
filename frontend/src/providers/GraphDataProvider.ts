@@ -532,6 +532,59 @@ export interface TopLevelNodesResult {
 }
 
 // ============================================
+// Entity Search — backend-driven, ancestor-aware
+// ============================================
+
+/**
+ * Request for the rich entity-search endpoint (POST /search/entities).
+ *
+ * Distinct from {@link NodeQuery.searchQuery} (a flat displayName/urn
+ * substring filter). This drives a backend-side search that can match
+ * displayName, qualifiedName, urn, description, tags, and arbitrary
+ * property values, and returns each hit's containment ancestor chain
+ * inline so the UI can lazy-expand the canvas to a deep result without
+ * an N+1 ancestor round-trip per hit.
+ */
+export interface EntitySearchRequest {
+    query: string
+    limit?: number
+    offset?: number
+    entityTypes?: EntityType[]
+    /** Optional view scope; backend may use it to restrict results to a view's data slice. */
+    viewId?: string | null
+    /** Default true — populates `ancestorChain` on each hit. */
+    includeAncestors?: boolean
+    /**
+     * When omitted, providers search a sensible default field set:
+     *   ["displayName", "urn", "qualifiedName", "description", "tags", "properties"]
+     */
+    searchFields?: string[]
+}
+
+/** Where a hit matched and a snippet for the UI. */
+export interface EntitySearchMatch {
+    /** "displayName" | "urn" | "qualifiedName" | "description" | "tags" | "properties.<key>" */
+    field: string
+    snippet: string
+    score: number
+}
+
+/** A single hit plus the containment chain leading to it (root → immediate parent). */
+export interface EntitySearchHit {
+    node: GraphNode
+    ancestorChain: GraphNode[]
+    matches: EntitySearchMatch[]
+}
+
+export interface EntitySearchResponse {
+    hits: EntitySearchHit[]
+    /** -1 when the provider can't compute a total cheaply. */
+    total: number
+    hasMore: boolean
+    tookMs: number
+}
+
+// ============================================
 // Provider Interface
 // ============================================
 
@@ -564,6 +617,19 @@ export interface GraphDataProvider {
      * Search nodes by text query
      */
     searchNodes(query: string, limit?: number): Promise<GraphNode[]>
+
+    /**
+     * Backend-driven entity search across multiple fields with inline
+     * containment ancestor chains. Unlike {@link searchNodes}, this is
+     * designed to find entities anywhere in the graph — including in
+     * collapsed/lazy-loaded subtrees — and to give the UI everything it
+     * needs to navigate to a result by expanding the canvas to it.
+     *
+     * Optional with a fallback: callers MAY provide their own implementation
+     * by composing searchNodes + getAncestors, but providers SHOULD push
+     * matching down to the database for relevance scoring and performance.
+     */
+    searchEntities?(request: EntitySearchRequest): Promise<EntitySearchResponse>
 
     // ==========================================
     // Edge Operations

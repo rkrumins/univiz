@@ -20,9 +20,10 @@ from ..models.graph import (
     AggregatedEdgeResult, AggregatedEdgeInfo,
     ChildrenWithEdgesResult, TopLevelNodesResult,
     TraceResult, TraceFocus,
+    EntitySearchRequest, EntitySearchHit, EntitySearchResponse,
 )
 from .base import GraphDataProvider
-from backend.common.interfaces.provider import ProviderConfigurationError
+from backend.common.interfaces.provider import ProviderConfigurationError, _default_match_for
 
 logger = logging.getLogger(__name__)
 
@@ -835,6 +836,108 @@ class FalkorDBProvider(GraphDataProvider):
     async def search_nodes(self, query: str, limit: int = 10, offset: int = 0) -> List[GraphNode]:
         q = NodeQuery(search_query=query, limit=limit, offset=offset)
         return await self.get_nodes(q)
+
+    async def search_entities(self, request: EntitySearchRequest) -> EntitySearchResponse:
+        """Backend-driven entity search across multiple fields.
+
+        Extends the displayName/urn substring match used by ``search_nodes``
+        to also match qualifiedName, description, tags (JSON-encoded
+        substring), and properties (JSON-encoded substring — covers both
+        keys and values). The properties/tags JSON-string trick avoids any
+        write-time schema change at the cost of false positives on JSON
+        scaffolding (``{"`` etc.) — query strings of one or two characters
+        are best filtered upstream.
+        """
+        await self._ensure_connected()
+        t0 = time.perf_counter()
+
+        q_lower = request.query.lower().strip()
+        if not q_lower:
+            return EntitySearchResponse(hits=[], total=-1, has_more=False, took_ms=0)
+
+        params: Dict[str, Any] = {
+            "search": q_lower,
+            "skip": int(request.offset),
+            "limit": int(request.limit),
+        }
+
+        # Map each requested search field to a Cypher predicate.
+        field_predicates = {
+            "displayName": "toLower(toString(n.displayName)) CONTAINS $search",
+            "urn": "toLower(toString(n.urn)) CONTAINS $search",
+            "qualifiedName": "(n.qualifiedName IS NOT NULL AND toLower(toString(n.qualifiedName)) CONTAINS $search)",
+            "description": "(n.description IS NOT NULL AND toLower(toString(n.description)) CONTAINS $search)",
+            "tags": "(n.tags IS NOT NULL AND toLower(toString(n.tags)) CONTAINS $search)",
+            "properties": "(n.properties IS NOT NULL AND toLower(toString(n.properties)) CONTAINS $search)",
+        }
+        requested = request.search_fields or list(field_predicates.keys())
+        where_parts = [field_predicates[f] for f in requested if f in field_predicates]
+        if not where_parts:
+            return EntitySearchResponse(hits=[], total=-1, has_more=False, took_ms=0)
+        where = "(" + " OR ".join(where_parts) + ")"
+
+        # Push entity_types filter into the Cypher to leverage label indices.
+        if request.entity_types:
+            union_branches = [
+                f"MATCH (n:{_sanitize_label(t)}) WHERE {where} RETURN n"
+                for t in request.entity_types
+            ]
+            cypher = (
+                f"CALL {{ {' UNION '.join(union_branches)} }} "
+                f"WITH n ORDER BY n.displayName SKIP $skip LIMIT $limit RETURN n"
+            )
+        else:
+            cypher = (
+                f"MATCH (n) WHERE {where} "
+                f"WITH n ORDER BY n.displayName SKIP $skip LIMIT $limit RETURN n"
+            )
+
+        try:
+            result = await self._ro_query(cypher, params=params)
+        except Exception as e:
+            logger.warning("search_entities query failed: %s", e)
+            return EntitySearchResponse(
+                hits=[], total=-1, has_more=False,
+                took_ms=int((time.perf_counter() - t0) * 1000),
+            )
+
+        nodes: List[GraphNode] = []
+        for row in (result.result_set or []):
+            n = self._extract_node_from_result(row)
+            if n:
+                nodes.append(n)
+
+        # Approximation: a full page implies more may exist. Exact totals
+        # require a COUNT query — too expensive at million-node scale.
+        has_more = len(nodes) >= request.limit
+
+        # Fetch ancestor chains in parallel — get_ancestors is Redis-cached
+        # so this is essentially free for already-traced nodes.
+        if request.include_ancestors and nodes:
+            chains = await asyncio.gather(
+                *(self.get_ancestors(n.urn, limit=50) for n in nodes),
+                return_exceptions=True,
+            )
+        else:
+            chains = [[] for _ in nodes]
+
+        hits: List[EntitySearchHit] = []
+        for node, chain in zip(nodes, chains):
+            # get_ancestors returns parent → grandparent → root; reverse to
+            # get root → immediate parent (the contract on EntitySearchHit).
+            ancestor_chain = list(reversed(chain)) if isinstance(chain, list) else []
+            hits.append(EntitySearchHit(
+                node=node,
+                ancestor_chain=ancestor_chain,
+                matches=[_default_match_for(node, q_lower)],
+            ))
+
+        return EntitySearchResponse(
+            hits=hits,
+            total=-1,
+            has_more=has_more,
+            took_ms=int((time.perf_counter() - t0) * 1000),
+        )
 
     async def get_edges(self, query: EdgeQuery) -> List[GraphEdge]:
         await self._ensure_connected()

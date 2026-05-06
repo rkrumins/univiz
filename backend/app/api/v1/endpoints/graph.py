@@ -19,6 +19,7 @@ from backend.app.models.graph import (
     BatchCommandRequest, BatchCommandResult, BatchResponse,
     ChildrenWithEdgesResult, TopLevelNodesResult,
     TraceRequest, TraceResult, ExpandRequest,
+    EntitySearchRequest, EntitySearchResponse,
 )
 from backend.common.interfaces.provider import ProviderConfigurationError
 from backend.app.services.context_engine import ContextEngine
@@ -323,6 +324,22 @@ async def search_nodes(
     engine: ContextEngine = Depends(get_context_engine),
 ):
     return await engine.search_nodes(query, limit=limit, offset=offset)
+
+
+@router.post("/search/entities", response_model=EntitySearchResponse, response_model_by_alias=True)
+async def search_entities(
+    request: EntitySearchRequest,
+    engine: ContextEngine = Depends(get_context_engine),
+):
+    """Backend-driven entity search across multiple fields.
+
+    Returns hits with their containment ancestor chain inline so the frontend
+    can lazy-expand the canvas to a result that lives many levels deep —
+    no client-side N+1 round-trips for ancestors. Matches displayName, urn,
+    qualifiedName, description, tags, and property values (Neo4j: via the
+    ``idx_entity_search`` fulltext index; FalkorDB: via multi-field CONTAINS).
+    """
+    return await engine.search_entities(request)
 
 
 @router.get("/edges", response_model=List[GraphEdge], response_model_by_alias=True,

@@ -43,6 +43,10 @@ from backend.common.models.graph import (
     TraceRequest,
     TraceResult,
     ExpandRequest,
+    EntitySearchRequest,
+    EntitySearchMatch,
+    EntitySearchHit,
+    EntitySearchResponse,
 )
 
 __all__ = [
@@ -59,4 +63,5 @@ __all__ = [
     "AggregatedEdgeRequest", "AggregatedEdgeInfo", "AggregatedEdgeResult",
     "CreateNodeRequest", "CreateNodeResult",
     "TraceFocus", "TraceRequest", "TraceResult", "ExpandRequest",
+    "EntitySearchRequest", "EntitySearchMatch", "EntitySearchHit", "EntitySearchResponse",
 ]

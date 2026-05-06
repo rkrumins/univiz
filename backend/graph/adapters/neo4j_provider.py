@@ -26,7 +26,7 @@ import time
 from collections import OrderedDict, defaultdict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
-from backend.common.interfaces.provider import GraphDataProvider
+from backend.common.interfaces.provider import GraphDataProvider, _default_match_for
 from backend.common.models.graph import (
     GraphNode, GraphEdge, NodeQuery, EdgeQuery,
     LineageResult, GraphSchemaStats,
@@ -35,6 +35,7 @@ from backend.common.models.graph import (
     OntologyMetadata, EdgeTypeMetadata, EntityTypeHierarchy,
     AggregatedEdgeResult, AggregatedEdgeInfo,
     TraceResult, TraceFocus,
+    EntitySearchRequest, EntitySearchHit, EntitySearchResponse,
 )
 from .schema_mapping import SchemaMapping, map_node_props, map_edge_props
 
@@ -501,6 +502,37 @@ class Neo4jProvider(GraphDataProvider):
                 except Exception:
                     pass  # Index may already exist or label may not exist yet
 
+        # Fulltext index spanning every mapped label and the search-relevant
+        # properties. Powers /search/entities — Lucene relevance scoring,
+        # prefix queries, and tokenized matching against the JSON-encoded
+        # ``properties`` blob (so property values are searchable without a
+        # write-time schema change). Silent failure when the Neo4j edition
+        # doesn't support fulltext (search_entities falls back to CONTAINS).
+        if labels:
+            ft_props = [
+                self._mapping.display_name_field,
+                self._mapping.qualified_name_field,
+                self._mapping.description_field,
+                self._mapping.tags_field,
+                self._mapping.identity_field,  # urn
+                "properties",  # JSON-encoded blob — canonical name, never mapped
+            ]
+            seen_props: set = set()
+            unique_props = []
+            for p in ft_props:
+                if p and p not in seen_props:
+                    seen_props.add(p)
+                    unique_props.append(p)
+            label_clause = "|".join(f"`{_sanitize_label(l)}`" for l in labels)
+            on_each = ", ".join(f"n.`{p}`" for p in unique_props)
+            try:
+                await self._run_write(
+                    f"CREATE FULLTEXT INDEX idx_entity_search IF NOT EXISTS "
+                    f"FOR (n:{label_clause}) ON EACH [{on_each}]"
+                )
+            except Exception as e:
+                logger.info("Fulltext index creation skipped: %s", e)
+
     # ------------------------------------------------------------------ #
     # Filter matching (Python-side post-filters)                           #
     # ------------------------------------------------------------------ #
@@ -687,6 +719,153 @@ class Neo4jProvider(GraphDataProvider):
 
     async def search_nodes(self, query: str, limit: int = 10) -> List[GraphNode]:
         return await self.get_nodes(NodeQuery(search_query=query, limit=limit))
+
+    async def search_entities(self, request: EntitySearchRequest) -> EntitySearchResponse:
+        """Backend-driven entity search using the fulltext index.
+
+        Strategy:
+          1. Try the ``idx_entity_search`` fulltext index (Lucene-scored,
+             tokenized — covers displayName, qualifiedName, urn, description,
+             tags, and the JSON-encoded ``properties`` blob).
+          2. If the index is missing or fulltext isn't supported, fall back
+             to the same multi-field CONTAINS pattern used by the FalkorDB
+             provider so functionality degrades gracefully on Community
+             edition or freshly-provisioned databases.
+
+        The user query is escaped against Lucene's reserved-character set
+        and a trailing ``*`` is appended to give prefix matching (so typing
+        "mark" finds "marketing" — the standard search-UX expectation).
+        """
+        t0 = time.perf_counter()
+        q_lower = (request.query or "").lower().strip()
+        if not q_lower:
+            return EntitySearchResponse(hits=[], total=-1, has_more=False, took_ms=0)
+
+        nodes, has_more = await self._search_entities_fulltext(q_lower, request)
+        if nodes is None:
+            nodes, has_more = await self._search_entities_fallback(q_lower, request)
+
+        if request.entity_types:
+            allowed = {t.lower() for t in request.entity_types}
+            nodes = [n for n in nodes if n.entity_type.lower() in allowed]
+
+        if request.include_ancestors and nodes:
+            chains = await asyncio.gather(
+                *(self.get_ancestors(n.urn, limit=50) for n in nodes),
+                return_exceptions=True,
+            )
+        else:
+            chains = [[] for _ in nodes]
+
+        hits: List[EntitySearchHit] = []
+        for node, chain in zip(nodes, chains):
+            ancestor_chain = list(reversed(chain)) if isinstance(chain, list) else []
+            hits.append(EntitySearchHit(
+                node=node,
+                ancestor_chain=ancestor_chain,
+                matches=[_default_match_for(node, q_lower)],
+            ))
+
+        return EntitySearchResponse(
+            hits=hits,
+            total=-1,
+            has_more=has_more,
+            took_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+    @staticmethod
+    def _escape_lucene(query: str) -> str:
+        """Escape Lucene reserved characters so the user's literal text doesn't break the parser."""
+        # https://lucene.apache.org/core/9_0_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html
+        reserved = r'+-&|!(){}[]^"~*?:\/'
+        out = []
+        for ch in query:
+            if ch in reserved:
+                out.append("\\" + ch)
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    async def _search_entities_fulltext(
+        self, q_lower: str, request: EntitySearchRequest,
+    ) -> tuple[Optional[List[GraphNode]], bool]:
+        """Try the fulltext index. Returns (None, False) when it's unavailable."""
+        escaped = self._escape_lucene(q_lower)
+        # Append wildcard for prefix matching ("mark" → matches "marketing").
+        # Multi-token queries get OR-joined wildcards.
+        tokens = [t for t in escaped.split() if t]
+        if not tokens:
+            return [], False
+        lucene_query = " OR ".join(f"{t}*" for t in tokens)
+
+        params: Dict[str, Any] = {
+            "q": lucene_query,
+            "skip": int(request.offset),
+            "limit": int(request.limit) + 1,  # +1 to detect has_more without a count query
+        }
+        cypher = (
+            "CALL db.index.fulltext.queryNodes('idx_entity_search', $q) "
+            "YIELD node, score "
+            "RETURN node, score "
+            "ORDER BY score DESC "
+            "SKIP $skip LIMIT $limit"
+        )
+        try:
+            rows = await self._run_read(cypher, params)
+        except Exception as e:
+            logger.info("Fulltext search unavailable, falling back to CONTAINS: %s", e)
+            return None, False
+
+        nodes: List[GraphNode] = []
+        for row in rows:
+            n = self._extract_node_from_record(row["node"])
+            if n:
+                nodes.append(n)
+        has_more = len(nodes) > request.limit
+        return nodes[: request.limit], has_more
+
+    async def _search_entities_fallback(
+        self, q_lower: str, request: EntitySearchRequest,
+    ) -> tuple[List[GraphNode], bool]:
+        """Multi-field CONTAINS fallback (same shape as the FalkorDB impl)."""
+        ip = self._id_prop()
+        name_field = self._mapping.display_name_field
+        qname_field = self._mapping.qualified_name_field
+        desc_field = self._mapping.description_field
+        tags_field = self._mapping.tags_field
+
+        field_predicates = {
+            "displayName": f"toLower(toString(n.`{name_field}`)) CONTAINS $search",
+            "urn": f"toLower(toString(n.{ip})) CONTAINS $search",
+            "qualifiedName": f"(n.`{qname_field}` IS NOT NULL AND toLower(toString(n.`{qname_field}`)) CONTAINS $search)",
+            "description": f"(n.`{desc_field}` IS NOT NULL AND toLower(toString(n.`{desc_field}`)) CONTAINS $search)",
+            "tags": f"(n.`{tags_field}` IS NOT NULL AND toLower(toString(n.`{tags_field}`)) CONTAINS $search)",
+            "properties": "(n.properties IS NOT NULL AND toLower(toString(n.properties)) CONTAINS $search)",
+        }
+        requested = request.search_fields or list(field_predicates.keys())
+        where_parts = [field_predicates[f] for f in requested if f in field_predicates]
+        if not where_parts:
+            return [], False
+        where = "(" + " OR ".join(where_parts) + ")"
+
+        params = {"search": q_lower, "skip": int(request.offset), "limit": int(request.limit) + 1}
+        cypher = (
+            f"MATCH (n) WHERE {where} "
+            f"RETURN n ORDER BY n.`{name_field}` SKIP $skip LIMIT $limit"
+        )
+        try:
+            rows = await self._run_read(cypher, params)
+        except Exception as e:
+            logger.warning("search_entities fallback failed: %s", e)
+            return [], False
+
+        nodes: List[GraphNode] = []
+        for row in rows:
+            n = self._extract_node_from_record(row["n"])
+            if n:
+                nodes.append(n)
+        has_more = len(nodes) > request.limit
+        return nodes[: request.limit], has_more
 
     # ================================================================== #
     # Edge Operations                                                      #

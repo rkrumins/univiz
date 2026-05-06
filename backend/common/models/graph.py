@@ -192,6 +192,64 @@ class ChildrenWithEdgesResult(BaseModel):
         populate_by_name = True
 
 
+# ============================================
+# Entity Search Models — backend-driven global search
+# ============================================
+
+class EntitySearchRequest(BaseModel):
+    """Request for the rich entity-search endpoint.
+
+    Distinct from ``NodeQuery.search_query`` (which is a flat ``CONTAINS`` over
+    displayName + urn). This drives a backend-side search that:
+      - matches displayName, qualifiedName, urn, description, tags, and the
+        entries of ``properties`` (subject to ``search_fields``);
+      - returns each hit's containment ancestor chain inline so the frontend
+        can lazy-expand to deep results without an N+1 round-trip.
+    """
+    query: str
+    limit: int = Field(20, ge=1, le=200)
+    offset: int = Field(0, ge=0)
+    entity_types: Optional[List[str]] = Field(None, alias="entityTypes")
+    view_id: Optional[str] = Field(None, alias="viewId")
+    include_ancestors: bool = Field(True, alias="includeAncestors")
+    # When None, providers search a sensible default field set:
+    #   ["displayName", "urn", "qualifiedName", "description", "tags", "properties"]
+    search_fields: Optional[List[str]] = Field(None, alias="searchFields")
+
+    class Config:
+        populate_by_name = True
+
+
+class EntitySearchMatch(BaseModel):
+    """Where a hit matched and a snippet for the UI."""
+    field: str  # "displayName" | "urn" | "qualifiedName" | "description" | "tags" | "properties.<key>"
+    snippet: str
+    score: float = 0.0
+
+
+class EntitySearchHit(BaseModel):
+    """One search hit + the containment chain leading to it."""
+    node: GraphNode
+    # Ordered root → immediate parent. Empty when the hit is itself a root or
+    # when ``include_ancestors=False`` was requested.
+    ancestor_chain: List[GraphNode] = Field(default_factory=list, alias="ancestorChain")
+    matches: List[EntitySearchMatch] = Field(default_factory=list)
+
+    class Config:
+        populate_by_name = True
+
+
+class EntitySearchResponse(BaseModel):
+    hits: List[EntitySearchHit]
+    # ``-1`` when the provider can't compute a total cheaply.
+    total: int = -1
+    has_more: bool = Field(False, alias="hasMore")
+    took_ms: int = Field(0, alias="tookMs")
+
+    class Config:
+        populate_by_name = True
+
+
 class TopLevelNodesResult(BaseModel):
     """Paginated list of instances that have no incoming containment edge.
 

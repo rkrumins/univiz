@@ -27,6 +27,7 @@ import { QuickCreateNode } from './QuickCreateNode'
 import { CommandPalette } from './CommandPalette'
 import { useCanvasInteractions } from '@/hooks/useCanvasInteractions'
 import { useCanvasKeyboard } from '@/hooks/useCanvasKeyboard'
+import { useNavigateToEntity } from '@/hooks/useNavigateToEntity'
 
 // Editor components (shared across canvases)
 import { EditorToolbar } from './EditorToolbar'
@@ -120,6 +121,11 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     onTraceNode: (nodeId) => trace.startTrace(nodeId),
     onNodeCreated: (nodeId) => selectNode(nodeId),
   })
+
+  // Backend-driven entity-search navigation.
+  const navigateToEntity = useNavigateToEntity()
+  const primaryContainmentEdgeType = containmentEdgeTypes[0] ?? 'CONTAINS'
+  const activeView = useSchemaStore((s) => s.getActiveView())
 
   // Keyboard shortcuts
   useCanvasKeyboard({
@@ -506,15 +512,25 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
         variant="centered"
       />
 
-      {/* Command Palette - Press Cmd+K */}
+      {/* Command Palette - Press Cmd+K (defaults to entity search) */}
       <CommandPalette
         isOpen={interactions.state.commandPalette.isOpen}
         onClose={interactions.closeCommandPalette}
-        onCreateEntity={(typeId) => {
+        initialMode="find"
+        searchScope="view"
+        viewId={activeView?.id ?? null}
+        onCreateEntity={(_typeId) => {
           interactions.closeCommandPalette()
           interactions.openQuickCreate({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
         }}
         onSelectEntity={(entityId) => selectNode(entityId)}
+        onSelectHit={(hit) => {
+          navigateToEntity(hit, {
+            strategy: 'hierarchy',
+            containmentEdgeType: primaryContainmentEdgeType,
+            setExpandedNodes,
+          })
+        }}
       />
     </div>
   )

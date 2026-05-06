@@ -10,6 +10,7 @@ from ..models.graph import (
     RelationshipVisualSchema, FieldSchema, AggregatedEdgeRequest, AggregatedEdgeResult, AggregatedEdgeInfo,
     CreateNodeRequest, CreateNodeResult, ChildrenWithEdgesResult, TopLevelNodesResult,
     TraceRequest, TraceResult, ExpandRequest,
+    EntitySearchRequest, EntitySearchResponse,
 )
 
 from ..providers.base import GraphDataProvider
@@ -323,6 +324,9 @@ class ContextEngine:
 
     async def search_nodes(self, query: str, limit: int = 10, offset: int = 0) -> List[GraphNode]:
         return await self.provider.search_nodes(query, limit=limit, offset=offset)
+
+    async def search_entities(self, request: EntitySearchRequest) -> EntitySearchResponse:
+        return await self.provider.search_entities(request)
     
     async def get_stats(self) -> Dict[str, Any]:
         return await self.provider.get_stats()

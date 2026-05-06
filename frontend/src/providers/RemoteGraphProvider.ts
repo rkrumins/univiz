@@ -27,6 +27,8 @@ import type {
     CreateNodeResult,
     TopLevelNodesQuery,
     TopLevelNodesResult,
+    EntitySearchRequest,
+    EntitySearchResponse,
 } from './GraphDataProvider'
 
 // Wire shape from POST /trace/v2 — `upstreamUrns`/`downstreamUrns` arrive as
@@ -228,6 +230,13 @@ export class RemoteGraphProvider implements GraphDataProvider {
         return await this.fetch<GraphNode[]>('/search', {
             method: 'POST',
             body: JSON.stringify({ query, limit }),
+        })
+    }
+
+    async searchEntities(request: EntitySearchRequest): Promise<EntitySearchResponse> {
+        return await this.fetch<EntitySearchResponse>('/search/entities', {
+            method: 'POST',
+            body: JSON.stringify(request),
         })
     }
 

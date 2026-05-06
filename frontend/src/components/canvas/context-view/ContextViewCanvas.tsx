@@ -52,6 +52,7 @@ import { QuickCreateNode } from '../QuickCreateNode'
 import { CommandPalette } from '../CommandPalette'
 import { useCanvasInteractions } from '@/hooks/useCanvasInteractions'
 import { useCanvasKeyboard } from '@/hooks/useCanvasKeyboard'
+import { useNavigateToEntity } from '@/hooks/useNavigateToEntity'
 
 // Editor components (shared across canvases)
 import { EditorToolbar } from '../EditorToolbar'
@@ -448,6 +449,11 @@ export function ContextViewCanvas({
   }, [nodes, interactions])
 
 
+
+  // Backend-driven entity-search navigation: hydrates ancestors, expands
+  // the chain, and scrolls the target into view.
+  const navigateToEntity = useNavigateToEntity()
+  const primaryContainmentEdgeType = containmentEdgeTypes[0] ?? 'CONTAINS'
 
   // Edge details
   const { isOpen: isEdgePanelOpen, toggle: toggleEdgePanel, close: closeEdgePanel } = useEdgeDetailPanel()
@@ -1373,15 +1379,25 @@ export function ContextViewCanvas({
         variant="centered"
       />
 
-      {/* Command Palette - Press Cmd+K */}
+      {/* Command Palette - Press Cmd+K (defaults to entity search) */}
       <CommandPalette
         isOpen={interactions.state.commandPalette.isOpen}
         onClose={interactions.closeCommandPalette}
+        initialMode="find"
+        searchScope="view"
+        viewId={activeView?.id ?? null}
         onCreateEntity={(_typeId) => {
           interactions.closeCommandPalette()
           interactions.openQuickCreate({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
         }}
         onSelectEntity={(entityId) => selectNode(entityId)}
+        onSelectHit={(hit) => {
+          navigateToEntity(hit, {
+            strategy: 'context-view',
+            containmentEdgeType: primaryContainmentEdgeType,
+            setExpandedNodes,
+          })
+        }}
       />
     </div>
   )

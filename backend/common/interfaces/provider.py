@@ -10,6 +10,7 @@ from ..models.graph import (
     LineageResult, GraphSchemaStats, OntologyMetadata,
     ChildrenWithEdgesResult, TopLevelNodesResult,
     TraceResult,
+    EntitySearchRequest, EntitySearchHit, EntitySearchMatch, EntitySearchResponse,
 )
 
 
@@ -27,6 +28,45 @@ class ProviderConfigurationError(RuntimeError):
     hardcoded defaults.
     """
     pass
+
+
+def _default_match_for(node: GraphNode, q_lower: str) -> EntitySearchMatch:
+    """Best-effort match field/snippet detection for the default search impl.
+
+    Used by :meth:`GraphDataProvider.search_entities` when the provider has no
+    native fulltext index — we need *something* to populate ``matches[].field``
+    so the UI can render a "matched in X" pill. Concrete providers should
+    return real matches with proper scores from their index.
+    """
+    def _snippet(text: str) -> str:
+        idx = text.lower().find(q_lower)
+        if idx < 0:
+            return text[:80]
+        start = max(0, idx - 30)
+        end = min(len(text), idx + len(q_lower) + 30)
+        return ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+
+    if node.display_name and q_lower in node.display_name.lower():
+        return EntitySearchMatch(field="displayName", snippet=_snippet(node.display_name), score=1.0)
+    if q_lower in node.urn.lower():
+        return EntitySearchMatch(field="urn", snippet=_snippet(node.urn), score=0.7)
+    if node.qualified_name and q_lower in node.qualified_name.lower():
+        return EntitySearchMatch(field="qualifiedName", snippet=_snippet(node.qualified_name), score=0.6)
+    if node.description and q_lower in node.description.lower():
+        return EntitySearchMatch(field="description", snippet=_snippet(node.description), score=0.5)
+    for tag in node.tags or []:
+        if q_lower in tag.lower():
+            return EntitySearchMatch(field="tags", snippet=tag, score=0.4)
+    for key, val in (node.properties or {}).items():
+        try:
+            sval = str(val)
+        except Exception:
+            continue
+        if q_lower in sval.lower():
+            return EntitySearchMatch(field=f"properties.{key}", snippet=_snippet(sval), score=0.3)
+    # No discoverable substring match (the provider must have matched on a
+    # field we don't know about — e.g. an indexed token). Fall back to name.
+    return EntitySearchMatch(field="displayName", snippet=node.display_name or node.urn, score=0.1)
 
 
 class GraphDataProvider(ABC):
@@ -64,6 +104,72 @@ class GraphDataProvider(ABC):
     @abstractmethod
     async def search_nodes(self, query: str, limit: int = 10) -> List[GraphNode]:
         pass
+
+    async def search_entities(self, request: EntitySearchRequest) -> EntitySearchResponse:
+        """Backend-driven entity search with inline ancestor chains.
+
+        The default implementation delegates to :meth:`search_nodes` (so any
+        concrete provider works out-of-the-box) and then fans out to
+        :meth:`get_ancestors` in parallel to attach each hit's containment
+        chain. Providers SHOULD override with a single-query implementation
+        that uses native fulltext indexing (Neo4j ``db.index.fulltext`` /
+        FalkorDB / RediSearch) and returns hits + ancestors in one round-trip.
+
+        ``request.search_fields`` is advisory: the default impl can only match
+        whatever ``search_nodes`` matches (typically displayName + urn). Fancy
+        per-field matching is the override's responsibility.
+
+        Returns ``EntitySearchResponse`` with ``total = -1`` when the
+        underlying provider can't compute a total cheaply.
+        """
+        import asyncio
+        import time
+
+        t0 = time.perf_counter()
+        # ``search_nodes`` doesn't expose offset on its abstract signature, so
+        # request limit + offset worth of nodes and slice. Concrete impls that
+        # natively support offset (FalkorDB) ignore this slice cost.
+        page_size = request.limit + request.offset
+        try:
+            raw_nodes = await self.search_nodes(request.query, limit=page_size)
+        except TypeError:
+            # Fallback for impls that accept extra kwargs differently.
+            raw_nodes = await self.search_nodes(request.query, page_size)
+
+        # Optional entity-type filter (post-filter — the abstract search_nodes
+        # signature has no entity_types param; overrides should push this down).
+        if request.entity_types:
+            allowed = {t.lower() for t in request.entity_types}
+            raw_nodes = [n for n in raw_nodes if n.entity_type.lower() in allowed]
+
+        sliced = raw_nodes[request.offset : request.offset + request.limit]
+        has_more = len(raw_nodes) > request.offset + request.limit
+
+        # Attach ancestor chains in parallel.
+        if request.include_ancestors and sliced:
+            chains = await asyncio.gather(
+                *(self.get_ancestors(n.urn, limit=50) for n in sliced),
+                return_exceptions=True,
+            )
+        else:
+            chains = [[]] * len(sliced)
+
+        hits: List[EntitySearchHit] = []
+        q_lower = request.query.lower()
+        for node, chain in zip(sliced, chains):
+            ancestor_chain = list(reversed(chain)) if isinstance(chain, list) else []
+            hits.append(EntitySearchHit(
+                node=node,
+                ancestor_chain=ancestor_chain,
+                matches=[_default_match_for(node, q_lower)],
+            ))
+
+        return EntitySearchResponse(
+            hits=hits,
+            total=-1,
+            has_more=has_more,
+            took_ms=int((time.perf_counter() - t0) * 1000),
+        )
 
     # ==========================================
     # Edge Operations
