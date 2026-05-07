@@ -146,6 +146,33 @@
     }
   }
 
+  /* === Cinematic Trace Mode ===
+     When `data-trace-active="true"` is set on a canvas root, the focus
+     node pulses with an accent-lineage halo and trace-incident edges get
+     a soft drop-shadow glow. Non-trace nodes are not dimmed here because
+     useTraceFilteredHierarchy already removes them from the render tree
+     in ContextViewCanvas. */
+  [data-trace-active="true"] [data-trace-focus="true"] {
+    animation: trace-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes trace-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 3px var(--nx-accent-lineage), 0 0 22px rgba(99, 102, 241, 0.45);
+    }
+    50% {
+      box-shadow: 0 0 0 3px var(--nx-accent-lineage), 0 0 36px rgba(99, 102, 241, 0.75);
+    }
+  }
+  .nx-edge-trace {
+    filter: drop-shadow(0 0 6px rgba(99, 102, 241, 0.7));
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-trace-active="true"] [data-trace-focus="true"] {
+      animation: none;
+      box-shadow: 0 0 0 3px var(--nx-accent-lineage), 0 0 28px rgba(99, 102, 241, 0.6);
+    }
+  }
+
   /* Edge confidence gradients */
   .nx-edge-high-confidence {
     stroke: var(--nx-accent-lineage);

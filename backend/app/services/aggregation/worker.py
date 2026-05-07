@@ -160,6 +160,36 @@ class AggregationWorker:
                 if not lineage_types:
                     raise ValueError("No lineage edge types configured — cannot aggregate")
 
+                # Worker-side gate re-validation. Closes the trigger →
+                # pickup race: if the user edited the ontology between
+                # ``trigger`` (which froze the edge types) and now, the
+                # frozen lists may no longer match the user's intent.
+                # Compare the fingerprint computed at trigger time to a
+                # fresh one over the pinned ontology row — any drift
+                # fails the job with an actionable reason rather than
+                # silently producing aggregations against a stale shape.
+                # Old jobs that pre-date the fingerprint column skip
+                # the check (NULL == "no fingerprint, trust the freeze").
+                if job.ontology_fingerprint and job.ontology_id:
+                    from backend.app.db.models import OntologyORM
+                    from backend.app.ontology import gate as _ontology_gate
+                    pinned = await session.get(OntologyORM, job.ontology_id)
+                    if pinned is None:
+                        raise ValueError(
+                            "ontology_resolution_changed: pinned ontology "
+                            f"{job.ontology_id!r} no longer exists"
+                        )
+                    current_fp = _ontology_gate.compute_fingerprint_from_ontology_orm(
+                        pinned
+                    )
+                    if current_fp != job.ontology_fingerprint:
+                        raise ValueError(
+                            "ontology_resolution_changed: assigned ontology "
+                            f"{job.ontology_id!r} has been edited since the "
+                            "job was triggered; retrigger to pick up the new "
+                            "containment / lineage classifications"
+                        )
+
                 # Get provider for this data source.
                 #
                 # P2.5 — implicit preflight gate. The manager's
@@ -184,6 +214,17 @@ class AggregationWorker:
                 # Configure the provider with the data source's specific structural mapping
                 # so physical queries can correctly differentiate lineage vs containment
                 provider.set_containment_edge_types(containment_types)
+
+                # Wipe the per-graph ancestors cache before materializing.
+                # The cache is intra-job memoization (see provider docs):
+                # persisting it across jobs lets a prior run with stale
+                # ``containment_edge_types`` (e.g. empty list before the
+                # user flagged ``is_containment``) leak ``[]`` ancestor
+                # chains into this run via cache hits, which collapses
+                # AGGREGATED edge generation to leaf-to-leaf only.
+                # Best-effort: provider swallows Redis errors.
+                if hasattr(provider, "reset_ancestors_cache"):
+                    await provider.reset_ancestors_cache()
 
                 # Compute fingerprint before aggregation
                 job.graph_fingerprint_before = await compute_graph_fingerprint(provider)

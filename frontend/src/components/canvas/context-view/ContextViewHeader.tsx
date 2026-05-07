@@ -9,9 +9,9 @@ import { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { TraceToolbar } from '../TraceToolbar'
 import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from './types'
+import { TraceContextViewSurface } from '../trace/TraceContextViewSurface'
 
 /** Minimal entity type shape needed for the granularity selector. */
 export interface GranularityOption {
@@ -64,6 +64,12 @@ export interface ContextViewHeaderProps {
   focusNodeName: string
   lineageEdgeTypes: string[]
   onExitTrace: () => void
+  /** id → HierarchyNode lookup, used by the trace surface to resolve names. */
+  displayMap: Map<string, HierarchyNode>
+  /** Edge color resolver from the active ontology — drives the trace edge-type chips. */
+  resolveEdgeColor: (edgeType: string) => string
+  /** Jump trace focus to a different URN (used by the inheritance banner). */
+  onJumpToTraceUrn: (urn: string) => void
 }
 
 export function ContextViewHeader({
@@ -90,9 +96,11 @@ export function ContextViewHeader({
   onUndo,
   onRedo,
   trace,
-  focusNodeName,
   lineageEdgeTypes,
   onExitTrace,
+  displayMap,
+  resolveEdgeColor,
+  onJumpToTraceUrn,
 }: ContextViewHeaderProps) {
   const searchInputRef = useRef<HTMLInputElement>(null)
 
@@ -356,32 +364,16 @@ export function ContextViewHeader({
         )}
       </AnimatePresence>
 
-      {/* Trace Toolbar */}
-      <AnimatePresence>
-        {trace.isTracing && (
-          <TraceToolbar
-            focusNodeName={focusNodeName}
-            upstreamCount={trace.upstreamCount}
-            downstreamCount={trace.downstreamCount}
-            showUpstream={trace.showUpstream}
-            showDownstream={trace.showDownstream}
-            onToggleUpstream={() => trace.setShowUpstream(!trace.showUpstream)}
-            onToggleDownstream={() => trace.setShowDownstream(!trace.showDownstream)}
-            onExitTrace={onExitTrace}
-            onRetrace={trace.retrace}
-            onTraceUpstream={() => trace.focusId && trace.traceUpstream(trace.focusId)}
-            onTraceDownstream={() => trace.focusId && trace.traceDownstream(trace.focusId)}
-            onTraceFullLineage={() => trace.focusId && trace.traceFullLineage(trace.focusId)}
-            config={trace.config}
-            onConfigChange={trace.setConfig}
-            traceResult={trace.result}
-            statistics={trace.statistics}
-            isLoading={trace.isLoading}
-            availableLineageEdgeTypes={lineageEdgeTypes}
-            position="floating"
-          />
-        )}
-      </AnimatePresence>
+      {/* Premium ContextView Trace Surface — pill, history, banners, details panel. */}
+      <TraceContextViewSurface
+        trace={trace}
+        displayMap={displayMap}
+        availableEdgeTypes={lineageEdgeTypes}
+        granularityOptions={granularityOptions}
+        resolveEdgeColor={resolveEdgeColor}
+        onExit={onExitTrace}
+        onJumpToUrn={onJumpToTraceUrn}
+      />
     </div>
   )
 }

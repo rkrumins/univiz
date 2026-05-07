@@ -226,6 +226,8 @@ export function LineageFlowOverlay({
           const isEdgeHighlighted = isHighlightActive && highlightedEdges?.has(edge.id)
           const isEdgeDimmed = isHighlightActive && !highlightedEdges?.has(edge.id)
 
+          let isTraceEdge = false
+          let isFocusIncident = false
           if (isTracing && traceResult) {
             edgeOpacity = edge.isGhost ? 0.4 : 0.8
             dynamicStrokeWidth = baseStrokeWidth + 1
@@ -242,9 +244,23 @@ export function LineageFlowOverlay({
               color = '#a78bfa'
             }
 
-            if (!srcInUpstream && !tgtInUpstream && !srcInDownstream && !tgtInDownstream) {
+            const focusId = traceResult.focusId
+            isFocusIncident = !!focusId && (
+              edge.source === focusId || edge.target === focusId
+            )
+
+            if (!srcInUpstream && !tgtInUpstream && !srcInDownstream && !tgtInDownstream && !isFocusIncident) {
               edgeOpacity = edge.isGhost ? 0.05 : 0.1
               dynamicStrokeWidth = Math.max(1, baseStrokeWidth - 1)
+            } else {
+              isTraceEdge = true
+            }
+
+            // Focus-incident edges are emphasised — thicker stroke, full opacity.
+            if (isFocusIncident) {
+              dynamicStrokeWidth = baseStrokeWidth + 1.5
+              edgeOpacity = 1
+              isTraceEdge = true
             }
           } else {
             if (isEdgeHighlighted) {
@@ -280,6 +296,8 @@ export function LineageFlowOverlay({
               ? edge.types
               : edge.originalType ? [edge.originalType] : [],
             confidence: edge.confidence || 0,
+            isTraceEdge,
+            isFocusIncident,
           })
         }
         return
@@ -696,6 +714,7 @@ export function LineageFlowOverlay({
               data-edge-id={edge.id}
               data-edge-src={edge.source}
               data-edge-tgt={edge.target}
+              className={edge.isTraceEdge ? 'nx-edge-trace' : undefined}
               style={{ opacity: groupOpacity, transition: 'opacity 0.25s ease' }}
             >
 

@@ -454,10 +454,28 @@ class FalkorDBProvider(GraphDataProvider):
             True if these came from a real ontology definition (assigned or system).
             False if from introspection-only — an empty list should NOT suppress
             the hardcoded fallback.
+
+        When the resolved type set actually changes, the per-graph
+        ancestors Redis cache is asynchronously invalidated as a
+        defence-in-depth against caller paths that bypass the worker's
+        explicit ``reset_ancestors_cache`` call (e.g. ContextEngine
+        re-resolving an ontology at request time on the same sticky
+        provider instance).
         """
         if from_ontology or types:
-            self._resolved_containment_types: Set[str] = {t.upper() for t in types}
+            new_set: Set[str] = {t.upper() for t in types}
+            old_set = getattr(self, "_resolved_containment_types", None)
+            self._resolved_containment_types = new_set
             self._resolved_containment_types_set = True
+            if old_set is not None and old_set != new_set:
+                # Sync method, async work — only schedule if there is a
+                # running loop. Outside one (test harness, sync init)
+                # the worker's explicit reset covers production.
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.reset_ancestors_cache())
+                except RuntimeError:
+                    pass
         # else: introspection-only with no containment found — don't set sentinel
 
     def set_entity_type_levels(self, mapping: Dict[str, int]) -> None:
@@ -531,35 +549,27 @@ class FalkorDBProvider(GraphDataProvider):
     def _get_containment_edge_types(self) -> Set[str]:
         """Return the authoritative containment edge type set.
 
-        Resolution chain (first match wins):
-        1. Ontology-resolved types injected by ContextEngine (may be empty = no hierarchy)
-        2. CONTAINMENT_EDGE_TYPES env var (explicit operator opt-in)
-        3. Raise ProviderConfigurationError — there is no safe hardcoded fallback
-           in a multi-tenant, custom-ontology system.
+        Single source of truth: the ontology-resolved types injected by
+        ContextEngine / aggregation. Empty is a valid resolved state
+        (flat graph with no containment hierarchy). Anything else
+        raises ``ProviderConfigurationError`` — silently defaulting in
+        a multi-tenant system masks ontology-coverage bugs the
+        resolution gate is meant to surface.
 
-        Enterprise tenants may use arbitrary edge type naming (e.g. "HAS_TABLE",
-        "PART_OF", "OWNS"). Silently defaulting to {CONTAINS, BELONGS_TO} produced
-        the "no results" bug in /nodes/top-level because such tenants legitimately
-        have neither type, yet the provider classified everything as "has a parent".
-        The right failure mode is loud and actionable at the API boundary.
+        The legacy ``CONTAINMENT_EDGE_TYPES`` env-var fallback was
+        removed: it was an operator escape hatch from the era before
+        the resolution gate, and it lets aggregation paths bypass the
+        per-data-source ontology assignment. Operators that need to
+        configure containment now do so by editing the ontology.
         """
-        # Prefer ontology-resolved types if they have been explicitly set
-        # (even if the set is empty — empty is a valid resolved state that
-        # indicates a flat graph with no containment hierarchy)
         if getattr(self, "_resolved_containment_types_set", False):
             return self._resolved_containment_types
-        if not hasattr(self, "_containment_cache"):
-            config = os.getenv("CONTAINMENT_EDGE_TYPES", "").strip()
-            if config:
-                self._containment_cache = {t.strip().upper() for t in config.split(",") if t.strip()}
-            else:
-                raise ProviderConfigurationError(
-                    "Containment edge types are not configured for this provider. "
-                    "ContextEngine must call set_containment_edge_types() from a "
-                    "resolved ontology, or the CONTAINMENT_EDGE_TYPES env var must "
-                    "be set. No hardcoded fallback is safe in a multi-tenant system."
-                )
-        return self._containment_cache
+        raise ProviderConfigurationError(
+            "Containment edge types are not configured for this provider. "
+            "ContextEngine / aggregation must call set_containment_edge_types() "
+            "with the resolved ontology before invoking provider methods that "
+            "depend on containment classification."
+        )
 
     def _extract_node_from_result(self, row) -> Optional[GraphNode]:
         """Extract GraphNode from a FalkorDB result row (Node or dict of properties)."""
@@ -1405,6 +1415,31 @@ class FalkorDBProvider(GraphDataProvider):
             await self._proj_query("CREATE INDEX FOR (n:_Projection) ON (n.urn)")
         except Exception:
             pass  # Index may already exist
+
+    async def reset_ancestors_cache(self) -> None:
+        """Wipe the per-graph ancestor cache for the start of an aggregation run.
+
+        The cache (`{graph_name}:ancestors` Redis Hash) is intra-job
+        memoization: many batches in a single job touch overlapping
+        URNs, so caching across batches is valuable. Persisting it
+        across jobs is *not*: the most common reason to re-aggregate is
+        an ontology classification change or a graph structure change,
+        and either invalidates ancestor chains. Without this reset, a
+        first job run with empty `containment_edge_types` caches `[]`
+        for every URN, and every subsequent job sees those as cache
+        hits and skips the graph walk — producing only leaf-to-leaf
+        AGGREGATED edges instead of propagating up the tree.
+
+        Best-effort: Redis errors are swallowed so a flush failure
+        never fails an aggregation job.
+        """
+        try:
+            await self._redis.delete(f"{self._graph_name}:ancestors")
+        except Exception as exc:
+            logger.debug(
+                "reset_ancestors_cache: Redis delete failed for %s: %s",
+                self._graph_name, exc,
+            )
 
     async def _get_ancestor_chain(self, urn: str) -> List[str]:
         """Get pre-computed ancestor chain from Redis Hash, or compute + cache it.

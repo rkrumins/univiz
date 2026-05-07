@@ -203,29 +203,28 @@ def resolve_ontology(
     introspected_rel_ids: Optional[List[str]] = None,
 ) -> ResolvedOntology:
     """
-    Three-layer merge: system_default <- assigned <- introspection.
+    Two-layer merge: assigned <- introspection.
 
-    Layer 1 (system_default): built-in definitions seeded at startup.
-    Layer 2 (assigned): ontology explicitly assigned to the data source.
-    Layer 3 (introspection): types observed in the graph but not yet defined.
-               These get a synthetic fallback definition so the UI renders them.
+    Layer 1 (assigned): ontology explicitly assigned to the data source.
+    Layer 2 (introspection): types observed in the graph but not yet defined.
+               These get a synthetic fallback definition so the UI still
+               renders unmapped types in exploration views.
+
+    The legacy ``system_default`` parameter is accepted for call-site
+    stability but ignored. Aggregation paths must read only the
+    assigned ontology, and other read paths get the same behaviour for
+    consistency — silently merging system defaults on top of an
+    assigned ontology produced unclassified-edge bugs that the
+    ``backend.app.ontology.gate`` resolution gate now refuses to allow
+    through.
     """
+    del system_default  # unused; see docstring
+
     entity_defs: Dict[str, EntityTypeDefEntry] = {}
     rel_defs: Dict[str, RelationshipTypeDefEntry] = {}
     sources: Dict[str, str] = {}
 
-    # Layer 1 — system default
-    if system_default:
-        sd_ent = parse_entity_definitions(system_default.entity_type_definitions)
-        sd_rel = parse_relationship_definitions(system_default.relationship_type_definitions)
-        entity_defs.update(sd_ent)
-        rel_defs.update(sd_rel)
-        for k in sd_ent:
-            sources[k] = "system_default"
-        for k in sd_rel:
-            sources[k] = "system_default"
-
-    # Layer 2 — assigned ontology override
+    # Layer 1 — assigned ontology
     if assigned:
         asgn_ent = parse_entity_definitions(assigned.entity_type_definitions)
         asgn_rel = parse_relationship_definitions(assigned.relationship_type_definitions)

@@ -19,6 +19,7 @@ import type {
     GraphDataProvider, GraphEdge, LineageResult, TraceOptions,
     TraceV2Result, TraceV2Request,
 } from '@/providers/GraphDataProvider'
+import type { TraceMeta } from '@/services/traceApi'
 import { useCanvasStore } from '@/store/canvas'
 
 // ============================================
@@ -99,6 +100,26 @@ export interface TraceResult {
      * matters (e.g. for a "Show only direct lineage" toggle).
      */
     ancestorUrns?: Set<string>
+    /**
+     * Sidecar metadata: cache hit/miss, regime, query latency, materialised
+     * hit rate. Populated when the v2 envelope emits a `meta` block. Used by
+     * the Performance tab in the trace panel.
+     */
+    meta?: TraceMeta
+}
+
+/** Recent-focus entry for the trace history breadcrumb. */
+export interface TraceHistoryEntry {
+    /** Internal node ID at the time the trace was started. */
+    focusId: string
+    /** URN at the time the trace was started — display name resolved at render time. */
+    focusUrn: string
+    /** Effective hierarchy level the trace ran at (from result.effectiveLevel). */
+    level?: number
+    /** Wall-clock timestamp of the push. */
+    timestamp: number
+    /** Snapshot of the trace config used — applied when the user jumps back. */
+    config: TraceConfig
 }
 
 /** Drill-down state — keyed by `${sourceUrn}->${targetUrn}@${atLevel}`. */
@@ -122,6 +143,8 @@ export interface TraceState {
     showDownstream: boolean
     /** Drill-down results keyed by `${sourceUrn}->${targetUrn}@${atLevel}` */
     drilldowns: Map<DrilldownKey, TraceV2Result>
+    /** Recent-focus breadcrumb (newest first, capped at 5). Session-scoped. */
+    traceHistory: TraceHistoryEntry[]
 
     // Actions
     setFocus: (nodeId: string | null) => void
@@ -138,9 +161,14 @@ export interface TraceState {
     ) => Promise<TraceV2Result | null>
     /** Collapse a previously-opened drilldown (reverts to the original AGGREGATED edge). */
     collapseDrilldown: (key: DrilldownKey) => void
+    /** Drop the trace-history breadcrumb. */
+    clearTraceHistory: () => void
     clearTrace: () => void
     reset: () => void
 }
+
+/** History capacity. Older entries are evicted FIFO. */
+const TRACE_HISTORY_LIMIT = 5
 
 // ============================================
 // Default Configuration
@@ -183,6 +211,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     showUpstream: true,
     showDownstream: true,
     drilldowns: new Map(),
+    traceHistory: [],
 
     setFocus: (nodeId) => {
         if (nodeId === null) {
@@ -246,7 +275,27 @@ export const useTraceStore = create<TraceState>((set, get) => ({
                 traceResult = traceResultFromLegacy(nodeId, urn, lineage)
             }
 
-            set({ status: 'success', result: traceResult })
+            // Push the new focus into the history breadcrumb. Skip the push
+            // when the user re-traces the same focus (e.g. config tweak +
+            // retrace) so history shows distinct focus nodes, not a wall of
+            // duplicates. Cap at TRACE_HISTORY_LIMIT (FIFO).
+            const { traceHistory } = get()
+            const head = traceHistory[0]
+            const isSameFocus = head?.focusId === nodeId
+            const nextHistory: TraceHistoryEntry[] = isSameFocus
+                ? traceHistory
+                : [
+                      {
+                          focusId: nodeId,
+                          focusUrn: urn,
+                          level: traceResult.effectiveLevel,
+                          timestamp: Date.now(),
+                          config,
+                      },
+                      ...traceHistory,
+                  ].slice(0, TRACE_HISTORY_LIMIT)
+
+            set({ status: 'success', result: traceResult, traceHistory: nextHistory })
             return traceResult
         } catch (err) {
             set({
@@ -295,6 +344,8 @@ export const useTraceStore = create<TraceState>((set, get) => ({
         set({ drilldowns: next })
     },
 
+    clearTraceHistory: () => set({ traceHistory: [] }),
+
     clearTrace: () => {
         set({
             focusId: null,
@@ -317,6 +368,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showUpstream: true,
             showDownstream: true,
             drilldowns: new Map(),
+            traceHistory: [],
         })
     },
 }))
@@ -375,6 +427,7 @@ function traceResultFromV2(focusId: string, focusUrn: string, v2: TraceV2Result)
         truncationReason: v2.truncationReason ?? undefined,
         containmentEdges: v2.containmentEdges,
         ancestorUrns,
+        meta: v2.meta,
     }
 }
 
@@ -499,6 +552,13 @@ export interface UseUnifiedTraceResult {
     expandAggregatedEdge: (sourceUrn: string, targetUrn: string, currentLevel: number) => Promise<TraceV2Result | null>
     /** Collapse a drilldown by key */
     collapseDrilldown: (key: DrilldownKey) => void
+
+    /** Recent-focus breadcrumb (newest first, max 5). Persists across `clearTrace`; cleared on `reset` or explicit `clearTraceHistory`. */
+    traceHistory: TraceHistoryEntry[]
+    /** Restore a previous focus from history — applies its config and re-traces. */
+    jumpToHistoryEntry: (entry: TraceHistoryEntry) => Promise<void>
+    /** Drop the entire trace-history breadcrumb. */
+    clearTraceHistory: () => void
 }
 
 export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTraceResult {
@@ -513,6 +573,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const showUpstream = useTraceStore(s => s.showUpstream)
     const showDownstream = useTraceStore(s => s.showDownstream)
     const drilldowns = useTraceStore(s => s.drilldowns)
+    const traceHistory = useTraceStore(s => s.traceHistory)
 
     // Actions
     const setConfig = useTraceStore(s => s.setConfig)
@@ -523,6 +584,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const setFocus = useTraceStore(s => s.setFocus)
     const expandAggregatedEdgeAction = useTraceStore(s => s.expandAggregatedEdge)
     const collapseDrilldown = useTraceStore(s => s.collapseDrilldown)
+    const clearTraceHistory = useTraceStore(s => s.clearTraceHistory)
 
     // Canvas store for auto-sync
     const { nodes: canvasNodes } = useCanvasStore()
@@ -586,6 +648,16 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
             await startTrace(nodeId)
         }
     }, [focusId, clearTrace, startTrace])
+
+    // Jump back to a previous focus from the history breadcrumb. Restores the
+    // entry's config snapshot first so the same trace shape is reproduced,
+    // then runs the trace. The fetchTrace handler will see the duplicate
+    // focus check and re-use the existing top-of-history entry rather than
+    // pushing a new one.
+    const jumpToHistoryEntry = useCallback(async (entry: TraceHistoryEntry) => {
+        setConfig(entry.config)
+        await startTrace(entry.focusId)
+    }, [setConfig, startTrace])
 
     // Drill into an AGGREGATED edge — provider-bound wrapper
     const expandAggregatedEdge = useCallback(async (
@@ -742,6 +814,9 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
         drilldowns,
         expandAggregatedEdge,
         collapseDrilldown,
+        traceHistory,
+        jumpToHistoryEntry,
+        clearTraceHistory,
     }
 }
 

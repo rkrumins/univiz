@@ -1,4 +1,6 @@
 export { WorkspaceStep } from './WorkspaceStep'
 export { AggregationStep } from './AggregationStep'
 export { SemanticStep } from './SemanticStep'
+export { SchemaReviewStep } from './SchemaReviewStep'
+export type { SchemaReviewStatusMap } from './SchemaReviewStep'
 export { ReviewStep } from './ReviewStep'

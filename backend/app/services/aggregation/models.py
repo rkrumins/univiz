@@ -75,6 +75,18 @@ class AggregationJobORM(Base):
     # ── Idempotency ─────────────────────────────────────────────────
     idempotency_key = Column(Text, nullable=True)
 
+    # Ontology resolution fingerprint at trigger time. Stable hash over
+    # the assigned ontology's revision + entity / relationship type
+    # definitions (computed by ``backend.app.ontology.gate``). The
+    # idempotency replay (60-min window keyed by idempotency_key) only
+    # short-circuits when this matches the current ontology fingerprint;
+    # any change to containment / lineage classifications shifts the
+    # fingerprint and forces a fresh resolve. NULL on rows created
+    # before this column existed and on aggregation_data_source_state
+    # entries cleared by the ontology PUT invalidation hook — both are
+    # treated as "stale, recompute".
+    ontology_fingerprint = Column(Text, nullable=True)
+
     # Per-emit sequence counter for the platform JobEmitter. Strictly
     # monotonic per job_id. The worker increments it on every progress
     # / heartbeat / terminal event published, and persists the highest

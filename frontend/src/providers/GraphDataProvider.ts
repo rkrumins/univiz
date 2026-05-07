@@ -7,6 +7,7 @@
  */
 
 import { LogicalNodeConfig, LayerAssignmentRuleConfig, RuleCondition, ScopeFilterConfig, EntityAssignmentConfig } from '../types/schema'
+import type { TraceMeta } from '@/services/traceApi'
 
 // ============================================
 // URN Types (DataHub Compatible)
@@ -455,6 +456,8 @@ export interface TraceV2Result {
     truncated: boolean
     /** "max_nodes" | "timeout" | null */
     truncationReason?: string | null
+    /** Sidecar performance metadata (cache, regime, query latency) — present when emitted by the v2 envelope */
+    meta?: TraceMeta
 }
 
 /**

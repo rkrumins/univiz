@@ -1091,7 +1091,10 @@ export function ContextViewCanvas({
   }, [clearSelection])
 
   return (
-    <div className={cn("h-full w-full flex flex-col overflow-hidden bg-gradient-to-br from-canvas via-canvas to-canvas-elevated/30", className)}>
+    <div
+      data-trace-active={trace.isTracing ? 'true' : 'false'}
+      className={cn("h-full w-full flex flex-col overflow-hidden bg-gradient-to-br from-canvas via-canvas to-canvas-elevated/30", className)}
+    >
       {/* Editor Toolbar - Unified with LineageCanvas */}
       <div className="absolute top-4 left-4 z-30">
         <EditorToolbar
@@ -1143,45 +1146,20 @@ export function ContextViewCanvas({
         focusNodeName={displayMap.get(trace.focusId || '')?.name || trace.focusId || 'Unknown Node'}
         lineageEdgeTypes={lineageEdgeTypes}
         onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+        displayMap={displayMap}
+        resolveEdgeColor={resolveEdgeColor}
+        onJumpToTraceUrn={(urn) => {
+          // Resolve URN → node ID through the urnToIdMap so we can route
+          // through the smart-level trace handler (consistent with all other
+          // trace entry points).
+          const id = urnToIdMap.get(urn) ?? urn
+          startTraceWithSmartLevel(id)
+        }}
       />
 
       <div className="flex-1 w-full h-full relative overflow-hidden bg-canvas flex flex-col">
-        {/* Trace mode banner — persistent, always-visible exit affordance.
-            Sits above the layer columns (not floating like TraceToolbar) so
-            the user can never lose it via scroll/pan. ESC also exits via
-            useCanvasInteractions.onExitTrace. */}
-        {trace.isTracing && (
-          <div
-            data-canvas-interactive
-            className="mx-4 mt-2 px-3 py-2 rounded-md bg-accent-lineage/10 border border-accent-lineage/40 text-accent-lineage text-xs flex items-center gap-2 z-20"
-          >
-            <span className="inline-block w-2 h-2 rounded-full bg-accent-lineage animate-pulse" aria-hidden="true" />
-            <span className="font-medium">Tracing</span>
-            <span className="text-accent-lineage/80 truncate" title={trace.focusId ?? undefined}>
-              {displayMap.get(trace.focusId || '')?.name || trace.focusId || 'Unknown'}
-            </span>
-            {(() => {
-              const focusNode = trace.focusId ? displayMap.get(trace.focusId) : null
-              const focusType = focusNode?.typeId
-              const level = trace.result?.effectiveLevel
-              if (!focusType && typeof level !== 'number') return null
-              return (
-                <span className="text-accent-lineage/60">
-                  · {focusType ?? ''}{typeof level === 'number' ? ` (L${level})` : ''}
-                </span>
-              )
-            })()}
-            <span className="ml-auto text-[10px] text-accent-lineage/50 hidden md:inline">Press ESC to exit</span>
-            <button
-              type="button"
-              onClick={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
-              className="ml-2 px-2 py-0.5 rounded border border-accent-lineage/40 hover:bg-accent-lineage/20 transition-colors duration-150 font-medium"
-              title="Exit trace (ESC)"
-            >
-              Exit Trace ✕
-            </button>
-          </div>
-        )}
+        {/* Trace pill, history, narrative banners, and details panel are rendered
+            by <TraceContextViewSurface /> inside <ContextViewHeader />. */}
         {/* Aggregation state banner — surfaces backend signals so an empty
             canvas isn't ambiguous between "no lineage" and "still computing".
             Priority: computing > truncated > stale-materialised. */}

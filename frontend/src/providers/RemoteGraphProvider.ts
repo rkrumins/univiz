@@ -28,6 +28,7 @@ import type {
     TopLevelNodesQuery,
     TopLevelNodesResult,
 } from './GraphDataProvider'
+import type { TraceMeta } from '@/services/traceApi'
 
 // Wire shape from POST /trace/v2 — `upstreamUrns`/`downstreamUrns` arrive as
 // JSON arrays (Pydantic serializes Set as list); we re-hydrate to Set on read.
@@ -43,6 +44,8 @@ interface RawTraceV2Result {
     inheritedFromUrn?: string | null
     truncated: boolean
     truncationReason?: string | null
+    /** Optional sidecar metadata — only present when the v2 envelope emits it. */
+    meta?: TraceMeta
 }
 
 function normalizeTraceV2(raw: RawTraceV2Result): TraceV2Result {
@@ -51,6 +54,7 @@ function normalizeTraceV2(raw: RawTraceV2Result): TraceV2Result {
         upstreamUrns: new Set(raw.upstreamUrns ?? []),
         downstreamUrns: new Set(raw.downstreamUrns ?? []),
         containmentEdges: raw.containmentEdges ?? [],
+        meta: raw.meta,
     }
 }
 

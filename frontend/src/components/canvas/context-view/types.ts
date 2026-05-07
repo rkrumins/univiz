@@ -58,4 +58,8 @@ export type ComputedEdge = {
   // For tooltip display
   types: string[]
   confidence: number
+  /** True when an active trace touches either endpoint — drives the cinematic glow + flow animation. */
+  isTraceEdge?: boolean
+  /** True when an endpoint is the trace focus — emphasised more strongly. */
+  isFocusIncident?: boolean
 }

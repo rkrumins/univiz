@@ -14,6 +14,7 @@ Supports two modes controlled by ``AGGREGATION_PROXY_ENABLED`` env var:
 This is the ONLY monolith file that imports FROM the aggregation package.
 """
 import asyncio
+import json as _json
 import logging
 import os
 from typing import List, Optional
@@ -26,7 +27,13 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.engine import get_db_session
+from backend.app.ontology import gate as ontology_gate
 from backend.app.services.aggregation.schemas import ResumeOverrides
+from backend.common.models.management import (
+    OntologyResolutionResponse,
+    OntologyResolutionRelGap,
+    OntologyResolutionHierarchyGap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +241,81 @@ async def trigger_aggregation(
     session: AsyncSession = Depends(get_db_session),
     trigger_source: str = Query("manual", alias="triggerSource"),
 ):
+    # Resolution gate runs BEFORE the proxy short-circuit. The Control
+    # Plane has no access to viz-service ontology tables, so the gate
+    # must enforce here in both modes.
+    #
+    # Read-only path: the helper does ``session.get`` / ``session.execute``,
+    # both of which trigger SQLAlchemy autobegin. We close that
+    # transaction with ``rollback`` immediately so ``svc.trigger`` (which
+    # opens its own ``session.begin()``) doesn't fail with
+    # "A transaction is already begun on this Session".
+    preflight = await _build_resolution_report(ds_id, session)
+    await session.rollback()
+    if preflight.kind == "ds_missing":
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "data_source_not_found",
+                "message": (
+                    f"Data source {ds_id!r} was not found. The id may be from "
+                    "a stale tab — refresh the workspace and try again."
+                ),
+            },
+        )
+    if preflight.kind == "ontology_unassigned":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ontology_not_assigned",
+                "message": (
+                    f"Data source {ds_id!r} has no ontology assigned. Configure "
+                    "an ontology for this data source first."
+                ),
+                "resolution": _report_to_response(
+                    ontology_gate.ResolutionReport(
+                        resolved=False,
+                        ontology_id=None,
+                        ontology_version=None,
+                        ontology_is_published=False,
+                        blocking_reasons=["ontology_not_assigned"],
+                    )
+                ).model_dump(by_alias=True),
+            },
+        )
+    if preflight.kind == "ontology_missing":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ontology_missing",
+                "message": (
+                    f"Data source {ds_id!r} references ontology "
+                    f"{preflight.ontology_id!r} but no such ontology exists. "
+                    "Reassign a valid ontology and retry."
+                ),
+            },
+        )
+    if preflight.kind != "ok" or preflight.report is None:
+        # Defensive: any new kind we forgot to wire surfaces as a 500
+        # rather than silently passing.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected pre-flight result: {preflight.kind!r}",
+        )
+    pre_report = preflight.report
+    if not pre_report.resolved:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ontology_unresolved",
+                "message": (
+                    "Ontology resolution gate failed: "
+                    + ", ".join(pre_report.blocking_reasons)
+                ),
+                "resolution": _report_to_response(pre_report).model_dump(by_alias=True),
+            },
+        )
+
     if _PROXY_ENABLED:
         body = await request.body()
         return await _proxy(
@@ -244,8 +326,9 @@ async def trigger_aggregation(
         )
 
     AggregationTriggerRequest, _, _, ConflictError, NotFoundError = _direct_imports()
-    import json
-    body_data = json.loads(await request.body())
+    from backend.app.services.aggregation.service import OntologyResolutionError
+
+    body_data = _json.loads(await request.body())
     body = AggregationTriggerRequest(**body_data)
     try:
         job = await svc.trigger(ds_id, body, trigger_source, session)
@@ -255,10 +338,196 @@ async def trigger_aggregation(
         return job
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except OntologyResolutionError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ontology_unresolved",
+                "message": str(e),
+                "resolution": _report_to_response(e.report).model_dump(by_alias=True),
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── Resolution gate (shared helper) ─────────────────────────────────
+
+
+class _PreflightResult:
+    """Outcome of the trigger-time pre-flight gate.
+
+    Distinguishes between the three "no report" reasons so the
+    endpoint can return a precise 422 instead of the catch-all
+    "ontology not assigned" message that masked real bugs (deleted
+    ontology rows, dangling ds_ids, mismatched IDs from the wizard,
+    etc.).
+    """
+    __slots__ = ("kind", "report", "ds_id", "ontology_id")
+
+    def __init__(self, *, kind: str, report=None, ds_id=None, ontology_id=None):
+        self.kind = kind
+        self.report = report
+        self.ds_id = ds_id
+        self.ontology_id = ontology_id
+
+
+async def _build_resolution_report(
+    ds_id: str, session: AsyncSession,
+) -> _PreflightResult:
+    """Run the ontology-resolution gate against the data source's
+    assigned ontology and the cached graph schema stats.
+
+    Returns a tagged ``_PreflightResult``:
+
+    - ``kind="ok"`` — gate evaluated; ``report`` holds the result.
+    - ``kind="ds_missing"`` — no ``WorkspaceDataSourceORM`` row for ``ds_id``.
+    - ``kind="ontology_unassigned"`` — DS exists but ``ontology_id`` is null.
+    - ``kind="ontology_missing"`` — ``ontology_id`` set but no row in
+      ``ontologies`` (dangling FK, e.g. ontology hard-deleted while a
+      data source still references it).
+
+    Reads only viz-service-owned tables, so the same code runs in
+    direct and proxy modes.
+    """
+    from backend.app.db.models import OntologyORM, WorkspaceDataSourceORM
+    from backend.app.db.repositories.stats_repo import get_data_source_stats
+
+    ds = await session.get(WorkspaceDataSourceORM, ds_id)
+    if ds is None:
+        logger.warning(
+            "trigger_aggregation: WorkspaceDataSourceORM not found for ds_id=%s",
+            ds_id,
+        )
+        return _PreflightResult(kind="ds_missing", ds_id=ds_id)
+    if not ds.ontology_id:
+        logger.info(
+            "trigger_aggregation: ds_id=%s exists but has no ontology_id",
+            ds_id,
+        )
+        return _PreflightResult(kind="ontology_unassigned", ds_id=ds_id)
+    orm = await session.get(OntologyORM, ds.ontology_id)
+    if orm is None:
+        logger.warning(
+            "trigger_aggregation: ds_id=%s references ontology_id=%s "
+            "but the ontology row is missing (dangling FK)",
+            ds_id, ds.ontology_id,
+        )
+        return _PreflightResult(
+            kind="ontology_missing", ds_id=ds_id, ontology_id=ds.ontology_id,
+        )
+
+    stats_row = await get_data_source_stats(session, ds_id)
+    entity_ids: List[str] = []
+    edge_ids: List[str] = []
+    if stats_row and stats_row.schema_stats:
+        try:
+            payload = _json.loads(stats_row.schema_stats)
+            entity_stats = payload.get("entityTypeStats") or payload.get("entity_type_stats") or []
+            edge_stats = payload.get("edgeTypeStats") or payload.get("edge_type_stats") or []
+            entity_ids = [
+                e.get("id") for e in entity_stats if isinstance(e, dict) and e.get("id")
+            ]
+            edge_ids = [
+                e.get("id") for e in edge_stats if isinstance(e, dict) and e.get("id")
+            ]
+        except (TypeError, ValueError):
+            pass
+
+    report = ontology_gate.check_resolution(
+        ontology_id=orm.id,
+        ontology_version=orm.version,
+        ontology_is_published=bool(orm.is_published),
+        ontology_revision=getattr(orm, "revision", 0) or 0,
+        entity_type_definitions_raw=_json.loads(orm.entity_type_definitions or "{}"),
+        relationship_type_definitions_raw=_json.loads(orm.relationship_type_definitions or "{}"),
+        introspected_entity_ids=entity_ids,
+        introspected_edge_ids=edge_ids,
+    )
+    return _PreflightResult(kind="ok", report=report, ds_id=ds_id, ontology_id=orm.id)
+
+
+def _report_to_response(
+    report: ontology_gate.ResolutionReport,
+) -> OntologyResolutionResponse:
+    return OntologyResolutionResponse(
+        resolved=report.resolved,
+        ontologyId=report.ontology_id,
+        ontologyVersion=report.ontology_version,
+        ontologyIsPublished=report.ontology_is_published,
+        missingEntityTypes=report.missing_entity_types,
+        missingEdgeTypes=report.missing_edge_types,
+        unclassifiedRelationships=[
+            OntologyResolutionRelGap(
+                id=g.id,
+                name=g.name,
+                isContainment=g.is_containment,
+                isLineage=g.is_lineage,
+            )
+            for g in report.unclassified_relationships
+        ],
+        hasLineage=report.has_lineage,
+        hasContainment=report.has_containment,
+        hierarchyWarnings=[
+            OntologyResolutionHierarchyGap(
+                entityType=g.entity_type,
+                missingField=g.missing_field,
+            )
+            for g in report.hierarchy_warnings
+        ],
+        advisoryWarnings=report.advisory_warnings,
+        blockingReasons=report.blocking_reasons,
+        fingerprint=report.fingerprint,
+    )
+
+
+# ── GET /data-sources/{ds_id}/ontology-resolution ───────────────────
+
+
+@router.get(
+    "/data-sources/{ds_id}/ontology-resolution",
+    response_model=OntologyResolutionResponse,
+    summary="Inspect the ontology-resolution gate for a data source",
+)
+async def get_ontology_resolution(
+    ds_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Run the ontology-resolution gate against the assigned ontology
+    and return the report. Drives the wizard's SchemaReviewStep and
+    the SemanticStep warning banner.
+
+    Always reads from the viz-service ontology DB even in proxy mode
+    (the Control Plane never sees ontology rows), so this endpoint is
+    not proxied.
+    """
+    preflight = await _build_resolution_report(ds_id, session)
+    if preflight.kind == "ds_missing":
+        raise HTTPException(status_code=404, detail=f"Data source {ds_id!r} not found")
+    if preflight.kind == "ontology_unassigned":
+        return OntologyResolutionResponse(
+            resolved=False,
+            ontologyId=None,
+            ontologyVersion=None,
+            ontologyIsPublished=False,
+            blockingReasons=["ontology_not_assigned"],
+        )
+    if preflight.kind == "ontology_missing":
+        return OntologyResolutionResponse(
+            resolved=False,
+            ontologyId=preflight.ontology_id,
+            ontologyVersion=None,
+            ontologyIsPublished=False,
+            blockingReasons=["ontology_missing"],
+        )
+    if preflight.kind == "ok" and preflight.report is not None:
+        return _report_to_response(preflight.report)
+    raise HTTPException(
+        status_code=500,
+        detail=f"Unexpected pre-flight result: {preflight.kind!r}",
+    )
 
 
 # ── GET /data-sources/{ds_id}/readiness ─────────────────────────────
