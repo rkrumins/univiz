@@ -72,6 +72,7 @@ import { ContextViewHeader } from './ContextViewHeader'
 import { useLoadingToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
+import { TraceContextViewSurface } from '../trace/TraceContextViewSurface'
 
 // Re-export for backward compatibility
 export { defaultReferenceModelLayers } from './constants'
@@ -1142,24 +1143,26 @@ export function ContextViewCanvas({
         canRedo={stagedRedoStack.length > 0}
         onUndo={undoStagedChange}
         onRedo={redoStagedChange}
-        trace={trace}
-        focusNodeName={displayMap.get(trace.focusId || '')?.name || trace.focusId || 'Unknown Node'}
-        lineageEdgeTypes={lineageEdgeTypes}
-        onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
-        displayMap={displayMap}
-        resolveEdgeColor={resolveEdgeColor}
-        onJumpToTraceUrn={(urn) => {
-          // Resolve URN → node ID through the urnToIdMap so we can route
-          // through the smart-level trace handler (consistent with all other
-          // trace entry points).
-          const id = urnToIdMap.get(urn) ?? urn
-          startTraceWithSmartLevel(id)
-        }}
       />
 
       <div className="flex-1 w-full h-full relative overflow-hidden bg-canvas flex flex-col">
-        {/* Trace pill, history, narrative banners, and details panel are rendered
-            by <TraceContextViewSurface /> inside <ContextViewHeader />. */}
+        {/* Premium trace surface — pill, history, narrative banners, details panel.
+            Mounted inside the canvas-body (which is `relative`) so the floating
+            elements sit cleanly above the layer columns without being clipped
+            by stacking-context boundaries. z-50 keeps it above EdgeLegend (z-30)
+            and the column wrapper (z-10). */}
+        <TraceContextViewSurface
+          trace={trace}
+          displayMap={displayMap}
+          availableEdgeTypes={lineageEdgeTypes}
+          granularityOptions={granularityOptions}
+          resolveEdgeColor={resolveEdgeColor}
+          onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+          onJumpToUrn={(urn) => {
+            const id = urnToIdMap.get(urn) ?? urn
+            startTraceWithSmartLevel(id)
+          }}
+        />
         {/* Aggregation state banner — surfaces backend signals so an empty
             canvas isn't ambiguous between "no lineage" and "still computing".
             Priority: computing > truncated > stale-materialised. */}

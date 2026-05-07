@@ -9,9 +9,7 @@ import { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
-import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from './types'
-import { TraceContextViewSurface } from '../trace/TraceContextViewSurface'
 
 /** Minimal entity type shape needed for the granularity selector. */
 export interface GranularityOption {
@@ -59,17 +57,9 @@ export interface ContextViewHeaderProps {
   onUndo?: () => void
   onRedo?: () => void
 
-  // Trace toolbar
-  trace: UseUnifiedTraceResult
-  focusNodeName: string
-  lineageEdgeTypes: string[]
-  onExitTrace: () => void
-  /** id → HierarchyNode lookup, used by the trace surface to resolve names. */
-  displayMap: Map<string, HierarchyNode>
-  /** Edge color resolver from the active ontology — drives the trace edge-type chips. */
-  resolveEdgeColor: (edgeType: string) => string
-  /** Jump trace focus to a different URN (used by the inheritance banner). */
-  onJumpToTraceUrn: (urn: string) => void
+  // Trace surface is now mounted directly in ContextViewCanvas's canvas-body
+  // so it floats above the layer columns rather than being clipped by the
+  // canvas-body's stacking context. No trace props needed here.
 }
 
 export function ContextViewHeader({
@@ -95,12 +85,6 @@ export function ContextViewHeader({
   canRedo = false,
   onUndo,
   onRedo,
-  trace,
-  lineageEdgeTypes,
-  onExitTrace,
-  displayMap,
-  resolveEdgeColor,
-  onJumpToTraceUrn,
 }: ContextViewHeaderProps) {
   const searchInputRef = useRef<HTMLInputElement>(null)
 
@@ -364,16 +348,9 @@ export function ContextViewHeader({
         )}
       </AnimatePresence>
 
-      {/* Premium ContextView Trace Surface — pill, history, banners, details panel. */}
-      <TraceContextViewSurface
-        trace={trace}
-        displayMap={displayMap}
-        availableEdgeTypes={lineageEdgeTypes}
-        granularityOptions={granularityOptions}
-        resolveEdgeColor={resolveEdgeColor}
-        onExit={onExitTrace}
-        onJumpToUrn={onJumpToTraceUrn}
-      />
+      {/* Trace surface is mounted in ContextViewCanvas's canvas-body — see
+          TraceContextViewSurface there. Keeping it out of the header avoids
+          the canvas-body's stacking context clipping the floating panel. */}
     </div>
   )
 }

@@ -253,13 +253,11 @@ export function LineageFlowOverlay({
               edgeOpacity = edge.isGhost ? 0.05 : 0.1
               dynamicStrokeWidth = Math.max(1, baseStrokeWidth - 1)
             } else {
-              isTraceEdge = true
-            }
-
-            // Focus-incident edges are emphasised — thicker stroke, full opacity.
-            if (isFocusIncident) {
-              dynamicStrokeWidth = baseStrokeWidth + 1.5
-              edgeOpacity = 1
+              // Trace participants — including focus-incident — get the soft
+              // outer drop-shadow glow via the `nx-edge-trace` class. The
+              // stroke itself stays at the regular trace width so the focus
+              // edges read as part of the same set rather than as bolded
+              // emphasis lines.
               isTraceEdge = true
             }
           } else {

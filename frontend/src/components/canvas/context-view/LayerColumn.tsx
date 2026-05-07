@@ -362,17 +362,26 @@ export const LayerColumn = React.memo(function LayerColumn({
     }
   }, [focusedNodeId, nodeToFlatIndexMap, virtualizer])
 
-  // Auto-scroll trace focus node into view (replaces FlatTreeItem's scrollIntoView)
+  // Auto-scroll trace focus node into view — runs ONCE per focus change.
+  // Without the ref guard the effect re-fires every time nodeToFlatIndexMap
+  // re-memoizes (which happens during scroll-driven virtualizer reflows),
+  // snapping the user back to the focus and preventing them from scrolling
+  // up or down through the lineage. With the guard the focus is centered
+  // when a trace starts; afterwards the user's scroll position is theirs.
+  const lastCenteredFocusRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!traceFocusId) return
-    const flatIndex = nodeToFlatIndexMap.get(traceFocusId)
-    if (flatIndex !== undefined) {
-      // Small delay to let the tree settle after expand
-      const timer = setTimeout(() => {
-        virtualizer.scrollToIndex(flatIndex, { align: 'center', behavior: 'smooth' })
-      }, 100)
-      return () => clearTimeout(timer)
+    if (!traceFocusId) {
+      lastCenteredFocusRef.current = null
+      return
     }
+    if (lastCenteredFocusRef.current === traceFocusId) return
+    const flatIndex = nodeToFlatIndexMap.get(traceFocusId)
+    if (flatIndex === undefined) return
+    const timer = setTimeout(() => {
+      virtualizer.scrollToIndex(flatIndex, { align: 'center', behavior: 'smooth' })
+      lastCenteredFocusRef.current = traceFocusId
+    }, 100)
+    return () => clearTimeout(timer)
   }, [traceFocusId, nodeToFlatIndexMap, virtualizer])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
