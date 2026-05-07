@@ -418,6 +418,9 @@ class AggregatedEdgeInfo(BaseModel):
 class AggregatedEdgeResult(BaseModel):
     aggregated_edges: List[AggregatedEdgeInfo] = Field(alias="aggregatedEdges")
     total_source_edges: int = Field(alias="totalSourceEdges")
+    truncated: bool = False
+    last_materialized_at: Optional[str] = Field(default=None, alias="lastMaterializedAt")
+    materialization_triggered: bool = Field(default=False, alias="materializationTriggered")
 
     class Config:
         populate_by_name = True

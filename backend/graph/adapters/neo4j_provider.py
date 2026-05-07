@@ -1099,6 +1099,7 @@ class Neo4jProvider(GraphDataProvider):
     async def get_aggregated_edges_between(
         self, source_urns: List[str], target_urns: Optional[List[str]],
         granularity: Any, containment_edges: List[str], lineage_edges: List[str],
+        *, timeout: Optional[float] = None,
     ) -> AggregatedEdgeResult:
         """Read pre-materialized AGGREGATED edges."""
         ip = self._id_prop()

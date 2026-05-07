@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
-from typing import Awaitable, Callable, List, Optional, Dict, Any, Set
+from typing import Awaitable, Callable, List, Optional, Dict, Any, Set, Tuple
 
 from ..models.graph import (
     GraphNode, GraphEdge, NodeQuery, EdgeQuery,
@@ -579,6 +579,12 @@ class FalkorDBProvider(GraphDataProvider):
 
     def _urn_label_key(self) -> str:
         return f"{self._graph_name}:urn_labels"
+
+    def _agg_last_materialized_key(self) -> str:
+        return f"{self._graph_name}:agg:last_materialized_at"
+
+    def _agg_in_flight_key(self, ds_id: str) -> str:
+        return f"materialize:in-flight:{ds_id}"
 
     async def _cache_urn_label(self, urn: str, label: str) -> None:
         """Store a single urn→label mapping."""
@@ -2250,6 +2256,15 @@ class FalkorDBProvider(GraphDataProvider):
             "input_edges_processed": processed,
             "errors": errors,
         }
+        try:
+            if self._redis is not None:
+                from datetime import datetime, timezone
+                await self._redis.set(
+                    self._agg_last_materialized_key(),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception as e:
+            logger.warning("Failed to stamp aggregated materialization timestamp: %s", e)
         logger.info(f"Batch materialization complete: {stats}")
         return stats
 
@@ -2260,6 +2275,8 @@ class FalkorDBProvider(GraphDataProvider):
         granularity: Any,
         containment_edges: List[str],
         lineage_edges: List[str],
+        *,
+        timeout: Optional[float] = None,
     ) -> AggregatedEdgeResult:
         """Read pre-materialized AGGREGATED edges from the projection graph.
 
@@ -2267,9 +2284,20 @@ class FalkorDBProvider(GraphDataProvider):
         No live fallback: if materialization hasn't run, returns empty result
         so the caller knows to trigger a backfill.
         """
+        from fastapi import HTTPException
+        from ..config.resilience import AGGREGATED_SOURCE_URN_BATCH_SIZE
+
+        if len(source_urns) > 100_000:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "TOO_MANY_SOURCE_URNS",
+                    "limit": 100000,
+                    "received": len(source_urns),
+                },
+            )
+
         await self._ensure_connected()
-
-
 
         if target_urns:
             cypher = (
@@ -2280,10 +2308,6 @@ class FalkorDBProvider(GraphDataProvider):
                 "r.weight AS weight, r.sourceEdgeTypes AS types "
                 "ORDER BY r.weight DESC"
             )
-            params: Dict[str, Any] = {
-                "sourceUrns": source_urns,
-                "targetUrns": target_urns,
-            }
         else:
             cypher = (
                 "MATCH (s)-[r:AGGREGATED]->(t) "
@@ -2293,23 +2317,61 @@ class FalkorDBProvider(GraphDataProvider):
                 "r.weight AS weight, r.sourceEdgeTypes AS types "
                 "ORDER BY r.weight DESC"
             )
-            params = {"sourceUrns": source_urns}
 
+        async def _run_batch(batch: List[str]) -> list:
+            params: Dict[str, Any] = {"sourceUrns": batch}
+            if target_urns:
+                params["targetUrns"] = target_urns
+            try:
+                result = await self._proj_ro_query(cypher, params=params, timeout=timeout)
+                return result.result_set or []
+            except Exception as e:
+                logger.warning(f"AGGREGATED edge read failed: {e}")
+                return []
+
+        batch_size = AGGREGATED_SOURCE_URN_BATCH_SIZE
+        if len(source_urns) > batch_size:
+            batches = [source_urns[i:i + batch_size] for i in range(0, len(source_urns), batch_size)]
+            batch_results = await asyncio.gather(*[_run_batch(b) for b in batches])
+            merged: Dict[Tuple[str, str], list] = {}
+            for batch_rows in batch_results:
+                for row in batch_rows:
+                    key = (row[0], row[1])
+                    existing = merged.get(key)
+                    if existing is None:
+                        merged[key] = list(row)
+                    else:
+                        existing[2] = (int(existing[2]) if existing[2] else 0) + (int(row[2]) if row[2] else 0)
+                        ex_types = existing[3] if isinstance(existing[3], list) else ([existing[3]] if existing[3] else [])
+                        new_types = row[3] if isinstance(row[3], list) else ([row[3]] if row[3] else [])
+                        existing[3] = list(dict.fromkeys([*ex_types, *new_types]))
+            rows = list(merged.values())
+        else:
+            rows = await _run_batch(source_urns)
+
+        last_materialized_at: Optional[str] = None
         try:
-            result = await self._proj_ro_query(cypher, params=params)
-            rows = result.result_set or []
+            if self._redis is not None:
+                raw = await self._redis.get(self._agg_last_materialized_key())
+                if raw is not None:
+                    last_materialized_at = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
         except Exception as e:
-            logger.warning(f"AGGREGATED edge read failed: {e}")
-            rows = []
+            logger.warning("Failed to read aggregated materialization timestamp: %s", e)
 
-        return self._rows_to_aggregated_result(rows)
+        return self._rows_to_aggregated_result(rows, last_materialized_at=last_materialized_at)
 
     # ------------------------------------------------------------------
     # Helpers for get_aggregated_edges_between
     # ------------------------------------------------------------------
 
-    def _rows_to_aggregated_result(self, rows: list) -> AggregatedEdgeResult:
+    def _rows_to_aggregated_result(
+        self,
+        rows: list,
+        *,
+        last_materialized_at: Optional[str] = None,
+    ) -> AggregatedEdgeResult:
         """Convert raw Cypher result rows into AggregatedEdgeResult."""
+        from ..config.resilience import AGGREGATED_EDGE_RESULT_CAP
         aggregated = []
         total_edges = 0
         for row in rows:
@@ -2326,7 +2388,12 @@ class FalkorDBProvider(GraphDataProvider):
                 sourceEdgeIds=[],
             ))
             total_edges += w
-        return AggregatedEdgeResult(aggregatedEdges=aggregated, totalSourceEdges=total_edges)
+        return AggregatedEdgeResult(
+            aggregatedEdges=aggregated,
+            totalSourceEdges=total_edges,
+            truncated=len(aggregated) >= AGGREGATED_EDGE_RESULT_CAP,
+            lastMaterializedAt=last_materialized_at,
+        )
 
     async def get_trace_lineage(
         self,

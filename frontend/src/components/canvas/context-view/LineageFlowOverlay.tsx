@@ -77,6 +77,26 @@ export function LineageFlowOverlay({
     return m
   }, [stagedEdgeChanges])
 
+  // Pre-bucket edges by their layer-node DOM-id endpoints so each redraw
+  // can iterate O(visible-edges) instead of O(E). Recomputed only when
+  // the `edges` reference itself changes — the index is consulted with
+  // the latest `globalVisibleNodes` membership inside updateFlow.
+  const edgeIndex = useMemo(() => {
+    const bySource = new Map<string, any[]>()
+    const byTarget = new Map<string, any[]>()
+    for (const edge of edges) {
+      const sourceId = `layer-node-${edge.source}`
+      const targetId = `layer-node-${edge.target}`
+      let sList = bySource.get(sourceId)
+      if (!sList) { sList = []; bySource.set(sourceId, sList) }
+      sList.push(edge)
+      let tList = byTarget.get(targetId)
+      if (!tList) { tList = []; byTarget.set(targetId, tList) }
+      tList.push(edge)
+    }
+    return { bySource, byTarget }
+  }, [edges])
+
   // Debounced update function using requestAnimationFrame
   const scheduleUpdate = useCallback(() => {
     if (rafIdRef.current !== null) {
@@ -138,7 +158,19 @@ export function LineageFlowOverlay({
       return el
     }
 
-    edges.forEach(edge => {
+    // Collect only edges with at least one endpoint currently in the
+    // viewport — bounded by O(visible-edges) instead of O(E). Dedup via a
+    // Set since an edge can appear in both indices when both endpoints
+    // are visible.
+    const candidateEdges = new Set<any>()
+    globalVisibleNodes.forEach(nodeId => {
+      const fromSrc = edgeIndex.bySource.get(nodeId)
+      if (fromSrc) for (const e of fromSrc) candidateEdges.add(e)
+      const fromTgt = edgeIndex.byTarget.get(nodeId)
+      if (fromTgt) for (const e of fromTgt) candidateEdges.add(e)
+    })
+
+    candidateEdges.forEach(edge => {
       const sourceId = `layer-node-${edge.source}`
       const targetId = `layer-node-${edge.target}`
       const sourceVisible = globalVisibleNodes.has(sourceId)
@@ -328,7 +360,7 @@ export function LineageFlowOverlay({
     })
     setOverflowBadges(badges)
     setOverflowEdges(trailingEdges)
-  }, [edges, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
+  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
 
   // Store updateFlow in ref for ResizeObserver access and expose to parent
   useEffect(() => {

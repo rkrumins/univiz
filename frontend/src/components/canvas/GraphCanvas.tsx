@@ -311,7 +311,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         .map(n => (n.data?.urn as string) || n.id)
         .filter(Boolean)
 
-      if (visibleUrns.length === 0 || visibleUrns.length > 500) return
+      if (visibleUrns.length === 0) return
 
       // Only fetch for COLLAPSED visible nodes (expanded ones' children handle themselves)
       const urnToId = new Map(nodesRef.current.map(n => [(n.data?.urn as string) || n.id, n.id]))

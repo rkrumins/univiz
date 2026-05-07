@@ -148,7 +148,13 @@ export function useEdgeProjection({
   isContainmentEdge,
   hoveredNodeId,
   suppressedAggEdgeKeys,
-}: UseEdgeProjectionOptions): { lineageEdges: any[], visibleLineageEdges: any[] } {
+}: UseEdgeProjectionOptions): { lineageEdges: any[], visibleLineageEdges: any[], unresolvedAggregatedCount: number } {
+
+  // Telemetry for silently-dropped aggregated edges whose endpoints can't be
+  // resolved through displayMap/ancestorMap/urnToIdMap. Surfacing this lets
+  // callers render a "X edges hidden — expand parents to reveal" badge.
+  const unresolvedAggregatedRef = useRef(0)
+  const lastWarnAtRef = useRef(0)
 
   // ── Flat node index — O(1) lookup replacing O(N) tree search ──────────
   const nodeIndex = useMemo(() => buildNodeIndex(nodesByLayer), [nodesByLayer])
@@ -284,6 +290,7 @@ export function useEdgeProjection({
     }
 
     // A. Aggregated Edges
+    let unresolvedThisPass = 0
     Array.from(aggregatedEdges.values())
       .filter(e => e.state === 'collapsed')
       .forEach(e => {
@@ -307,8 +314,18 @@ export function useEdgeProjection({
               sourceEdgeIds: agg.sourceEdgeIds,
             }
           }, 'AGGREGATED')
+        } else if (!sId && !tId) {
+          unresolvedThisPass++
         }
       })
+    unresolvedAggregatedRef.current = unresolvedThisPass
+    if (unresolvedThisPass > 0) {
+      const now = Date.now()
+      if (now - lastWarnAtRef.current > 1000) {
+        lastWarnAtRef.current = now
+        console.warn(`[useEdgeProjection] ${unresolvedThisPass} aggregated edges hidden — endpoints unresolvable via displayMap/ancestorMap/urnToIdMap`)
+      }
+    }
 
     // B. Regular / Trace Edges
     edges
@@ -431,5 +448,9 @@ export function useEdgeProjection({
     })
   }, [projectedEdges, expandedNodes, displayMap, hoveredNodeId])
 
-  return { lineageEdges, visibleLineageEdges: visibleLineageEdgesWithDelegation }
+  return {
+    lineageEdges,
+    visibleLineageEdges: visibleLineageEdgesWithDelegation,
+    unresolvedAggregatedCount: unresolvedAggregatedRef.current,
+  }
 }

@@ -85,7 +85,7 @@ class _StubProvider(GraphDataProvider):
     async def get_full_lineage(self, urn, upstream_depth, downstream_depth, include_column_lineage=False, descendant_types=None) -> LineageResult:
         return LineageResult(nodes=list(self._nodes.values()), edges=self._edges, totalCount=len(self._nodes), hasMore=False)
 
-    async def get_aggregated_edges_between(self, source_urns, target_urns, granularity, containment_edges, lineage_edges) -> Any:
+    async def get_aggregated_edges_between(self, source_urns, target_urns, granularity, containment_edges, lineage_edges, *, timeout=None) -> Any:
         return []
 
     async def get_trace_lineage(self, urn, direction, depth, containment_edges, lineage_edges) -> LineageResult:

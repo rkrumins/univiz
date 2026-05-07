@@ -925,15 +925,26 @@ class _TimeoutMiddleware:
         self._tiers: list[tuple[str, float]] = [
             ("/api/v1/health",        float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
             ("/health",               float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
+            ("/api/v1/graph/edges/aggregated", float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
             ("/api/v1/graph/",        float(os.getenv("HTTP_TIMEOUT_GRAPH_SECS", "15"))),
             ("/api/v1/aggregation/",  float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
         ]
         self._default_timeout: float = float(os.getenv("HTTP_TIMEOUT_DEFAULT_SECS", "30"))
 
     def _resolve_timeout(self, path: str) -> float:
+        # Workspace-scoped graph routes are mounted under
+        # /api/v1/{ws_id}/graph/... — collapse the dynamic segment so the
+        # literal-prefix tiers above can still match.
+        candidates = [path]
+        if path.startswith("/api/v1/"):
+            tail = path[len("/api/v1/"):]
+            sep = tail.find("/")
+            if sep > 0:
+                candidates.append("/api/v1" + tail[sep:])
         for pattern, timeout in self._tiers:
-            if path.startswith(pattern):
-                return timeout
+            for candidate in candidates:
+                if candidate.startswith(pattern):
+                    return timeout
         return self._default_timeout
 
     def _is_sse_path(self, path: str) -> bool:

@@ -119,8 +119,8 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // Internal Fetch Helper
     // ==========================================
 
-    private async fetch<T>(path: string, options?: RequestInit & { extraParams?: Record<string, string> }): Promise<T> {
-        const { extraParams, ...fetchOptions } = options ?? {}
+    private async fetch<T>(path: string, options?: RequestInit & { extraParams?: Record<string, string>, timeoutMs?: number }): Promise<T> {
+        const { extraParams, timeoutMs, ...fetchOptions } = options ?? {}
         const method = (fetchOptions.method ?? 'GET').toUpperCase()
         const url = this.buildUrl(path, extraParams)
         const cacheKey = `${method}:${url}:${fetchOptions.body ?? ''}`
@@ -137,12 +137,12 @@ export class RemoteGraphProvider implements GraphDataProvider {
         const existing = this._inflight.get(cacheKey)
         if (existing) return existing as Promise<T>
 
-        const promise = this._doFetch<T>(url, fetchOptions, method, cacheKey)
+        const promise = this._doFetch<T>(url, fetchOptions, method, cacheKey, timeoutMs)
         this._inflight.set(cacheKey, promise)
         return promise
     }
 
-    private async _doFetch<T>(url: string, fetchOptions: RequestInit, method: string, cacheKey: string): Promise<T> {
+    private async _doFetch<T>(url: string, fetchOptions: RequestInit, method: string, cacheKey: string, timeoutMs?: number): Promise<T> {
         // Circuit breaker: fail fast if provider is known-dead
         if (!this.circuitBreaker.canRequest()) {
             this._inflight.delete(cacheKey)
@@ -158,6 +158,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
             // provider calls that no longer happen here.
             const response = await fetchWithTimeout(url, {
                 ...fetchOptions,
+                ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                 headers: {
                     'Content-Type': 'application/json',
                     ...fetchOptions?.headers,
@@ -563,9 +564,13 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // ==========================================
 
     async getAggregatedEdges(request: AggregatedEdgeRequest): Promise<AggregatedEdgeResult> {
+        // Aligns with backend HTTP_TIMEOUT_AGGREGATION_SECS (45s) for the
+        // aggregated-edges route — the 8s default is sized for cache-hit
+        // graph endpoints and aborts legitimately-slow Cypher reads.
         return await this.fetch<AggregatedEdgeResult>('/edges/aggregated', {
             method: 'POST',
-            body: JSON.stringify(request)
+            body: JSON.stringify(request),
+            timeoutMs: 45_000,
         })
     }
 

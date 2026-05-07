@@ -270,6 +270,9 @@ export interface AggregatedEdgeInfo {
 export interface AggregatedEdgeResult {
     aggregatedEdges: AggregatedEdgeInfo[]
     totalSourceEdges: number
+    truncated?: boolean
+    lastMaterializedAt?: string | null
+    materializationTriggered?: boolean
 }
 
 // ============================================

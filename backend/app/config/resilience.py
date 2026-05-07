@@ -25,6 +25,17 @@ BREAKER_RESET_TIMEOUT_SECS: int = int(os.getenv("PROVIDER_BREAKER_RESET_TIMEOUT_
 # ── FalkorDB-specific query timeouts ────────────────────────────────
 # Read-only Cypher queries (MATCH ... RETURN).
 FALKORDB_QUERY_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_QUERY_TIMEOUT", "5"))
+# Aggregated-edge projection reads can scan large URN sets; the generic
+# 5s read timeout kills these on graphs with hundreds of containers.
+FALKORDB_AGGREGATED_READ_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_AGGREGATED_READ_TIMEOUT_SECS", "30"))
+# Soft cap on aggregated-edge result rows. When a response reaches this
+# count it is flagged ``truncated=true`` so the caller can render a
+# "narrow your selection" hint instead of silently showing partial data.
+AGGREGATED_EDGE_RESULT_CAP: int = int(os.getenv("AGGREGATED_EDGE_RESULT_CAP", "100000"))
+# Max source URNs sent to a single aggregated-edge Cypher; oversized
+# requests are split and gathered. Hard upper bound at 100k is enforced
+# by the provider with a 413 response.
+AGGREGATED_SOURCE_URN_BATCH_SIZE: int = int(os.getenv("AGGREGATED_SOURCE_URN_BATCH_SIZE", "5000"))
 # Write Cypher queries (CREATE, MERGE, UNWIND+MERGE batch ops).
 # Generous default because batch MERGE operations in the aggregation
 # worker can legitimately take 10-15s on large graphs.

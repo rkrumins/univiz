@@ -2,6 +2,7 @@ from typing import List, Optional
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request, Response
 from fastapi.responses import JSONResponse
@@ -470,7 +471,10 @@ class InternalEdgeQuery(BaseModel):
     """Fetch edges where BOTH source and target are in the provided URN set."""
     urns: List[str]
     edge_types: Optional[List[str]] = Field(None, alias="edgeTypes")
-    limit: int = Field(5000)
+    limit: int = Field(
+        default_factory=lambda: int(os.getenv("INTERNAL_EDGE_QUERY_LIMIT_DEFAULT", "50000")),
+        le=200000,
+    )
     class Config:
         populate_by_name = True
 

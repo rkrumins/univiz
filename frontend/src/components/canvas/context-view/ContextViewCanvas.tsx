@@ -250,6 +250,9 @@ export function ContextViewCanvas({
     isLoading: isLoadingAggregatedEdges,
     granularity: lineageGranularity,
     setGranularity: setLineageGranularity,
+    truncated: aggregationTruncated,
+    lastMaterializedAt: aggregationLastMaterializedAt,
+    materializationTriggered: aggregationMaterializationTriggered,
   } = useAggregatedLineage({ granularity: null })
 
   // Instance-level assignments from store (user drag-and-drop)
@@ -659,8 +662,6 @@ export function ContextViewCanvas({
 
     const fetchDebounced = setTimeout(() => {
       const currentVisibleList = getVisibleContainerUrns()
-
-      if (currentVisibleList.length > 500) return
 
       // Exclude expanded nodes from aggregation targets.
       // When a node is expanded, its children are already in the visible list and will
@@ -1181,6 +1182,48 @@ export function ContextViewCanvas({
             </button>
           </div>
         )}
+        {/* Aggregation state banner — surfaces backend signals so an empty
+            canvas isn't ambiguous between "no lineage" and "still computing".
+            Priority: computing > truncated > stale-materialised. */}
+        {(() => {
+          if (aggregationMaterializationTriggered) {
+            return (
+              <div
+                data-canvas-interactive
+                className="mx-4 mt-2 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/40 text-amber-700 text-xs flex items-center gap-2 z-20"
+              >
+                <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" aria-hidden="true" />
+                <span className="font-medium">Aggregations computing — this view will refresh in a moment.</span>
+              </div>
+            )
+          }
+          if (aggregationTruncated) {
+            return (
+              <div
+                data-canvas-interactive
+                className="mx-4 mt-2 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/40 text-amber-700 text-xs flex items-center gap-2 z-20"
+              >
+                <span className="font-medium">Showing the largest connections — narrow the selection to see more.</span>
+              </div>
+            )
+          }
+          if (aggregationLastMaterializedAt) {
+            const ageMs = Date.now() - new Date(aggregationLastMaterializedAt).getTime()
+            const ageMin = Math.floor(ageMs / 60_000)
+            if (ageMin > 60) {
+              const ageHours = Math.floor(ageMin / 60)
+              return (
+                <div
+                  data-canvas-interactive
+                  className="mx-4 mt-2 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/40 text-amber-700 text-xs flex items-center gap-2 z-20"
+                >
+                  <span className="font-medium">Aggregations last computed {ageHours}h ago.</span>
+                </div>
+              )
+            }
+          }
+          return null
+        })()}
         {/* Warning: missing ontology configuration */}
         {schema && containmentEdgeTypes.length === 0 && edges.length > 0 && (
           <div className="mx-4 mt-2 px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs flex items-center gap-2 z-20">
