@@ -181,6 +181,7 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
       ref={itemRef}
       id={`layer-node-${node.id}`}
       data-canvas-interactive
+      data-trace-focus={isFocusNode ? 'true' : 'false'}
       className={cn(
         "flex items-center gap-2 mx-1 rounded-xl cursor-pointer transition-all duration-200 group/item relative",
         heightClass,

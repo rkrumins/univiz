@@ -88,7 +88,7 @@ class _StubProvider(GraphDataProvider):
             totalCount=len(self._nodes), hasMore=False,
         )
 
-    async def get_aggregated_edges_between(self, source_urns, target_urns, granularity, containment_edges, lineage_edges) -> Any:
+    async def get_aggregated_edges_between(self, source_urns, target_urns, granularity, containment_edges, lineage_edges, *, timeout=None) -> Any:
         return []
 
     async def get_trace_lineage(self, urn, direction, depth, containment_edges, lineage_edges) -> LineageResult:

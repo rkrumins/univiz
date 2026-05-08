@@ -9,7 +9,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
-from typing import Awaitable, Callable, List, Optional, Dict, Any, Set
+from typing import Awaitable, Callable, List, Optional, Dict, Any, Set, Tuple
 
 from ..models.graph import (
     GraphNode, GraphEdge, NodeQuery, EdgeQuery,
@@ -454,6 +454,12 @@ class FalkorDBProvider(GraphDataProvider):
             True if these came from a real ontology definition (assigned or system).
             False if from introspection-only — an empty list should NOT suppress
             the hardcoded fallback.
+
+        Cache invalidation is implicit: the ancestors cache key
+        (``_ancestors_cache_key``) hashes the resolved type set, so a
+        change to ``types`` automatically routes reads/writes to a
+        different Redis namespace. No manual flush is needed; old
+        namespaces are simply unreachable and lazy-evicted by Redis.
         """
         if from_ontology or types:
             self._resolved_containment_types: Set[str] = {t.upper() for t in types}
@@ -531,35 +537,27 @@ class FalkorDBProvider(GraphDataProvider):
     def _get_containment_edge_types(self) -> Set[str]:
         """Return the authoritative containment edge type set.
 
-        Resolution chain (first match wins):
-        1. Ontology-resolved types injected by ContextEngine (may be empty = no hierarchy)
-        2. CONTAINMENT_EDGE_TYPES env var (explicit operator opt-in)
-        3. Raise ProviderConfigurationError — there is no safe hardcoded fallback
-           in a multi-tenant, custom-ontology system.
+        Single source of truth: the ontology-resolved types injected by
+        ContextEngine / aggregation. Empty is a valid resolved state
+        (flat graph with no containment hierarchy). Anything else
+        raises ``ProviderConfigurationError`` — silently defaulting in
+        a multi-tenant system masks ontology-coverage bugs the
+        resolution gate is meant to surface.
 
-        Enterprise tenants may use arbitrary edge type naming (e.g. "HAS_TABLE",
-        "PART_OF", "OWNS"). Silently defaulting to {CONTAINS, BELONGS_TO} produced
-        the "no results" bug in /nodes/top-level because such tenants legitimately
-        have neither type, yet the provider classified everything as "has a parent".
-        The right failure mode is loud and actionable at the API boundary.
+        The legacy ``CONTAINMENT_EDGE_TYPES`` env-var fallback was
+        removed: it was an operator escape hatch from the era before
+        the resolution gate, and it lets aggregation paths bypass the
+        per-data-source ontology assignment. Operators that need to
+        configure containment now do so by editing the ontology.
         """
-        # Prefer ontology-resolved types if they have been explicitly set
-        # (even if the set is empty — empty is a valid resolved state that
-        # indicates a flat graph with no containment hierarchy)
         if getattr(self, "_resolved_containment_types_set", False):
             return self._resolved_containment_types
-        if not hasattr(self, "_containment_cache"):
-            config = os.getenv("CONTAINMENT_EDGE_TYPES", "").strip()
-            if config:
-                self._containment_cache = {t.strip().upper() for t in config.split(",") if t.strip()}
-            else:
-                raise ProviderConfigurationError(
-                    "Containment edge types are not configured for this provider. "
-                    "ContextEngine must call set_containment_edge_types() from a "
-                    "resolved ontology, or the CONTAINMENT_EDGE_TYPES env var must "
-                    "be set. No hardcoded fallback is safe in a multi-tenant system."
-                )
-        return self._containment_cache
+        raise ProviderConfigurationError(
+            "Containment edge types are not configured for this provider. "
+            "ContextEngine / aggregation must call set_containment_edge_types() "
+            "with the resolved ontology before invoking provider methods that "
+            "depend on containment classification."
+        )
 
     def _extract_node_from_result(self, row) -> Optional[GraphNode]:
         """Extract GraphNode from a FalkorDB result row (Node or dict of properties)."""
@@ -579,6 +577,12 @@ class FalkorDBProvider(GraphDataProvider):
 
     def _urn_label_key(self) -> str:
         return f"{self._graph_name}:urn_labels"
+
+    def _agg_last_materialized_key(self) -> str:
+        return f"{self._graph_name}:agg:last_materialized_at"
+
+    def _agg_in_flight_key(self, ds_id: str) -> str:
+        return f"materialize:in-flight:{ds_id}"
 
     async def _cache_urn_label(self, urn: str, label: str) -> None:
         """Store a single urn→label mapping."""
@@ -1400,13 +1404,43 @@ class FalkorDBProvider(GraphDataProvider):
         except Exception:
             pass  # Index may already exist
 
+    def _ancestors_cache_key(self) -> str:
+        """Return the Redis Hash key for ancestor chains in this graph,
+        scoped by the resolved containment-types fingerprint.
+
+        Different containment configurations resolve to different
+        ancestor chains for the same URN, so they must live in
+        different cache namespaces. Without this scoping, a prior job
+        that ran with empty ``containment_edge_types`` would cache
+        ``"[]"`` for every URN and every subsequent job (with proper
+        types) would silently see cache hits and produce only
+        leaf-to-leaf AGGREGATED edges instead of propagating up the
+        containment tree.
+
+        The fingerprint is a short SHA1 over the sorted, upper-cased
+        type names. Empty / unset → a stable empty-set fingerprint
+        that flat-graph aggregations reuse safely. Identical
+        configurations (across jobs, across caller paths) reuse the
+        same key — full intra- and cross-job caching preserved.
+        """
+        import hashlib
+
+        types = getattr(self, "_resolved_containment_types", None) or set()
+        if not isinstance(types, (set, frozenset, list, tuple)):
+            types = set()
+        normalised = ",".join(sorted(t.upper() for t in types))
+        digest = hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:12]
+        return f"{self._graph_name}:ancestors:{digest}"
+
     async def _get_ancestor_chain(self, urn: str) -> List[str]:
         """Get pre-computed ancestor chain from Redis Hash, or compute + cache it.
 
         Returns list of URNs from immediate parent to root (ordered).
-        Uses Redis Hash `{graph_name}:ancestors` for O(1) lookup.
+        The cache key includes a containment-types fingerprint so a
+        change to the resolved containment configuration cannot return
+        a stale chain from a prior config (see ``_ancestors_cache_key``).
         """
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
         try:
             raw = await self._redis.execute_command("HGET", cache_key, urn)
             if raw:
@@ -1452,8 +1486,11 @@ class FalkorDBProvider(GraphDataProvider):
         """Compute and cache ancestor chains for multiple URNs at once.
 
         Uses Redis pipeline for batch HSET — zero extra round-trips.
+        Cache namespace is scoped by containment-types fingerprint
+        (see ``_ancestors_cache_key``) so a config change cannot leak
+        stale chains from a prior configuration.
         """
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
         result: Dict[str, List[str]] = {}
 
         # First, try to fetch all from cache in one pipeline
@@ -1865,10 +1902,12 @@ class FalkorDBProvider(GraphDataProvider):
         """Invalidate ancestor cache for a node and its descendants, then rebuild.
 
         When a node's parent changes, its entire subtree's ancestor chains
-        are invalidated and lazily recomputed on next access.
+        are invalidated and lazily recomputed on next access. Targets the
+        current containment-types namespace; older namespaces are
+        unreachable so they don't need to be touched.
         """
         await self._ensure_connected()
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
 
         # Invalidate this node's cached chain
         try:
@@ -2250,6 +2289,15 @@ class FalkorDBProvider(GraphDataProvider):
             "input_edges_processed": processed,
             "errors": errors,
         }
+        try:
+            if self._redis is not None:
+                from datetime import datetime, timezone
+                await self._redis.set(
+                    self._agg_last_materialized_key(),
+                    datetime.now(timezone.utc).isoformat(),
+                )
+        except Exception as e:
+            logger.warning("Failed to stamp aggregated materialization timestamp: %s", e)
         logger.info(f"Batch materialization complete: {stats}")
         return stats
 
@@ -2260,6 +2308,8 @@ class FalkorDBProvider(GraphDataProvider):
         granularity: Any,
         containment_edges: List[str],
         lineage_edges: List[str],
+        *,
+        timeout: Optional[float] = None,
     ) -> AggregatedEdgeResult:
         """Read pre-materialized AGGREGATED edges from the projection graph.
 
@@ -2267,9 +2317,20 @@ class FalkorDBProvider(GraphDataProvider):
         No live fallback: if materialization hasn't run, returns empty result
         so the caller knows to trigger a backfill.
         """
+        from fastapi import HTTPException
+        from ..config.resilience import AGGREGATED_SOURCE_URN_BATCH_SIZE
+
+        if len(source_urns) > 100_000:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "TOO_MANY_SOURCE_URNS",
+                    "limit": 100000,
+                    "received": len(source_urns),
+                },
+            )
+
         await self._ensure_connected()
-
-
 
         if target_urns:
             cypher = (
@@ -2280,10 +2341,6 @@ class FalkorDBProvider(GraphDataProvider):
                 "r.weight AS weight, r.sourceEdgeTypes AS types "
                 "ORDER BY r.weight DESC"
             )
-            params: Dict[str, Any] = {
-                "sourceUrns": source_urns,
-                "targetUrns": target_urns,
-            }
         else:
             cypher = (
                 "MATCH (s)-[r:AGGREGATED]->(t) "
@@ -2293,23 +2350,61 @@ class FalkorDBProvider(GraphDataProvider):
                 "r.weight AS weight, r.sourceEdgeTypes AS types "
                 "ORDER BY r.weight DESC"
             )
-            params = {"sourceUrns": source_urns}
 
+        async def _run_batch(batch: List[str]) -> list:
+            params: Dict[str, Any] = {"sourceUrns": batch}
+            if target_urns:
+                params["targetUrns"] = target_urns
+            try:
+                result = await self._proj_ro_query(cypher, params=params, timeout=timeout)
+                return result.result_set or []
+            except Exception as e:
+                logger.warning(f"AGGREGATED edge read failed: {e}")
+                return []
+
+        batch_size = AGGREGATED_SOURCE_URN_BATCH_SIZE
+        if len(source_urns) > batch_size:
+            batches = [source_urns[i:i + batch_size] for i in range(0, len(source_urns), batch_size)]
+            batch_results = await asyncio.gather(*[_run_batch(b) for b in batches])
+            merged: Dict[Tuple[str, str], list] = {}
+            for batch_rows in batch_results:
+                for row in batch_rows:
+                    key = (row[0], row[1])
+                    existing = merged.get(key)
+                    if existing is None:
+                        merged[key] = list(row)
+                    else:
+                        existing[2] = (int(existing[2]) if existing[2] else 0) + (int(row[2]) if row[2] else 0)
+                        ex_types = existing[3] if isinstance(existing[3], list) else ([existing[3]] if existing[3] else [])
+                        new_types = row[3] if isinstance(row[3], list) else ([row[3]] if row[3] else [])
+                        existing[3] = list(dict.fromkeys([*ex_types, *new_types]))
+            rows = list(merged.values())
+        else:
+            rows = await _run_batch(source_urns)
+
+        last_materialized_at: Optional[str] = None
         try:
-            result = await self._proj_ro_query(cypher, params=params)
-            rows = result.result_set or []
+            if self._redis is not None:
+                raw = await self._redis.get(self._agg_last_materialized_key())
+                if raw is not None:
+                    last_materialized_at = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
         except Exception as e:
-            logger.warning(f"AGGREGATED edge read failed: {e}")
-            rows = []
+            logger.warning("Failed to read aggregated materialization timestamp: %s", e)
 
-        return self._rows_to_aggregated_result(rows)
+        return self._rows_to_aggregated_result(rows, last_materialized_at=last_materialized_at)
 
     # ------------------------------------------------------------------
     # Helpers for get_aggregated_edges_between
     # ------------------------------------------------------------------
 
-    def _rows_to_aggregated_result(self, rows: list) -> AggregatedEdgeResult:
+    def _rows_to_aggregated_result(
+        self,
+        rows: list,
+        *,
+        last_materialized_at: Optional[str] = None,
+    ) -> AggregatedEdgeResult:
         """Convert raw Cypher result rows into AggregatedEdgeResult."""
+        from ..config.resilience import AGGREGATED_EDGE_RESULT_CAP
         aggregated = []
         total_edges = 0
         for row in rows:
@@ -2326,7 +2421,12 @@ class FalkorDBProvider(GraphDataProvider):
                 sourceEdgeIds=[],
             ))
             total_edges += w
-        return AggregatedEdgeResult(aggregatedEdges=aggregated, totalSourceEdges=total_edges)
+        return AggregatedEdgeResult(
+            aggregatedEdges=aggregated,
+            totalSourceEdges=total_edges,
+            truncated=len(aggregated) >= AGGREGATED_EDGE_RESULT_CAP,
+            lastMaterializedAt=last_materialized_at,
+        )
 
     async def get_trace_lineage(
         self,

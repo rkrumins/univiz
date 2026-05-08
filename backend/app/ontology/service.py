@@ -67,10 +67,17 @@ class LocalOntologyService:
         introspected_rel_ids: Optional[List[str]] = None,
     ) -> ResolvedOntology:
         """
-        Three-layer merge:
-        1. System default (only when no assigned ontology — opt-in fallback)
-        2. Assigned ontology (per data source or workspace)
-        3. Introspected types (gap-fill — types in graph but not in ontology)
+        Two-layer merge:
+        1. Assigned ontology (per data source or workspace)
+        2. Introspected types (gap-fill — types in graph but not in ontology)
+
+        The system-default merge layer was removed. Aggregation requires
+        the assigned ontology to fully cover and classify the graph
+        (enforced by ``backend.app.ontology.gate``); falling back to a
+        system default would mask the gaps that gate is meant to surface.
+        Read paths get the same behaviour for consistency — Layer 2
+        still synthesizes fallback definitions for un-onboarded data
+        sources so the explorer keeps rendering unmapped types.
         """
         assigned: Optional[OntologyData] = None
         if workspace_id:
@@ -79,15 +86,8 @@ class LocalOntologyService:
             except Exception:
                 logger.exception("Failed to load assigned ontology for workspace=%s ds=%s", workspace_id, data_source_id)
 
-        # Only use system default as base when NO assigned ontology exists.
-        # This makes the system ontology opt-in — it provides fallback definitions
-        # for graphs that haven't been configured, but doesn't pollute custom ontologies.
-        system_default: Optional[OntologyData] = None
-        if assigned is None:
-            system_default = await self._repo.get_system_default()
-
         return resolve_ontology(
-            system_default=system_default,
+            system_default=None,
             assigned=assigned,
             introspected_entity_ids=introspected_entity_ids,
             introspected_rel_ids=introspected_rel_ids,

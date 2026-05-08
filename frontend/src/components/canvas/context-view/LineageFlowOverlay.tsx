@@ -77,6 +77,26 @@ export function LineageFlowOverlay({
     return m
   }, [stagedEdgeChanges])
 
+  // Pre-bucket edges by their layer-node DOM-id endpoints so each redraw
+  // can iterate O(visible-edges) instead of O(E). Recomputed only when
+  // the `edges` reference itself changes — the index is consulted with
+  // the latest `globalVisibleNodes` membership inside updateFlow.
+  const edgeIndex = useMemo(() => {
+    const bySource = new Map<string, any[]>()
+    const byTarget = new Map<string, any[]>()
+    for (const edge of edges) {
+      const sourceId = `layer-node-${edge.source}`
+      const targetId = `layer-node-${edge.target}`
+      let sList = bySource.get(sourceId)
+      if (!sList) { sList = []; bySource.set(sourceId, sList) }
+      sList.push(edge)
+      let tList = byTarget.get(targetId)
+      if (!tList) { tList = []; byTarget.set(targetId, tList) }
+      tList.push(edge)
+    }
+    return { bySource, byTarget }
+  }, [edges])
+
   // Debounced update function using requestAnimationFrame
   const scheduleUpdate = useCallback(() => {
     if (rafIdRef.current !== null) {
@@ -138,7 +158,19 @@ export function LineageFlowOverlay({
       return el
     }
 
-    edges.forEach(edge => {
+    // Collect only edges with at least one endpoint currently in the
+    // viewport — bounded by O(visible-edges) instead of O(E). Dedup via a
+    // Set since an edge can appear in both indices when both endpoints
+    // are visible.
+    const candidateEdges = new Set<any>()
+    globalVisibleNodes.forEach(nodeId => {
+      const fromSrc = edgeIndex.bySource.get(nodeId)
+      if (fromSrc) for (const e of fromSrc) candidateEdges.add(e)
+      const fromTgt = edgeIndex.byTarget.get(nodeId)
+      if (fromTgt) for (const e of fromTgt) candidateEdges.add(e)
+    })
+
+    candidateEdges.forEach(edge => {
       const sourceId = `layer-node-${edge.source}`
       const targetId = `layer-node-${edge.target}`
       const sourceVisible = globalVisibleNodes.has(sourceId)
@@ -194,6 +226,8 @@ export function LineageFlowOverlay({
           const isEdgeHighlighted = isHighlightActive && highlightedEdges?.has(edge.id)
           const isEdgeDimmed = isHighlightActive && !highlightedEdges?.has(edge.id)
 
+          let isTraceEdge = false
+          let isFocusIncident = false
           if (isTracing && traceResult) {
             edgeOpacity = edge.isGhost ? 0.4 : 0.8
             dynamicStrokeWidth = baseStrokeWidth + 1
@@ -210,9 +244,21 @@ export function LineageFlowOverlay({
               color = '#a78bfa'
             }
 
-            if (!srcInUpstream && !tgtInUpstream && !srcInDownstream && !tgtInDownstream) {
+            const focusId = traceResult.focusId
+            isFocusIncident = !!focusId && (
+              edge.source === focusId || edge.target === focusId
+            )
+
+            if (!srcInUpstream && !tgtInUpstream && !srcInDownstream && !tgtInDownstream && !isFocusIncident) {
               edgeOpacity = edge.isGhost ? 0.05 : 0.1
               dynamicStrokeWidth = Math.max(1, baseStrokeWidth - 1)
+            } else {
+              // Trace participants — including focus-incident — get the soft
+              // outer drop-shadow glow via the `nx-edge-trace` class. The
+              // stroke itself stays at the regular trace width so the focus
+              // edges read as part of the same set rather than as bolded
+              // emphasis lines.
+              isTraceEdge = true
             }
           } else {
             if (isEdgeHighlighted) {
@@ -248,6 +294,8 @@ export function LineageFlowOverlay({
               ? edge.types
               : edge.originalType ? [edge.originalType] : [],
             confidence: edge.confidence || 0,
+            isTraceEdge,
+            isFocusIncident,
           })
         }
         return
@@ -328,7 +376,7 @@ export function LineageFlowOverlay({
     })
     setOverflowBadges(badges)
     setOverflowEdges(trailingEdges)
-  }, [edges, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
+  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
 
   // Store updateFlow in ref for ResizeObserver access and expose to parent
   useEffect(() => {
@@ -664,6 +712,7 @@ export function LineageFlowOverlay({
               data-edge-id={edge.id}
               data-edge-src={edge.source}
               data-edge-tgt={edge.target}
+              className={edge.isTraceEdge ? 'nx-edge-trace' : undefined}
               style={{ opacity: groupOpacity, transition: 'opacity 0.25s ease' }}
             >
 

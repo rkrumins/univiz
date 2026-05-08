@@ -24,6 +24,10 @@ import type {
     OntologySuggestResponse,
 } from '@/services/ontologyDefinitionService'
 import { providerService } from '@/services/providerService'
+import {
+    ontologyResolutionService,
+    type OntologyResolutionResponse,
+} from '@/services/ontologyResolutionService'
 import type { CatalogItemResponse } from '@/services/catalogService'
 import type { OnboardingFormData } from '../AssetOnboardingWizard'
 import { useToast } from '@/components/ui/toast'
@@ -786,6 +790,18 @@ export function SemanticStep({
                                                     analyzeSource={analyzeSource}
                                                 />
                                             )}
+
+                                            {/* Resolution preview banner — surfaces unclassified
+                                                relationships and missing types the moment an
+                                                ontology is selected, so the user sees the gap
+                                                before reaching the SchemaReview step. */}
+                                            {!state.skipped && state.phase === 'recommendations' && itemOntologyId && itemOntologyId !== '__create_from_graph__' && (
+                                                <ResolutionPreviewBanner
+                                                    ontologyId={itemOntologyId}
+                                                    providerId={providerId}
+                                                    assetName={item.sourceIdentifier || item.name}
+                                                />
+                                            )}
                                         </div>
                                     </motion.div>
                                 )}
@@ -1251,5 +1267,115 @@ function BulkConfirmationSummary({
                 })}
             </div>
         </motion.div>
+    )
+}
+
+
+// ─── Resolution Preview Banner ────────────────────────────────────────────
+//
+// Renders inline beneath an ontology selection. Calls the gate
+// preview endpoint and surfaces the count of unclassified
+// relationships, missing entity types, and missing edge types so
+// the user sees the gap before reaching SchemaReviewStep. This is
+// purely informational at this step — the gate is enforced (and
+// fixed) on the next step.
+
+function ResolutionPreviewBanner({
+    ontologyId,
+    providerId,
+    assetName,
+}: {
+    ontologyId: string
+    providerId: string
+    assetName: string
+}) {
+    const [resolution, setResolution] = useState<OntologyResolutionResponse | null>(null)
+    const [loading, setLoading] = useState(false)
+    const [error, setError] = useState<string | null>(null)
+
+    useEffect(() => {
+        let cancelled = false
+        async function run() {
+            setLoading(true)
+            setError(null)
+            try {
+                const envelope = await providerService.getAssetStats(providerId, assetName)
+                if (cancelled) return
+                if (!envelope.data) {
+                    setResolution(null)
+                    return
+                }
+                // The /resolution-check endpoint expects GraphSchemaStats
+                // with camelCase keys. providerService.getAssetStats returns
+                // the canonical envelope which already has that shape after
+                // transformation in SemanticStep — but the raw data here is
+                // the entityTypeCounts/edgeTypeCounts dict. Transform it.
+                const stats = transformStatsForSuggest(envelope.data)
+                const report = await ontologyResolutionService.previewForOntology(ontologyId, stats)
+                if (!cancelled) setResolution(report)
+            } catch (e) {
+                if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+            } finally {
+                if (!cancelled) setLoading(false)
+            }
+        }
+        run()
+        return () => { cancelled = true }
+    }, [ontologyId, providerId, assetName])
+
+    if (loading || error || !resolution) return null
+    const noContainment = (resolution.advisoryWarnings ?? []).includes('no_containment_edges')
+    if (
+        resolution.resolved &&
+        resolution.hierarchyWarnings.length === 0 &&
+        !noContainment
+    ) return null
+
+    const unclassifiedCount = resolution.unclassifiedRelationships.length
+    const missingEntityCount = resolution.missingEntityTypes.length
+    const missingEdgeCount = resolution.missingEdgeTypes.length
+    const hasBlocking = !resolution.resolved
+
+    const parts: string[] = []
+    if (unclassifiedCount > 0) {
+        parts.push(`${unclassifiedCount} relationship${unclassifiedCount !== 1 ? 's' : ''} not classified as containment or lineage`)
+    }
+    if (missingEntityCount > 0) {
+        parts.push(`${missingEntityCount} entity type${missingEntityCount !== 1 ? 's' : ''} missing from the ontology`)
+    }
+    if (missingEdgeCount > 0) {
+        parts.push(`${missingEdgeCount} edge type${missingEdgeCount !== 1 ? 's' : ''} missing from the ontology`)
+    }
+    if (resolution.hierarchyWarnings.length > 0) {
+        parts.push(`${resolution.hierarchyWarnings.length} hierarchy warning${resolution.hierarchyWarnings.length !== 1 ? 's' : ''}`)
+    }
+    if (noContainment) {
+        parts.push('No relationship is flagged as Containment — AGGREGATED edges will not propagate up the containment tree (only direct lineage endpoints)')
+    }
+
+    return (
+        <div className={cn(
+            'flex items-start gap-2.5 px-3.5 py-2.5 rounded-lg border text-xs',
+            hasBlocking
+                ? 'bg-amber-500/[0.06] border-amber-500/25 text-amber-500'
+                : 'bg-blue-500/[0.05] border-blue-500/20 text-blue-400',
+        )}>
+            <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+                <div className="font-medium">
+                    {hasBlocking
+                        ? 'This ontology has gaps that will block aggregation'
+                        : 'Hierarchy advisory'}
+                </div>
+                <ul className="text-[11px] opacity-90 space-y-0.5">
+                    {parts.map((p, i) => <li key={i}>• {p}</li>)}
+                </ul>
+                {hasBlocking && (
+                    <div className="text-[11px] opacity-80 pt-0.5">
+                        Resolve in the next step (Schema Review) before completing onboarding.
+                    </div>
+                )}
+            </div>
+        </div>
     )
 }

@@ -72,6 +72,7 @@ import { ContextViewHeader } from './ContextViewHeader'
 import { useLoadingToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
+import { TraceContextViewSurface } from '../trace/TraceContextViewSurface'
 
 // Re-export for backward compatibility
 export { defaultReferenceModelLayers } from './constants'
@@ -250,6 +251,7 @@ export function ContextViewCanvas({
     isLoading: isLoadingAggregatedEdges,
     granularity: lineageGranularity,
     setGranularity: setLineageGranularity,
+    truncated: aggregationTruncated,
   } = useAggregatedLineage({ granularity: null })
 
   // Instance-level assignments from store (user drag-and-drop)
@@ -659,8 +661,6 @@ export function ContextViewCanvas({
 
     const fetchDebounced = setTimeout(() => {
       const currentVisibleList = getVisibleContainerUrns()
-
-      if (currentVisibleList.length > 500) return
 
       // Exclude expanded nodes from aggregation targets.
       // When a node is expanded, its children are already in the visible list and will
@@ -1090,7 +1090,10 @@ export function ContextViewCanvas({
   }, [clearSelection])
 
   return (
-    <div className={cn("h-full w-full flex flex-col overflow-hidden bg-gradient-to-br from-canvas via-canvas to-canvas-elevated/30", className)}>
+    <div
+      data-trace-active={trace.isTracing ? 'true' : 'false'}
+      className={cn("h-full w-full flex flex-col overflow-hidden bg-gradient-to-br from-canvas via-canvas to-canvas-elevated/30", className)}
+    >
       {/* Editor Toolbar - Unified with LineageCanvas */}
       <div className="absolute top-4 left-4 z-30">
         <EditorToolbar
@@ -1138,47 +1141,37 @@ export function ContextViewCanvas({
         canRedo={stagedRedoStack.length > 0}
         onUndo={undoStagedChange}
         onRedo={redoStagedChange}
-        trace={trace}
-        focusNodeName={displayMap.get(trace.focusId || '')?.name || trace.focusId || 'Unknown Node'}
-        lineageEdgeTypes={lineageEdgeTypes}
-        onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
       />
 
       <div className="flex-1 w-full h-full relative overflow-hidden bg-canvas flex flex-col">
-        {/* Trace mode banner — persistent, always-visible exit affordance.
-            Sits above the layer columns (not floating like TraceToolbar) so
-            the user can never lose it via scroll/pan. ESC also exits via
-            useCanvasInteractions.onExitTrace. */}
-        {trace.isTracing && (
+        {/* Premium trace surface — pill, history, narrative banners, details panel.
+            Mounted inside the canvas-body (which is `relative`) so the floating
+            elements sit cleanly above the layer columns without being clipped
+            by stacking-context boundaries. z-50 keeps it above EdgeLegend (z-30)
+            and the column wrapper (z-10). */}
+        <TraceContextViewSurface
+          trace={trace}
+          displayMap={displayMap}
+          availableEdgeTypes={lineageEdgeTypes}
+          granularityOptions={granularityOptions}
+          resolveEdgeColor={resolveEdgeColor}
+          onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+          onJumpToUrn={(urn) => {
+            const id = urnToIdMap.get(urn) ?? urn
+            startTraceWithSmartLevel(id)
+          }}
+        />
+        {/* Aggregation truncation banner — backend signal that the visible
+            edge set was capped. The "computing" and "last computed Xh ago"
+            banners were removed: the materialization-triggered flag was
+            sticky after first paint and the staleness banner fired even
+            for fresh aggregations. Trust the data already on canvas. */}
+        {aggregationTruncated && (
           <div
             data-canvas-interactive
-            className="mx-4 mt-2 px-3 py-2 rounded-md bg-accent-lineage/10 border border-accent-lineage/40 text-accent-lineage text-xs flex items-center gap-2 z-20"
+            className="mx-4 mt-2 px-3 py-2 rounded-md bg-amber-500/10 border border-amber-500/40 text-amber-700 text-xs flex items-center gap-2 z-20"
           >
-            <span className="inline-block w-2 h-2 rounded-full bg-accent-lineage animate-pulse" aria-hidden="true" />
-            <span className="font-medium">Tracing</span>
-            <span className="text-accent-lineage/80 truncate" title={trace.focusId ?? undefined}>
-              {displayMap.get(trace.focusId || '')?.name || trace.focusId || 'Unknown'}
-            </span>
-            {(() => {
-              const focusNode = trace.focusId ? displayMap.get(trace.focusId) : null
-              const focusType = focusNode?.typeId
-              const level = trace.result?.effectiveLevel
-              if (!focusType && typeof level !== 'number') return null
-              return (
-                <span className="text-accent-lineage/60">
-                  · {focusType ?? ''}{typeof level === 'number' ? ` (L${level})` : ''}
-                </span>
-              )
-            })()}
-            <span className="ml-auto text-[10px] text-accent-lineage/50 hidden md:inline">Press ESC to exit</span>
-            <button
-              type="button"
-              onClick={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
-              className="ml-2 px-2 py-0.5 rounded border border-accent-lineage/40 hover:bg-accent-lineage/20 transition-colors duration-150 font-medium"
-              title="Exit trace (ESC)"
-            >
-              Exit Trace ✕
-            </button>
+            <span className="font-medium">Showing the largest connections — narrow the selection to see more.</span>
           </div>
         )}
         {/* Warning: missing ontology configuration */}

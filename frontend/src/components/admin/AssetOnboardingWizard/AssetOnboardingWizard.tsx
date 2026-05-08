@@ -12,7 +12,7 @@
 import { useState, useMemo, useCallback, useEffect, useRef, startTransition } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Database, Settings, BookOpen, Check, ChevronLeft, ChevronRight, Loader2, X, Wand2, AlertTriangle } from 'lucide-react'
+import { Database, Settings, BookOpen, Check, ChevronLeft, ChevronRight, Loader2, X, Wand2, AlertTriangle, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { workspaceService } from '@/services/workspaceService'
 import { catalogService, type CatalogItemResponse } from '@/services/catalogService'
@@ -23,6 +23,7 @@ import { useToast } from '@/components/ui/toast'
 import { WorkspaceStep } from './steps/WorkspaceStep'
 import { AggregationStep } from './steps/AggregationStep'
 import { SemanticStep } from './steps/SemanticStep'
+import { SchemaReviewStep, type SchemaReviewStatusMap } from './steps/SchemaReviewStep'
 import { ReviewStep, type NavigationDestination } from './steps/ReviewStep'
 import { aggregationService } from '@/services/aggregationService'
 import { useWizardKeyboard } from './hooks/useWizardKeyboard'
@@ -50,7 +51,7 @@ export interface OnboardingFormData {
     }>
 }
 
-type WizardStep = 'workspace' | 'aggregation' | 'semantic' | 'review'
+type WizardStep = 'workspace' | 'aggregation' | 'semantic' | 'schemaReview' | 'review'
 
 interface AssetOnboardingWizardProps {
     provider: ProviderResponse
@@ -66,6 +67,7 @@ const STEPS: { id: WizardStep; title: string; icon: typeof Database }[] = [
     { id: 'workspace', title: 'Workspace', icon: Database },
     { id: 'aggregation', title: 'Aggregation', icon: Settings },
     { id: 'semantic', title: 'Semantic Layer', icon: BookOpen },
+    { id: 'schemaReview', title: 'Schema Review', icon: ShieldCheck },
     { id: 'review', title: 'Review', icon: Check },
 ]
 
@@ -116,6 +118,9 @@ export function AssetOnboardingWizard({
     const [workspaceNames, setWorkspaceNames] = useState<Record<string, string>>({})
     const [ontologyNames, setOntologyNames] = useState<Record<string, string>>({})
 
+    // SchemaReview gate state — driven by SchemaReviewStep, read by canProceed.
+    const [schemaReviewStatus, setSchemaReviewStatus] = useState<SchemaReviewStatusMap>({})
+
     // Loaded workspace names (from WorkspaceStep's API call) — used throughout wizard
     const [loadedWorkspaceNames, setLoadedWorkspaceNames] = useState<Record<string, string>>({})
 
@@ -138,6 +143,7 @@ export function AssetOnboardingWizard({
             setCreatedContext(null)
             setCreatedDataSourceIds([])
             setShowCloseConfirm(false)
+            setSchemaReviewStatus({})
             setFormData({
                 allocations: Object.fromEntries(
                     catalogItems.map(c => [c.id, { workspaceId: '', newWorkspaceName: '', newWorkspaceDescription: '' }])
@@ -174,10 +180,19 @@ export function AssetOnboardingWizard({
                 // Allow proceeding if at least one ontology is set OR all are explicitly left empty (skipped)
                 return Object.values(formData.ontologySelections).some(s => s.ontologyId !== '') ||
                     Object.values(formData.ontologySelections).every(s => s.ontologyId === '')
+            case 'schemaReview': {
+                // Every catalog item that has an ontology assigned must
+                // pass the resolution gate. Items without an ontology
+                // (skipped) bypass aggregation entirely so they don't
+                // need to be resolved. Hierarchy warnings stay advisory.
+                const required = catalogItems.filter(c => formData.ontologySelections[c.id]?.ontologyId)
+                if (required.length === 0) return true
+                return required.every(c => schemaReviewStatus[c.id]?.resolution?.resolved === true)
+            }
             case 'review':
                 return true
         }
-    }, [currentStep, formData])
+    }, [currentStep, formData, catalogItems, schemaReviewStatus])
 
     // ─── Step Warnings (inline validation) ────────────────────────────────────
     const stepWarnings = useMemo((): string[] => {
@@ -193,10 +208,18 @@ export function AssetOnboardingWizard({
                 return catalogItems
                     .filter(c => !formData.ontologySelections[c.id]?.ontologyId)
                     .map(c => `"${c.name}" has no ontology selected`)
+            case 'schemaReview':
+                return catalogItems
+                    .filter(c => {
+                        const ontologyId = formData.ontologySelections[c.id]?.ontologyId
+                        if (!ontologyId) return false
+                        return !schemaReviewStatus[c.id]?.resolution?.resolved
+                    })
+                    .map(c => `"${c.name}" has unresolved ontology gaps`)
             default:
                 return []
         }
-    }, [currentStep, formData, catalogItems])
+    }, [currentStep, formData, catalogItems, schemaReviewStatus])
 
     // ─── Step Summary (mini-text under completed step pills) ────────────────
     const getStepSummary = useCallback((stepId: WizardStep): string | null => {
@@ -223,10 +246,16 @@ export function AssetOnboardingWizard({
                 const configured = Object.values(formData.ontologySelections).filter(s => s.ontologyId).length
                 return `${configured}/${catalogItems.length} configured`
             }
+            case 'schemaReview': {
+                const required = catalogItems.filter(c => formData.ontologySelections[c.id]?.ontologyId)
+                if (required.length === 0) return 'No sources to review'
+                const resolved = required.filter(c => schemaReviewStatus[c.id]?.resolution?.resolved).length
+                return `${resolved}/${required.length} resolved`
+            }
             default:
                 return null
         }
-    }, [formData, catalogItems, loadedWorkspaceNames])
+    }, [formData, catalogItems, loadedWorkspaceNames, schemaReviewStatus])
 
     // ─── Navigation ───────────────────────────────────────────────────────────
     const currentStepIndex = STEPS.findIndex(s => s.id === currentStep)
@@ -244,6 +273,9 @@ export function AssetOnboardingWizard({
             } else if (stepId === 'semantic') {
                 const count = Object.values(formData.ontologySelections).filter(s => s.ontologyId !== '').length
                 showToast('success', `Semantic layer configured for ${count} source${count !== 1 ? 's' : ''}`)
+            } else if (stepId === 'schemaReview') {
+                const required = catalogItems.filter(c => formData.ontologySelections[c.id]?.ontologyId).length
+                showToast('success', `Schema review passed for ${required} source${required !== 1 ? 's' : ''}`)
             }
 
             // startTransition keeps the click responsive while the next step
@@ -255,7 +287,7 @@ export function AssetOnboardingWizard({
                 setCurrentStep(STEPS[nextIndex].id)
             })
         }
-    }, [canProceed, currentStepIndex, currentStep, formData, showToast])
+    }, [canProceed, currentStepIndex, currentStep, formData, showToast, catalogItems])
 
     const goBack = useCallback(() => {
         if (previousSteps.length > 0) {
@@ -637,6 +669,16 @@ export function AssetOnboardingWizard({
                                         providerId={provider.id}
                                         workspaceNames={loadedWorkspaceNames}
                                         onOntologiesLoaded={setOntologyNames}
+                                    />
+                                ) : currentStep === 'schemaReview' ? (
+                                    <SchemaReviewStep
+                                        formData={formData}
+                                        updateFormData={updateFormData}
+                                        catalogItems={catalogItems}
+                                        providerId={provider.id}
+                                        ontologyNames={ontologyNames}
+                                        statusMap={schemaReviewStatus}
+                                        onStatusChange={setSchemaReviewStatus}
                                     />
                                 ) : currentStep === 'review' ? (
                                     <ReviewStep

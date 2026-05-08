@@ -14,6 +14,7 @@ Supports two modes controlled by ``AGGREGATION_PROXY_ENABLED`` env var:
 This is the ONLY monolith file that imports FROM the aggregation package.
 """
 import asyncio
+import json as _json
 import logging
 import os
 from typing import List, Optional
@@ -26,7 +27,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.engine import get_db_session
+from backend.app.ontology import gate as ontology_gate
+from backend.app.ontology import runtime as ontology_runtime
 from backend.app.services.aggregation.schemas import ResumeOverrides
+from backend.common.models.management import (
+    OntologyResolutionResponse,
+    OntologyResolutionRelGap,
+    OntologyResolutionHierarchyGap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +242,62 @@ async def trigger_aggregation(
     session: AsyncSession = Depends(get_db_session),
     trigger_source: str = Query("manual", alias="triggerSource"),
 ):
+    # ── Proxy mode preflight ─────────────────────────────────────────
+    # The Control Plane has no access to viz-service ontology tables,
+    # so when proxying we must enforce the gate here. In direct mode we
+    # delegate to ``svc.trigger`` (which runs the same gate via
+    # ``service._resolve_ontology``) — that avoids both the duplicate
+    # gate evaluation and the autobegin/rollback dance the prior
+    # implementation needed.
     if _PROXY_ENABLED:
+        try:
+            report = await ontology_runtime.build_resolution_report(session, ds_id)
+        except ontology_runtime.DataSourceMissing:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "data_source_not_found",
+                    "message": (
+                        f"Data source {ds_id!r} was not found. The id may be "
+                        "from a stale tab — refresh the workspace and try again."
+                    ),
+                },
+            )
+        except ontology_runtime.OntologyNotAssigned:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ontology_not_assigned",
+                    "message": (
+                        f"Data source {ds_id!r} has no ontology assigned. "
+                        "Configure an ontology for this data source first."
+                    ),
+                },
+            )
+        except ontology_runtime.OntologyMissing as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ontology_missing",
+                    "message": (
+                        f"Data source {ds_id!r} references ontology {str(exc)!r} "
+                        "but no such ontology exists. Reassign a valid ontology "
+                        "and retry."
+                    ),
+                },
+            )
+        if not report.resolved:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ontology_unresolved",
+                    "message": (
+                        "Ontology resolution gate failed: "
+                        + ", ".join(report.blocking_reasons)
+                    ),
+                    "resolution": _report_to_response(report).model_dump(by_alias=True),
+                },
+            )
         body = await request.body()
         return await _proxy(
             "POST",
@@ -243,9 +306,14 @@ async def trigger_aggregation(
             body=body,
         )
 
+    # ── Direct mode ──────────────────────────────────────────────────
+    # ``svc.trigger`` runs the gate inside its own transaction and
+    # raises typed exceptions which we map to HTTP here. No separate
+    # preflight, so no autobegin conflict with ``session.begin()``.
     AggregationTriggerRequest, _, _, ConflictError, NotFoundError = _direct_imports()
-    import json
-    body_data = json.loads(await request.body())
+    from backend.app.services.aggregation.service import OntologyResolutionError
+
+    body_data = _json.loads(await request.body())
     body = AggregationTriggerRequest(**body_data)
     try:
         job = await svc.trigger(ds_id, body, trigger_source, session)
@@ -255,10 +323,102 @@ async def trigger_aggregation(
         return job
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except OntologyResolutionError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ontology_unresolved",
+                "message": str(e),
+                "resolution": _report_to_response(e.report).model_dump(by_alias=True),
+            },
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── Resolution-gate response serializer ─────────────────────────────
+
+
+def _report_to_response(
+    report: ontology_gate.ResolutionReport,
+) -> OntologyResolutionResponse:
+    return OntologyResolutionResponse(
+        resolved=report.resolved,
+        ontologyId=report.ontology_id,
+        ontologyVersion=report.ontology_version,
+        ontologyIsPublished=report.ontology_is_published,
+        missingEntityTypes=report.missing_entity_types,
+        missingEdgeTypes=report.missing_edge_types,
+        unclassifiedRelationships=[
+            OntologyResolutionRelGap(
+                id=g.id,
+                name=g.name,
+                isContainment=g.is_containment,
+                isLineage=g.is_lineage,
+            )
+            for g in report.unclassified_relationships
+        ],
+        hasLineage=report.has_lineage,
+        hasContainment=report.has_containment,
+        hierarchyWarnings=[
+            OntologyResolutionHierarchyGap(
+                entityType=g.entity_type,
+                missingField=g.missing_field,
+            )
+            for g in report.hierarchy_warnings
+        ],
+        advisoryWarnings=report.advisory_warnings,
+        blockingReasons=report.blocking_reasons,
+        fingerprint=report.fingerprint,
+    )
+
+
+# ── GET /data-sources/{ds_id}/ontology-resolution ───────────────────
+
+
+@router.get(
+    "/data-sources/{ds_id}/ontology-resolution",
+    response_model=OntologyResolutionResponse,
+    summary="Inspect the ontology-resolution gate for a data source",
+)
+async def get_ontology_resolution(
+    ds_id: str,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Run the ontology-resolution gate against the assigned ontology
+    and return the report. Drives the wizard's SchemaReviewStep and
+    the SemanticStep warning banner.
+
+    Always reads from the viz-service ontology DB even in proxy mode
+    (the Control Plane never sees ontology rows), so this endpoint is
+    not proxied.
+    """
+    try:
+        report = await ontology_runtime.build_resolution_report(session, ds_id)
+    except ontology_runtime.DataSourceMissing:
+        raise HTTPException(status_code=404, detail=f"Data source {ds_id!r} not found")
+    except ontology_runtime.OntologyNotAssigned:
+        # Surface a structured "not configured" signal so the wizard
+        # can route to ontology selection rather than treating this
+        # as a hard fail.
+        return OntologyResolutionResponse(
+            resolved=False,
+            ontologyId=None,
+            ontologyVersion=None,
+            ontologyIsPublished=False,
+            blockingReasons=["ontology_not_assigned"],
+        )
+    except ontology_runtime.OntologyMissing as exc:
+        return OntologyResolutionResponse(
+            resolved=False,
+            ontologyId=str(exc),
+            ontologyVersion=None,
+            ontologyIsPublished=False,
+            blockingReasons=["ontology_missing"],
+        )
+    return _report_to_response(report)
 
 
 # ── GET /data-sources/{ds_id}/readiness ─────────────────────────────

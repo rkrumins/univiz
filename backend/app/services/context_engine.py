@@ -13,6 +13,7 @@ from ..models.graph import (
 )
 
 from ..providers.base import GraphDataProvider
+from ..config.resilience import FALKORDB_AGGREGATED_READ_TIMEOUT_SECS
 from backend.common.adapters import ProviderUnavailable
 
 if TYPE_CHECKING:
@@ -20,6 +21,11 @@ if TYPE_CHECKING:
     from ..ontology.protocols import OntologyServiceProtocol
 
 logger = logging.getLogger(__name__)
+
+
+# Strong references to fire-and-forget materialization tasks. Without this,
+# Python GC may collect a running task because no caller awaits it.
+_pending_materialize_tasks: Set[asyncio.Task] = set()
 
 
 # Granularity is now expressed as an entity type ID string (e.g. "dataset", "term").
@@ -1314,13 +1320,73 @@ class ContextEngine:
         else:
             containment_types = ontology.containment_edge_types
 
-        return await self.provider.get_aggregated_edges_between(
+        result = await self.provider.get_aggregated_edges_between(
             source_urns=request.source_urns,
             target_urns=request.target_urns,
             granularity=request.granularity,
             containment_edges=list(containment_types),
-            lineage_edges=list(lineage_types)
+            lineage_edges=list(lineage_types),
+            timeout=FALKORDB_AGGREGATED_READ_TIMEOUT_SECS,
         )
+
+        if (
+            len(result.aggregated_edges) == 0
+            and result.last_materialized_at is None
+            and hasattr(self.provider, "materialize_aggregated_edges_batch")
+        ):
+            triggered = await self._trigger_materialize_in_background(
+                containment_types=list(containment_types),
+                lineage_types=list(lineage_types),
+            )
+            if triggered:
+                result.materialization_triggered = True
+
+        return result
+
+    async def _trigger_materialize_in_background(
+        self,
+        *,
+        containment_types: List[str],
+        lineage_types: List[str],
+    ) -> bool:
+        """Fire a one-shot background materialize, deduped via Redis SET-NX.
+
+        Returns True when a new materialize was scheduled (or a prior one
+        is still in flight), False when the dedupe layer is unreachable
+        and we cannot safely fan-out.
+        """
+        redis = getattr(self.provider, "_redis", None)
+        if redis is None:
+            return False
+        ds_id = self._data_source_id or self._workspace_id or "default"
+        dedupe_key = f"materialize:in-flight:{ds_id}"
+        try:
+            claimed = bool(await redis.set(dedupe_key, "1", nx=True, ex=600))
+        except Exception as e:
+            logger.warning("Materialize dedupe-claim failed: %s", e)
+            return False
+
+        if not claimed:
+            return True
+
+        async def _run():
+            try:
+                await self.provider.materialize_aggregated_edges_batch(
+                    containment_edge_types=containment_types,
+                    lineage_edge_types=lineage_types,
+                )
+            except Exception as e:
+                logger.error("Background aggregated materialization failed: %s", e, exc_info=True)
+            finally:
+                try:
+                    await redis.delete(dedupe_key)
+                except Exception:
+                    pass
+
+        task = asyncio.create_task(_run(), name=f"materialize-aggregated-{ds_id}")
+        _pending_materialize_tasks.add(task)
+        task.add_done_callback(_pending_materialize_tasks.discard)
+        return True
 
     async def create_node(self, request: CreateNodeRequest) -> CreateNodeResult:
         """

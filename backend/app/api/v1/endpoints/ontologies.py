@@ -23,6 +23,9 @@ from backend.common.models.management import (
     OntologyDefinitionResponse,
     OntologyCoverageResponse,
     OntologyMatchResult,
+    OntologyResolutionResponse,
+    OntologyResolutionRelGap,
+    OntologyResolutionHierarchyGap,
     OntologySuggestResponse,
     OntologyValidationIssue,
     OntologyValidationResponse,
@@ -31,13 +34,42 @@ from backend.common.models.management import (
     OntologyImportResponse,
 )
 from backend.common.models.graph import GraphSchemaStats
+from backend.app.ontology import gate as ontology_gate
 
 router = APIRouter()
 
 
-def _invalidate_ontology_caches() -> None:
-    """Kept for call-site stability; per-request engines no longer need invalidation."""
-    return None
+async def _invalidate_ontology_caches(
+    session: AsyncSession, ontology_id: Optional[str] = None,
+) -> None:
+    """Eagerly invalidate any cached aggregation idempotency replays
+    that pin to ``ontology_id``.
+
+    The 60-minute idempotency replay in ``AggregationService.trigger``
+    short-circuits when ``AggregationJobORM.ontology_fingerprint``
+    matches the current ontology. After a successful PUT we proactively
+    clear that fingerprint to NULL on prior jobs for this ontology so
+    the very next trigger falls through to a fresh resolve. The
+    trigger-time check remains the authoritative defense; this hook
+    just makes invalidation explicit and observable.
+
+    No-op when ``ontology_id`` is None (e.g. seeding) or when the
+    aggregation schema isn't loaded (test contexts).
+    """
+    if not ontology_id:
+        return None
+    try:
+        from backend.app.services.aggregation.models import AggregationJobORM
+    except ImportError:
+        return None
+    from sqlalchemy import update
+
+    await session.execute(
+        update(AggregationJobORM)
+        .where(AggregationJobORM.ontology_id == ontology_id)
+        .where(AggregationJobORM.ontology_fingerprint.isnot(None))
+        .values(ontology_fingerprint=None)
+    )
 
 
 @router.get("", response_model=List[OntologyDefinitionResponse])
@@ -59,7 +91,7 @@ async def create_ontology(
 ):
     """Create a new ontology (starts at version 1, unpublished)."""
     result = await ontology_definition_repo.create_ontology(session, req)
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, getattr(result, "id", None))
     return result
 
 
@@ -146,7 +178,13 @@ async def update_ontology(
     ontology = await ontology_definition_repo.update_ontology(session, ontology_id, req)
     if not ontology:
         raise HTTPException(status_code=404, detail=f"Ontology '{ontology_id}' not found")
-    _invalidate_ontology_caches()
+    # Invalidate idempotency replays pinned to either the source ID
+    # (in-place update) or the freshly minted version ID (published →
+    # new-version path inside ``update_ontology``).
+    await _invalidate_ontology_caches(session, ontology_id)
+    new_id = getattr(ontology, "id", None)
+    if new_id and new_id != ontology_id:
+        await _invalidate_ontology_caches(session, new_id)
     return ontology
 
 
@@ -170,7 +208,7 @@ async def delete_ontology(
             detail="Cannot delete ontology: one or more data sources still reference it.",
         )
     await ontology_definition_repo.delete_ontology(session, ontology_id)
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, ontology_id)
 
 
 @router.post("/{ontology_id}/restore", response_model=OntologyDefinitionResponse)
@@ -182,7 +220,7 @@ async def restore_ontology(
     restored = await ontology_definition_repo.restore_ontology(session, ontology_id)
     if not restored:
         raise HTTPException(status_code=404, detail=f"No deleted ontology '{ontology_id}' found to restore")
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, ontology_id)
     return restored
 
 
@@ -210,7 +248,7 @@ async def publish_ontology(
     ontology = await ontology_definition_repo.publish_ontology(session, ontology_id)
     if not ontology:
         raise HTTPException(status_code=404, detail=f"Ontology '{ontology_id}' not found")
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, ontology_id)
     return ontology
 
 
@@ -241,7 +279,7 @@ async def clone_ontology(
         relationshipTypeDefinitions=json.loads(source.relationship_type_definitions or "{}"),
     )
     result = await ontology_definition_repo.create_ontology(session, req)
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, getattr(result, "id", None))
     return result
 
 
@@ -273,7 +311,7 @@ async def create_new_version(
             detail=f"A draft version (v{existing_draft.version}) already exists for this schema. Edit it instead.",
         )
     result = await ontology_definition_repo.create_new_version_from_source(session, source)
-    _invalidate_ontology_caches()
+    await _invalidate_ontology_caches(session, getattr(result, "id", None))
     return result
 
 
@@ -333,6 +371,72 @@ async def get_ontology_coverage(
         extraEntityTypes=report.extra_entity_types,
         coveredRelationshipTypes=report.covered_relationship_types,
         uncoveredRelationshipTypes=report.uncovered_relationship_types,
+    )
+
+
+@router.post("/{ontology_id}/resolution-check", response_model=OntologyResolutionResponse)
+async def check_ontology_resolution(
+    ontology_id: str = Path(...),
+    stats: GraphSchemaStats = Body(...),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Run the ontology-resolution gate against an arbitrary set of
+    introspected graph stats.
+
+    Used by the AssetOnboardingWizard SchemaReviewStep before any data
+    source has been created. The data-source-keyed counterpart
+    (``GET /admin/data-sources/{ds_id}/ontology-resolution``) reuses the
+    same gate against the cached stats already attached to the data
+    source.
+    """
+    import json as _json
+
+    orm = await ontology_definition_repo.get_ontology_orm(session, ontology_id)
+    if not orm:
+        raise HTTPException(status_code=404, detail=f"Ontology '{ontology_id}' not found")
+
+    introspected_entity_ids = [s.id for s in stats.entity_type_stats if getattr(s, "id", None)]
+    introspected_edge_ids = [s.id for s in stats.edge_type_stats if getattr(s, "id", None)]
+
+    report = ontology_gate.check_resolution(
+        ontology_id=orm.id,
+        ontology_version=orm.version,
+        ontology_is_published=bool(orm.is_published),
+        ontology_revision=getattr(orm, "revision", 0) or 0,
+        entity_type_definitions_raw=_json.loads(orm.entity_type_definitions or "{}"),
+        relationship_type_definitions_raw=_json.loads(orm.relationship_type_definitions or "{}"),
+        introspected_entity_ids=introspected_entity_ids,
+        introspected_edge_ids=introspected_edge_ids,
+    )
+
+    return OntologyResolutionResponse(
+        resolved=report.resolved,
+        ontologyId=report.ontology_id,
+        ontologyVersion=report.ontology_version,
+        ontologyIsPublished=report.ontology_is_published,
+        missingEntityTypes=report.missing_entity_types,
+        missingEdgeTypes=report.missing_edge_types,
+        unclassifiedRelationships=[
+            OntologyResolutionRelGap(
+                id=g.id,
+                name=g.name,
+                isContainment=g.is_containment,
+                isLineage=g.is_lineage,
+            )
+            for g in report.unclassified_relationships
+        ],
+        hasLineage=report.has_lineage,
+        hasContainment=report.has_containment,
+        hierarchyWarnings=[
+            OntologyResolutionHierarchyGap(
+                entityType=g.entity_type,
+                missingField=g.missing_field,
+            )
+            for g in report.hierarchy_warnings
+        ],
+        advisoryWarnings=report.advisory_warnings,
+        blockingReasons=report.blocking_reasons,
+        fingerprint=report.fingerprint,
     )
 
 
@@ -471,7 +575,7 @@ async def import_ontology_new(
     """
     try:
         result = await ontology_definition_repo.import_ontology(session, req, target_id=None)
-        _invalidate_ontology_caches()
+        await _invalidate_ontology_caches(session, getattr(result, "ontology_id", None))
         return result
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -495,7 +599,10 @@ async def import_ontology_into(
     """
     try:
         result = await ontology_definition_repo.import_ontology(session, req, target_id=ontology_id)
-        _invalidate_ontology_caches()
+        await _invalidate_ontology_caches(session, ontology_id)
+        target_after = getattr(result, "ontology_id", None)
+        if target_after and target_after != ontology_id:
+            await _invalidate_ontology_caches(session, target_after)
         return result
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

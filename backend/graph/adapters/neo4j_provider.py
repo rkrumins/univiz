@@ -1099,6 +1099,7 @@ class Neo4jProvider(GraphDataProvider):
     async def get_aggregated_edges_between(
         self, source_urns: List[str], target_urns: Optional[List[str]],
         granularity: Any, containment_edges: List[str], lineage_edges: List[str],
+        *, timeout: Optional[float] = None,
     ) -> AggregatedEdgeResult:
         """Read pre-materialized AGGREGATED edges."""
         ip = self._id_prop()
@@ -1985,6 +1986,27 @@ class Neo4jProvider(GraphDataProvider):
     # Ancestor / Descendant Chains                                         #
     # ================================================================== #
 
+    def _ancestors_cache_key(self) -> str:
+        """Return the Redis Hash key for ancestor chains in this database,
+        scoped by the resolved containment-types fingerprint.
+
+        Same semantics as the FalkorDB provider: different containment
+        configurations resolve to different ancestor chains for the
+        same URN, so they must live in different cache namespaces.
+        Without this scoping, a prior run with empty
+        ``containment_edge_types`` would cache ``"[]"`` for every URN
+        and every subsequent run (with proper types) would silently
+        see cache hits and produce only leaf-to-leaf AGGREGATED edges.
+        """
+        import hashlib
+
+        types = getattr(self, "_resolved_containment_types", None) or set()
+        if not isinstance(types, (set, frozenset, list, tuple)):
+            types = set()
+        normalised = ",".join(sorted(t.upper() for t in types))
+        digest = hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:12]
+        return f"{self._database}:ancestors:{digest}"
+
     async def _compute_ancestor_chain(self, urn: str) -> List[str]:
         """Single Cypher to walk containment edges upward."""
         ip = self._id_prop()
@@ -2006,10 +2028,15 @@ class Neo4jProvider(GraphDataProvider):
         return []
 
     async def _get_ancestor_chain(self, urn: str) -> List[str]:
-        """Get ancestor chain with optional Redis caching."""
+        """Get ancestor chain with optional Redis caching.
+
+        Cache namespace is scoped by containment-types fingerprint
+        (see ``_ancestors_cache_key``) so a config change cannot
+        return stale chains from a prior configuration.
+        """
         await self._ensure_redis()
         if self._redis_available and self._redis:
-            cache_key = f"{self._database}:ancestors"
+            cache_key = self._ancestors_cache_key()
             try:
                 raw = await self._redis.hget(cache_key, urn)
                 if raw:
@@ -2351,13 +2378,17 @@ class Neo4jProvider(GraphDataProvider):
             logger.error("Batched AGGREGATED decrement failed: %s", e)
 
     async def on_containment_changed(self, urn: str) -> None:
-        """Invalidate ancestor cache for a node and its descendants."""
+        """Invalidate ancestor cache for a node and its descendants.
+
+        Targets the current containment-types namespace; older
+        namespaces are unreachable so they don't need to be touched.
+        """
         await self._ensure_redis()
         if not self._redis_available or not self._redis:
             return  # No cache to invalidate
 
         ip = self._id_prop()
-        cache_key = f"{self._database}:ancestors"
+        cache_key = self._ancestors_cache_key()
         containment = list(self._get_containment_edge_types())
 
         if not containment:

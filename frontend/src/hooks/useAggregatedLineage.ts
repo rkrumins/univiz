@@ -85,6 +85,21 @@ export interface UseAggregatedLineageResult {
 
     /** Get edge types summary for an aggregated edge */
     getEdgeTypes: (aggregatedEdgeId: string) => string[]
+
+    /** True when the backend capped the aggregated-edge result set. */
+    truncated: boolean
+
+    /**
+     * ISO-8601 timestamp of the last AGGREGATED materialisation, or null if
+     * the projection has never been computed for this data source.
+     */
+    lastMaterializedAt: string | null
+
+    /**
+     * True when this response triggered a fire-and-forget materialise on
+     * the backend — the canvas should re-poll shortly to pick up edges.
+     */
+    materializationTriggered: boolean
 }
 
 // ============================================
@@ -100,12 +115,27 @@ interface CacheEntry {
 }
 
 const aggregatedEdgeCache = new Map<string, CacheEntry>()
-const CACHE_MAX_ENTRIES = 50
+const CACHE_MAX_ENTRIES = 200
+const AGGREGATED_FETCH_BATCH_SIZE = 500
+
+// FNV-1a 64-bit, BigInt arithmetic. Returns a hex string. Avoids holding
+// multi-MB joined-URN strings in the cache key across hundreds of entries.
+const FNV_OFFSET_64 = 0xcbf29ce484222325n
+const FNV_PRIME_64 = 0x100000001b3n
+const FNV_MASK_64 = 0xffffffffffffffffn
+function fnv1a64(input: string): string {
+    let hash = FNV_OFFSET_64
+    for (let i = 0; i < input.length; i++) {
+        hash ^= BigInt(input.charCodeAt(i))
+        hash = (hash * FNV_PRIME_64) & FNV_MASK_64
+    }
+    return hash.toString(16)
+}
 
 function getCacheKey(sourceUrns: string[], targetUrns: string[] | undefined, granularity: string): string {
-    const sortedSources = [...sourceUrns].sort().join(',')
-    const sortedTargets = targetUrns ? [...targetUrns].sort().join(',') : ''
-    return `${granularity}:${sortedSources}:${sortedTargets}`
+    const srcHash = fnv1a64([...sourceUrns].sort().join(''))
+    const tgtHash = targetUrns ? fnv1a64([...targetUrns].sort().join('')) : '0'
+    return `${granularity}:${srcHash}:${tgtHash}`
 }
 
 // ============================================
@@ -125,6 +155,9 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
     const [isLoading, setIsLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [granularity, setGranularity] = useState(initialGranularity)
+    const [truncated, setTruncated] = useState(false)
+    const [lastMaterializedAt, setLastMaterializedAt] = useState<string | null>(null)
+    const [materializationTriggered, setMaterializationTriggered] = useState(false)
 
     // Track current source URNs for refetch on granularity change
     const currentSourceUrnsRef = useRef<string[]>([])
@@ -152,6 +185,9 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
                 }
                 return edgeMap
             })
+            setTruncated(cached.result.truncated ?? false)
+            setLastMaterializedAt(cached.result.lastMaterializedAt ?? null)
+            setMaterializationTriggered(cached.result.materializationTriggered ?? false)
             return
         }
 
@@ -159,19 +195,64 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
         setError(null)
 
         try {
-            const result = await provider.getAggregatedEdges({
-                sourceUrns,
-                targetUrns,
-                granularity,
-            })
+            // Chunk source URNs above the per-request budget so a 100k-node
+            // canvas doesn't hand the backend a single 100k-URN payload.
+            const chunks: string[][] = []
+            if (sourceUrns.length > AGGREGATED_FETCH_BATCH_SIZE) {
+                for (let i = 0; i < sourceUrns.length; i += AGGREGATED_FETCH_BATCH_SIZE) {
+                    chunks.push(sourceUrns.slice(i, i + AGGREGATED_FETCH_BATCH_SIZE))
+                }
+            } else {
+                chunks.push(sourceUrns)
+            }
 
-            // Cache the result (LRU eviction when full)
+            const settled = await Promise.allSettled(
+                chunks.map(chunk => provider.getAggregatedEdges({
+                    sourceUrns: chunk,
+                    targetUrns,
+                    granularity,
+                }))
+            )
+
+            const fulfilled = settled
+                .filter((s): s is PromiseFulfilledResult<AggregatedEdgeResult> => s.status === 'fulfilled')
+                .map(s => s.value)
+            const rejected = settled.filter(s => s.status === 'rejected') as PromiseRejectedResult[]
+
+            // Dedupe-merge by agg.id; later chunks with same id win (last-write).
+            const mergedEdgesById = new Map<string, AggregatedEdgeInfo>()
+            let mergedTotalSourceEdges = 0
+            let mergedTruncated = false
+            let mergedLastMaterializedAt: string | null | undefined = undefined
+            let mergedMaterializationTriggered = false
+            for (const r of fulfilled) {
+                for (const agg of r.aggregatedEdges) mergedEdgesById.set(agg.id, agg)
+                mergedTotalSourceEdges += r.totalSourceEdges ?? 0
+                if (r.truncated) mergedTruncated = true
+                if (r.materializationTriggered) mergedMaterializationTriggered = true
+                if (r.lastMaterializedAt !== undefined) {
+                    if (mergedLastMaterializedAt === undefined || mergedLastMaterializedAt === null) {
+                        mergedLastMaterializedAt = r.lastMaterializedAt
+                    } else if (r.lastMaterializedAt && r.lastMaterializedAt < mergedLastMaterializedAt) {
+                        mergedLastMaterializedAt = r.lastMaterializedAt
+                    }
+                }
+            }
+            const mergedResult: AggregatedEdgeResult = {
+                aggregatedEdges: Array.from(mergedEdgesById.values()),
+                totalSourceEdges: mergedTotalSourceEdges,
+                truncated: mergedTruncated,
+                lastMaterializedAt: mergedLastMaterializedAt ?? null,
+                materializationTriggered: mergedMaterializationTriggered,
+            }
+
+            // Cache the merged result (LRU eviction when full)
             if (aggregatedEdgeCache.size >= CACHE_MAX_ENTRIES) {
                 const oldestKey = aggregatedEdgeCache.keys().next().value
                 if (oldestKey !== undefined) aggregatedEdgeCache.delete(oldestKey)
             }
             aggregatedEdgeCache.set(cacheKey, {
-                result,
+                result: mergedResult,
                 timestamp: Date.now(),
                 sourceUrns,
                 targetUrns,
@@ -181,7 +262,7 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
             // Update state with functional update to avoid dependency on aggregatedEdges
             setAggregatedEdges(prev => {
                 const edgeMap = new Map<string, AggregatedEdgeState>()
-                for (const agg of result.aggregatedEdges) {
+                for (const agg of mergedResult.aggregatedEdges) {
                     const existing = prev.get(agg.id)
                     edgeMap.set(agg.id, {
                         aggregated: agg,
@@ -191,6 +272,16 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
                 }
                 return edgeMap
             })
+
+            setTruncated(mergedResult.truncated ?? false)
+            setLastMaterializedAt(mergedResult.lastMaterializedAt ?? null)
+            setMaterializationTriggered(mergedResult.materializationTriggered ?? false)
+
+            // Partial-success: surface the failure but keep applied chunks.
+            if (rejected.length > 0) {
+                const firstErr = rejected[0].reason
+                setError(firstErr instanceof Error ? firstErr.message : 'Failed to fetch some aggregated edges')
+            }
 
             // Track for refetch
             currentSourceUrnsRef.current = sourceUrns
@@ -329,6 +420,9 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
         setAggregatedEdges(new Map())
         currentSourceUrnsRef.current = []
         currentTargetUrnsRef.current = undefined
+        setTruncated(false)
+        setLastMaterializedAt(null)
+        setMaterializationTriggered(false)
     }, [])
 
     // Get edge count
@@ -356,6 +450,9 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
         clearCache,
         getEdgeCount,
         getEdgeTypes,
+        truncated,
+        lastMaterializedAt,
+        materializationTriggered,
     }
 }
 

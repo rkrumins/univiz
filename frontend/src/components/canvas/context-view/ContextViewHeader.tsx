@@ -9,8 +9,6 @@ import { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { TraceToolbar } from '../TraceToolbar'
-import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from './types'
 
 /** Minimal entity type shape needed for the granularity selector. */
@@ -59,11 +57,9 @@ export interface ContextViewHeaderProps {
   onUndo?: () => void
   onRedo?: () => void
 
-  // Trace toolbar
-  trace: UseUnifiedTraceResult
-  focusNodeName: string
-  lineageEdgeTypes: string[]
-  onExitTrace: () => void
+  // Trace surface is now mounted directly in ContextViewCanvas's canvas-body
+  // so it floats above the layer columns rather than being clipped by the
+  // canvas-body's stacking context. No trace props needed here.
 }
 
 export function ContextViewHeader({
@@ -89,10 +85,6 @@ export function ContextViewHeader({
   canRedo = false,
   onUndo,
   onRedo,
-  trace,
-  focusNodeName,
-  lineageEdgeTypes,
-  onExitTrace,
 }: ContextViewHeaderProps) {
   const searchInputRef = useRef<HTMLInputElement>(null)
 
@@ -356,32 +348,9 @@ export function ContextViewHeader({
         )}
       </AnimatePresence>
 
-      {/* Trace Toolbar */}
-      <AnimatePresence>
-        {trace.isTracing && (
-          <TraceToolbar
-            focusNodeName={focusNodeName}
-            upstreamCount={trace.upstreamCount}
-            downstreamCount={trace.downstreamCount}
-            showUpstream={trace.showUpstream}
-            showDownstream={trace.showDownstream}
-            onToggleUpstream={() => trace.setShowUpstream(!trace.showUpstream)}
-            onToggleDownstream={() => trace.setShowDownstream(!trace.showDownstream)}
-            onExitTrace={onExitTrace}
-            onRetrace={trace.retrace}
-            onTraceUpstream={() => trace.focusId && trace.traceUpstream(trace.focusId)}
-            onTraceDownstream={() => trace.focusId && trace.traceDownstream(trace.focusId)}
-            onTraceFullLineage={() => trace.focusId && trace.traceFullLineage(trace.focusId)}
-            config={trace.config}
-            onConfigChange={trace.setConfig}
-            traceResult={trace.result}
-            statistics={trace.statistics}
-            isLoading={trace.isLoading}
-            availableLineageEdgeTypes={lineageEdgeTypes}
-            position="floating"
-          />
-        )}
-      </AnimatePresence>
+      {/* Trace surface is mounted in ContextViewCanvas's canvas-body — see
+          TraceContextViewSurface there. Keeping it out of the header avoids
+          the canvas-body's stacking context clipping the floating panel. */}
     </div>
   )
 }

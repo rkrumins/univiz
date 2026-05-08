@@ -345,6 +345,54 @@ class OntologyCoverageResponse(BaseModel):
         populate_by_name = True
 
 
+class OntologyResolutionRelGap(BaseModel):
+    """A relationship type missing classification flags."""
+    id: str
+    name: str
+    is_containment: Optional[bool] = Field(None, alias="isContainment")
+    is_lineage: Optional[bool] = Field(None, alias="isLineage")
+
+    class Config:
+        populate_by_name = True
+
+
+class OntologyResolutionHierarchyGap(BaseModel):
+    """An entity type with an incomplete hierarchy field. Advisory."""
+    entity_type: str = Field(alias="entityType")
+    missing_field: str = Field(alias="missingField")
+
+    class Config:
+        populate_by_name = True
+
+
+class OntologyResolutionResponse(BaseModel):
+    """Per-data-source ontology resolution gate report.
+
+    Drives the AssetOnboardingWizard SchemaReviewStep and is enforced
+    by AggregationService.trigger before any aggregation job is created.
+    """
+    resolved: bool
+    ontology_id: Optional[str] = Field(None, alias="ontologyId")
+    ontology_version: Optional[int] = Field(None, alias="ontologyVersion")
+    ontology_is_published: bool = Field(False, alias="ontologyIsPublished")
+    missing_entity_types: List[str] = Field(default_factory=list, alias="missingEntityTypes")
+    missing_edge_types: List[str] = Field(default_factory=list, alias="missingEdgeTypes")
+    unclassified_relationships: List[OntologyResolutionRelGap] = Field(
+        default_factory=list, alias="unclassifiedRelationships"
+    )
+    has_lineage: bool = Field(False, alias="hasLineage")
+    has_containment: bool = Field(False, alias="hasContainment")
+    hierarchy_warnings: List[OntologyResolutionHierarchyGap] = Field(
+        default_factory=list, alias="hierarchyWarnings"
+    )
+    advisory_warnings: List[str] = Field(default_factory=list, alias="advisoryWarnings")
+    blocking_reasons: List[str] = Field(default_factory=list, alias="blockingReasons")
+    fingerprint: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
+
+
 class OntologyMatchResult(BaseModel):
     ontology_id: str = Field(alias="ontologyId")
     ontology_name: str = Field(alias="ontologyName")

@@ -29,6 +29,8 @@ from .schemas import (
     ResumeOverrides,
 )
 from .fingerprint import compute_graph_fingerprint, fingerprints_match
+from backend.app.ontology import gate as ontology_gate
+from backend.app.ontology import runtime as ontology_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,15 @@ class AggregationService:
         # collapse to the original job (200 with the existing job ID).
         # Done outside the transaction so non-key-bearing callers don't
         # pay a lookup cost.
+        #
+        # The replay is ontology-aware. The prior job freezes
+        # ``containment_edge_types`` / ``lineage_edge_types`` at trigger
+        # time, so an unconditional replay would mask edits the user made
+        # to the ontology between runs (the original "edits not picked
+        # up on re-run" bug). Replay only short-circuits when the prior
+        # job's ``ontology_fingerprint`` matches the current ontology —
+        # otherwise the prior job is treated as stale and we fall
+        # through to a fresh resolve.
         idem_key = request.idempotency_key
         cutoff_iso = (
             datetime.now(timezone.utc) - timedelta(minutes=60)
@@ -109,12 +120,21 @@ class AggregationService:
                 )
             ).scalar_one_or_none()
             if existing_idem is not None:
+                if await self._replay_fingerprint_matches(
+                    existing_idem, ds_id, session,
+                ):
+                    logger.info(
+                        "Idempotent replay for data source %s — returning job %s "
+                        "(idempotency_key=%s)",
+                        ds_id, existing_idem.id, idem_key,
+                    )
+                    return self._to_response(existing_idem)
                 logger.info(
-                    "Idempotent replay for data source %s — returning job %s "
-                    "(idempotency_key=%s)",
-                    ds_id, existing_idem.id, idem_key,
+                    "Skipping idempotent replay for data source %s job %s — "
+                    "ontology fingerprint changed since first trigger; "
+                    "running a fresh resolve",
+                    ds_id, existing_idem.id,
                 )
-                return self._to_response(existing_idem)
 
         # ── Atomic claim (Phase 2 §2.1) ────────────────────────────
         # `claim_exclusive` combines a pg_try_advisory_xact_lock with
@@ -134,7 +154,9 @@ class AggregationService:
                             .limit(1)
                         )
                     ).scalar_one_or_none()
-                    if replay is not None:
+                    if replay is not None and await self._replay_fingerprint_matches(
+                        replay, ds_id, session,
+                    ):
                         return self._to_response(replay)
                 raise ConflictError(
                     "An aggregation job is already active for this data source"
@@ -171,12 +193,10 @@ class AggregationService:
                     )
             containment_types = ontology_data.get("containment_edge_types", [])
             lineage_types = ontology_data.get("lineage_edge_types", [])
-
-            if not lineage_types:
-                raise ValueError(
-                    "Aggregation requires an assigned ontology with lineage edge types. "
-                    "Please configure an ontology for this data source first."
-                )
+            # Empty-lineage is no longer possible here — the gate's
+            # ``no_lineage`` blocking reason already raised
+            # OntologyResolutionError inside ``_resolve_ontology``. The
+            # frozen list still gets persisted for the worker.
 
             # Create job with frozen edge types + denormalized graph metadata
             job_kwargs = dict(
@@ -187,6 +207,7 @@ class AggregationService:
                 graph_name=ontology_data.get("graph_name"),
                 data_source_label=ontology_data.get("data_source_label"),
                 ontology_id=ontology_data.get("ontology_id"),
+                ontology_fingerprint=ontology_data.get("ontology_fingerprint"),
                 projection_mode=request.projection_mode,
                 containment_edge_types=json.dumps(containment_types),
                 lineage_edge_types=json.dumps(lineage_types),
@@ -979,87 +1000,110 @@ class AggregationService:
     # ── Ontology Resolution ──────────────────────────────────────────
 
     async def _resolve_ontology(self, ds_id: str, session: AsyncSession) -> dict:
-        """Resolve ontology edge types for a data source.
+        """Resolve ontology edge types for a data source and run the
+        ontology-resolution gate.
 
-        DEV MODE ONLY — in the decoupled architecture, ontology resolution
-        happens in the viz-service BEFORE proxying to the Control Plane
-        (via InternalTriggerRequest with pre-resolved edge types).
+        Delegates to ``ontology_runtime.build_resolution_report`` for
+        the load + gate evaluation; translates its typed exceptions
+        into the service's domain errors so the endpoint adapter can
+        keep its existing exception → HTTP mapping. Raises:
 
-        This method is retained for backward compatibility when running
-        in dev/monolith mode (AGGREGATION_PROXY_ENABLED=false).
+            - NotFoundError  — DS row or ontology row missing
+            - ValueError     — DS exists but ontology_id is null
+            - OntologyResolutionError — gate failed (any of:
+              missing_entity_types, missing_edge_types,
+              unclassified_relationships, no_lineage)
 
         Returns dict with:
-            ontology_id, containment_edge_types, lineage_edge_types
+            ontology_id, ontology_fingerprint, workspace_id, provider_id,
+            graph_name, data_source_label, containment_edge_types,
+            lineage_edge_types
         """
-        # In dev mode, we still need access to WorkspaceDataSourceORM for
-        # the ontology_id lookup. This import is acceptable because dev
-        # mode runs all services in one process with shared DB access.
         try:
-            from backend.app.db.models import WorkspaceDataSourceORM
-        except ImportError:
-            raise ValueError(
-                "Ontology resolution requires monolith DB models. "
-                "In microservice mode, use InternalTriggerRequest with pre-resolved edge types."
-            )
-
-        ds = await session.get(WorkspaceDataSourceORM, ds_id)
-        if not ds:
+            report = await ontology_runtime.build_resolution_report(session, ds_id)
+        except ontology_runtime.DataSourceMissing:
             raise NotFoundError(f"Data source {ds_id} not found")
-
-        if not ds.ontology_id:
+        except ontology_runtime.OntologyNotAssigned:
             raise ValueError(
                 "Aggregation requires an assigned ontology. "
                 "Please configure an ontology for this data source first."
             )
+        except ontology_runtime.OntologyMissing as exc:
+            raise NotFoundError(f"Ontology {str(exc)} not found")
 
-        # Common metadata from the data source (for denormalization + guards)
-        ds_meta = {
+        if not report.resolved:
+            raise OntologyResolutionError(report)
+
+        # Gate passed — derive the flat edge-type lists from the same
+        # ontology row the runtime helper just used. We re-load the row
+        # here only to avoid threading it back through the helper API;
+        # one extra ORM lookup is cheap relative to the gate eval.
+        from backend.app.db.models import OntologyORM, WorkspaceDataSourceORM
+        from backend.app.ontology.resolver import (
+            parse_entity_definitions,
+            parse_relationship_definitions,
+            derive_flat_lists,
+        )
+
+        ds = await session.get(WorkspaceDataSourceORM, ds_id)
+        ontology_orm = await session.get(OntologyORM, ds.ontology_id)
+        entity_defs = parse_entity_definitions(
+            json.loads(ontology_orm.entity_type_definitions or "{}")
+        )
+        rel_defs = parse_relationship_definitions(
+            json.loads(ontology_orm.relationship_type_definitions or "{}")
+        )
+        flat = derive_flat_lists(entity_defs, rel_defs)
+
+        return {
             "ontology_id": ds.ontology_id,
+            "ontology_fingerprint": report.fingerprint,
             "workspace_id": ds.workspace_id,
             "provider_id": ds.provider_id,
             "graph_name": ds.graph_name,
             "data_source_label": getattr(ds, "label", None),
+            "containment_edge_types": flat.containment_edge_types,
+            "lineage_edge_types": flat.lineage_edge_types,
         }
 
-        # Use the ontology service if available (monolith direct call)
-        if self._ontology_service:
-            try:
-                ontology = await self._ontology_service.resolve(
-                    workspace_id=ds.workspace_id,
-                    data_source_id=ds_id,
-                )
-                return {
-                    **ds_meta,
-                    "containment_edge_types": ontology.containment_edge_types,
-                    "lineage_edge_types": ontology.lineage_edge_types,
-                }
-            except Exception as e:
-                logger.warning(
-                    "Ontology resolution via service failed, falling back to DB: %s", e
-                )
+    async def _replay_fingerprint_matches(
+        self,
+        existing_job: AggregationJobORM,
+        ds_id: str,
+        session: AsyncSession,
+    ) -> bool:
+        """Return True if it's safe to replay ``existing_job`` for the
+        current trigger.
 
-        # Fallback: read ontology definitions directly from DB
-        from backend.app.db.models import OntologyORM
-        ontology_orm = await session.get(OntologyORM, ds.ontology_id)
-        if not ontology_orm:
-            raise NotFoundError(f"Ontology {ds.ontology_id} not found")
+        The replay is only safe when the ontology hasn't materially
+        changed since ``existing_job`` was created. We compare the
+        prior job's frozen ``ontology_fingerprint`` to a freshly
+        computed fingerprint over the current OntologyORM row. Any
+        mismatch (including either side being NULL) returns False so
+        the caller falls through to a fresh resolve.
 
-        from backend.app.ontology.resolver import parse_relationship_definitions, derive_flat_lists, parse_entity_definitions
+        Tolerates missing data sources / ontologies (returns False) so
+        a stale prior job never wins by accident; the surrounding
+        gate-fail path will produce a clearer 422 below.
+        """
+        if not existing_job.ontology_fingerprint:
+            return False
         try:
-            entity_defs = parse_entity_definitions(
-                json.loads(ontology_orm.entity_type_definitions or "{}")
-            )
-            rel_defs = parse_relationship_definitions(
-                json.loads(ontology_orm.relationship_type_definitions or "{}")
-            )
-            flat = derive_flat_lists(entity_defs, rel_defs)
-            return {
-                **ds_meta,
-                "containment_edge_types": flat.containment_edge_types,
-                "lineage_edge_types": flat.lineage_edge_types,
-            }
-        except Exception as e:
-            raise ValueError(f"Failed to parse ontology definitions: {e}") from e
+            from backend.app.db.models import WorkspaceDataSourceORM, OntologyORM
+        except ImportError:
+            return False
+        ds = await session.get(WorkspaceDataSourceORM, ds_id)
+        if ds is None or not ds.ontology_id:
+            return False
+        # If the assigned ontology changed entirely, the prior fingerprint
+        # belongs to a different ontology — never safe to replay.
+        if ds.ontology_id != existing_job.ontology_id:
+            return False
+        ontology_orm = await session.get(OntologyORM, ds.ontology_id)
+        if ontology_orm is None:
+            return False
+        current_fp = ontology_gate.compute_fingerprint_from_ontology_orm(ontology_orm)
+        return current_fp == existing_job.ontology_fingerprint
 
     # ── State Management Helpers ────────────────────────────────────────
 
@@ -1146,3 +1190,20 @@ class ConflictError(Exception):
 class NotFoundError(Exception):
     """404 — resource not found."""
     pass
+
+
+class OntologyResolutionError(Exception):
+    """422 — the assigned ontology fails the resolution gate.
+
+    Carries the full ``ResolutionReport`` so the endpoint can surface
+    blocking_reasons + per-relationship gaps to the wizard without
+    re-running the gate. Distinct from a generic ``ValueError`` so
+    the trigger endpoint can attach the structured detail body
+    cleanly.
+    """
+
+    def __init__(self, report):
+        self.report = report
+        super().__init__(
+            "Ontology resolution gate failed: " + ", ".join(report.blocking_reasons)
+        )
