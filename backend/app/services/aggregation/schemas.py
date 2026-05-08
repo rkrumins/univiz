@@ -4,7 +4,7 @@ Pydantic request/response schemas for the aggregation API.
 These live inside the aggregation package so the package is self-contained.
 The thin FastAPI adapter (app/api/v1/endpoints/aggregation.py) imports from here.
 """
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -255,13 +255,6 @@ class DataSourceReadinessResponse(BaseModel):
     last_aggregated_at: Optional[str] = Field(None, alias="lastAggregatedAt")
     aggregation_edge_count: int = Field(0, alias="aggregationEdgeCount")
     message: str
-    # Ontology-resolution gate report. Loose dict-typed to keep the
-    # aggregation package free of viz-service ``OntologyResolutionResponse``
-    # imports (the package is self-contained per its docstring).
-    # Wizard / typed clients should run the payload through
-    # ``OntologyResolutionResponse.model_validate`` themselves. None when
-    # no ontology is assigned or the gate could not be evaluated.
-    ontology_resolution: Optional[Dict[str, Any]] = Field(None, alias="ontologyResolution")
 
     class Config:
         populate_by_name = True

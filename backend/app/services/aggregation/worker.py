@@ -212,19 +212,11 @@ class AggregationWorker:
                 await provider.set_projection_mode(job.projection_mode or "in_source")
 
                 # Configure the provider with the data source's specific structural mapping
-                # so physical queries can correctly differentiate lineage vs containment
+                # so physical queries can correctly differentiate lineage vs containment.
+                # The provider's ancestors cache is keyed by a fingerprint of these
+                # types, so a change in classification automatically routes reads to
+                # a fresh cache namespace — no manual invalidation needed.
                 provider.set_containment_edge_types(containment_types)
-
-                # Wipe the per-graph ancestors cache before materializing.
-                # The cache is intra-job memoization (see provider docs):
-                # persisting it across jobs lets a prior run with stale
-                # ``containment_edge_types`` (e.g. empty list before the
-                # user flagged ``is_containment``) leak ``[]`` ancestor
-                # chains into this run via cache hits, which collapses
-                # AGGREGATED edge generation to leaf-to-leaf only.
-                # Best-effort: provider swallows Redis errors.
-                if hasattr(provider, "reset_ancestors_cache"):
-                    await provider.reset_ancestors_cache()
 
                 # Compute fingerprint before aggregation
                 job.graph_fingerprint_before = await compute_graph_fingerprint(provider)

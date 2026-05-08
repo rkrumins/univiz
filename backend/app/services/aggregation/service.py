@@ -30,6 +30,7 @@ from .schemas import (
 )
 from .fingerprint import compute_graph_fingerprint, fingerprints_match
 from backend.app.ontology import gate as ontology_gate
+from backend.app.ontology import runtime as ontology_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +289,6 @@ class AggregationService:
                 last_aggregated_at=None,
                 aggregation_edge_count=0,
                 message="Aggregation has not been configured. Aggregate or skip to create views.",
-                ontology_resolution=await self._readiness_resolution_payload(ds_id, session),
             )
 
         # Find active job (if any)
@@ -343,7 +343,6 @@ class AggregationService:
             last_aggregated_at=state.last_aggregated_at,
             aggregation_edge_count=state.aggregation_edge_count or 0,
             message=messages.get(status, "Unknown status."),
-            ontology_resolution=await self._readiness_resolution_payload(ds_id, session),
         )
 
     async def get_job(
@@ -1004,82 +1003,50 @@ class AggregationService:
         """Resolve ontology edge types for a data source and run the
         ontology-resolution gate.
 
-        Reads the assigned ontology, evaluates ``ontology_gate.check_resolution``
-        against the cached graph schema stats, and rejects with ValueError
-        (mapped to HTTP 422 by the endpoint adapter) if the report is not
-        resolved. The four blocking reasons are:
+        Delegates to ``ontology_runtime.build_resolution_report`` for
+        the load + gate evaluation; translates its typed exceptions
+        into the service's domain errors so the endpoint adapter can
+        keep its existing exception → HTTP mapping. Raises:
 
-            - missing_entity_types
-            - missing_edge_types
-            - unclassified_relationships
-            - no_lineage
+            - NotFoundError  — DS row or ontology row missing
+            - ValueError     — DS exists but ontology_id is null
+            - OntologyResolutionError — gate failed (any of:
+              missing_entity_types, missing_edge_types,
+              unclassified_relationships, no_lineage)
 
         Returns dict with:
             ontology_id, ontology_fingerprint, workspace_id, provider_id,
             graph_name, data_source_label, containment_edge_types,
             lineage_edge_types
         """
-        # In dev mode, we still need access to WorkspaceDataSourceORM for
-        # the ontology_id lookup. This import is acceptable because dev
-        # mode runs all services in one process with shared DB access.
         try:
-            from backend.app.db.models import WorkspaceDataSourceORM, OntologyORM
-        except ImportError:
-            raise ValueError(
-                "Ontology resolution requires monolith DB models. "
-                "In microservice mode, use InternalTriggerRequest with pre-resolved edge types."
-            )
-
-        ds = await session.get(WorkspaceDataSourceORM, ds_id)
-        if not ds:
+            report = await ontology_runtime.build_resolution_report(session, ds_id)
+        except ontology_runtime.DataSourceMissing:
             raise NotFoundError(f"Data source {ds_id} not found")
-
-        if not ds.ontology_id:
+        except ontology_runtime.OntologyNotAssigned:
             raise ValueError(
                 "Aggregation requires an assigned ontology. "
                 "Please configure an ontology for this data source first."
             )
-
-        ontology_orm = await session.get(OntologyORM, ds.ontology_id)
-        if not ontology_orm:
-            raise NotFoundError(f"Ontology {ds.ontology_id} not found")
-
-        # Pull the cached schema stats. Gate evaluation requires the
-        # introspected node-label and edge-type lists; without them the
-        # check would falsely pass for any ontology. Cache miss → fail
-        # the gate with a typed reason so the wizard can surface "stats
-        # still computing, retry shortly" instead of treating it as a
-        # silent pass.
-        introspected_entities, introspected_edges = await self._load_introspected_type_ids(
-            ds_id, session
-        )
-
-        report = ontology_gate.check_resolution(
-            ontology_id=ontology_orm.id,
-            ontology_version=ontology_orm.version,
-            ontology_is_published=bool(ontology_orm.is_published),
-            ontology_revision=getattr(ontology_orm, "revision", 0) or 0,
-            entity_type_definitions_raw=json.loads(
-                ontology_orm.entity_type_definitions or "{}"
-            ),
-            relationship_type_definitions_raw=json.loads(
-                ontology_orm.relationship_type_definitions or "{}"
-            ),
-            introspected_entity_ids=introspected_entities,
-            introspected_edge_ids=introspected_edges,
-        )
+        except ontology_runtime.OntologyMissing as exc:
+            raise NotFoundError(f"Ontology {str(exc)} not found")
 
         if not report.resolved:
             raise OntologyResolutionError(report)
 
-        # Gate passed — derive the flat edge-type lists. Same shape the
-        # ontology service / legacy fallback produced, so the rest of
-        # ``trigger()`` is unchanged.
+        # Gate passed — derive the flat edge-type lists from the same
+        # ontology row the runtime helper just used. We re-load the row
+        # here only to avoid threading it back through the helper API;
+        # one extra ORM lookup is cheap relative to the gate eval.
+        from backend.app.db.models import OntologyORM, WorkspaceDataSourceORM
         from backend.app.ontology.resolver import (
             parse_entity_definitions,
             parse_relationship_definitions,
             derive_flat_lists,
         )
+
+        ds = await session.get(WorkspaceDataSourceORM, ds_id)
+        ontology_orm = await session.get(OntologyORM, ds.ontology_id)
         entity_defs = parse_entity_definitions(
             json.loads(ontology_orm.entity_type_definitions or "{}")
         )
@@ -1098,40 +1065,6 @@ class AggregationService:
             "containment_edge_types": flat.containment_edge_types,
             "lineage_edge_types": flat.lineage_edge_types,
         }
-
-    async def _readiness_resolution_payload(
-        self, ds_id: str, session: AsyncSession,
-    ) -> Optional[dict]:
-        """Compute the ontology-resolution gate as a JSON-safe dict for
-        embedding in ``DataSourceReadinessResponse``.
-
-        Returns None when no ontology is assigned or when the underlying
-        ORM lookup fails (best-effort — readiness must never throw on
-        the gate path; the dedicated /ontology-resolution endpoint
-        exposes structured errors instead).
-        """
-        try:
-            from backend.app.db.models import OntologyORM, WorkspaceDataSourceORM
-        except ImportError:
-            return None
-        ds = await session.get(WorkspaceDataSourceORM, ds_id)
-        if ds is None or not ds.ontology_id:
-            return None
-        orm = await session.get(OntologyORM, ds.ontology_id)
-        if orm is None:
-            return None
-        entity_ids, edge_ids = await self._load_introspected_type_ids(ds_id, session)
-        report = ontology_gate.check_resolution(
-            ontology_id=orm.id,
-            ontology_version=orm.version,
-            ontology_is_published=bool(orm.is_published),
-            ontology_revision=getattr(orm, "revision", 0) or 0,
-            entity_type_definitions_raw=json.loads(orm.entity_type_definitions or "{}"),
-            relationship_type_definitions_raw=json.loads(orm.relationship_type_definitions or "{}"),
-            introspected_entity_ids=entity_ids,
-            introspected_edge_ids=edge_ids,
-        )
-        return ontology_gate.report_to_dict(report)
 
     async def _replay_fingerprint_matches(
         self,
@@ -1171,32 +1104,6 @@ class AggregationService:
             return False
         current_fp = ontology_gate.compute_fingerprint_from_ontology_orm(ontology_orm)
         return current_fp == existing_job.ontology_fingerprint
-
-    async def _load_introspected_type_ids(
-        self, ds_id: str, session: AsyncSession,
-    ) -> tuple[List[str], List[str]]:
-        """Read entity- and edge-type IDs from the cached schema stats.
-
-        Reads ``data_source_stats.schema_stats`` (populated by the stats
-        service after introspection). Cache miss returns empty lists,
-        which makes the gate's "missing_*" criteria fire — the right
-        signal for "stats not ready, can't validate yet". Callers should
-        not catch that exception silently.
-        """
-        from backend.app.db.repositories.stats_repo import get_data_source_stats
-
-        cache = await get_data_source_stats(session, ds_id)
-        if not cache or not cache.schema_stats:
-            return [], []
-        try:
-            payload = json.loads(cache.schema_stats)
-        except (TypeError, ValueError):
-            return [], []
-        entity_stats = payload.get("entityTypeStats") or payload.get("entity_type_stats") or []
-        edge_stats = payload.get("edgeTypeStats") or payload.get("edge_type_stats") or []
-        entity_ids = [e.get("id") for e in entity_stats if isinstance(e, dict) and e.get("id")]
-        edge_ids = [e.get("id") for e in edge_stats if isinstance(e, dict) and e.get("id")]
-        return entity_ids, edge_ids
 
     # ── State Management Helpers ────────────────────────────────────────
 

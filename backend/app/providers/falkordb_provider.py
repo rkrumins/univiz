@@ -455,27 +455,15 @@ class FalkorDBProvider(GraphDataProvider):
             False if from introspection-only — an empty list should NOT suppress
             the hardcoded fallback.
 
-        When the resolved type set actually changes, the per-graph
-        ancestors Redis cache is asynchronously invalidated as a
-        defence-in-depth against caller paths that bypass the worker's
-        explicit ``reset_ancestors_cache`` call (e.g. ContextEngine
-        re-resolving an ontology at request time on the same sticky
-        provider instance).
+        Cache invalidation is implicit: the ancestors cache key
+        (``_ancestors_cache_key``) hashes the resolved type set, so a
+        change to ``types`` automatically routes reads/writes to a
+        different Redis namespace. No manual flush is needed; old
+        namespaces are simply unreachable and lazy-evicted by Redis.
         """
         if from_ontology or types:
-            new_set: Set[str] = {t.upper() for t in types}
-            old_set = getattr(self, "_resolved_containment_types", None)
-            self._resolved_containment_types = new_set
+            self._resolved_containment_types: Set[str] = {t.upper() for t in types}
             self._resolved_containment_types_set = True
-            if old_set is not None and old_set != new_set:
-                # Sync method, async work — only schedule if there is a
-                # running loop. Outside one (test harness, sync init)
-                # the worker's explicit reset covers production.
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self.reset_ancestors_cache())
-                except RuntimeError:
-                    pass
         # else: introspection-only with no containment found — don't set sentinel
 
     def set_entity_type_levels(self, mapping: Dict[str, int]) -> None:
@@ -1416,38 +1404,43 @@ class FalkorDBProvider(GraphDataProvider):
         except Exception:
             pass  # Index may already exist
 
-    async def reset_ancestors_cache(self) -> None:
-        """Wipe the per-graph ancestor cache for the start of an aggregation run.
+    def _ancestors_cache_key(self) -> str:
+        """Return the Redis Hash key for ancestor chains in this graph,
+        scoped by the resolved containment-types fingerprint.
 
-        The cache (`{graph_name}:ancestors` Redis Hash) is intra-job
-        memoization: many batches in a single job touch overlapping
-        URNs, so caching across batches is valuable. Persisting it
-        across jobs is *not*: the most common reason to re-aggregate is
-        an ontology classification change or a graph structure change,
-        and either invalidates ancestor chains. Without this reset, a
-        first job run with empty `containment_edge_types` caches `[]`
-        for every URN, and every subsequent job sees those as cache
-        hits and skips the graph walk — producing only leaf-to-leaf
-        AGGREGATED edges instead of propagating up the tree.
+        Different containment configurations resolve to different
+        ancestor chains for the same URN, so they must live in
+        different cache namespaces. Without this scoping, a prior job
+        that ran with empty ``containment_edge_types`` would cache
+        ``"[]"`` for every URN and every subsequent job (with proper
+        types) would silently see cache hits and produce only
+        leaf-to-leaf AGGREGATED edges instead of propagating up the
+        containment tree.
 
-        Best-effort: Redis errors are swallowed so a flush failure
-        never fails an aggregation job.
+        The fingerprint is a short SHA1 over the sorted, upper-cased
+        type names. Empty / unset → a stable empty-set fingerprint
+        that flat-graph aggregations reuse safely. Identical
+        configurations (across jobs, across caller paths) reuse the
+        same key — full intra- and cross-job caching preserved.
         """
-        try:
-            await self._redis.delete(f"{self._graph_name}:ancestors")
-        except Exception as exc:
-            logger.debug(
-                "reset_ancestors_cache: Redis delete failed for %s: %s",
-                self._graph_name, exc,
-            )
+        import hashlib
+
+        types = getattr(self, "_resolved_containment_types", None) or set()
+        if not isinstance(types, (set, frozenset, list, tuple)):
+            types = set()
+        normalised = ",".join(sorted(t.upper() for t in types))
+        digest = hashlib.sha1(normalised.encode("utf-8")).hexdigest()[:12]
+        return f"{self._graph_name}:ancestors:{digest}"
 
     async def _get_ancestor_chain(self, urn: str) -> List[str]:
         """Get pre-computed ancestor chain from Redis Hash, or compute + cache it.
 
         Returns list of URNs from immediate parent to root (ordered).
-        Uses Redis Hash `{graph_name}:ancestors` for O(1) lookup.
+        The cache key includes a containment-types fingerprint so a
+        change to the resolved containment configuration cannot return
+        a stale chain from a prior config (see ``_ancestors_cache_key``).
         """
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
         try:
             raw = await self._redis.execute_command("HGET", cache_key, urn)
             if raw:
@@ -1493,8 +1486,11 @@ class FalkorDBProvider(GraphDataProvider):
         """Compute and cache ancestor chains for multiple URNs at once.
 
         Uses Redis pipeline for batch HSET — zero extra round-trips.
+        Cache namespace is scoped by containment-types fingerprint
+        (see ``_ancestors_cache_key``) so a config change cannot leak
+        stale chains from a prior configuration.
         """
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
         result: Dict[str, List[str]] = {}
 
         # First, try to fetch all from cache in one pipeline
@@ -1906,10 +1902,12 @@ class FalkorDBProvider(GraphDataProvider):
         """Invalidate ancestor cache for a node and its descendants, then rebuild.
 
         When a node's parent changes, its entire subtree's ancestor chains
-        are invalidated and lazily recomputed on next access.
+        are invalidated and lazily recomputed on next access. Targets the
+        current containment-types namespace; older namespaces are
+        unreachable so they don't need to be touched.
         """
         await self._ensure_connected()
-        cache_key = f"{self._graph_name}:ancestors"
+        cache_key = self._ancestors_cache_key()
 
         # Invalidate this node's cached chain
         try:

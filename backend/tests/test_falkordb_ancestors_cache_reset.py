@@ -1,108 +1,96 @@
-"""Tests for the per-job ancestors-cache lifecycle on the FalkorDB provider.
+"""Tests for the containment-fingerprint-scoped ancestors cache key.
 
-The cache (`{graph_name}:ancestors` Redis Hash) is intra-job memoization:
-populated lazily during a single aggregation run, wiped at the start of
-the next. These tests exercise the wipe path (``reset_ancestors_cache``)
-and the change-detected fallback in ``set_containment_edge_types``
-without spinning up Redis or FalkorDB.
+The Redis Hash that caches per-URN ancestor chains is namespaced by a
+fingerprint of the resolved containment edge types
+(``_ancestors_cache_key``). Different containment configurations
+produce different cache namespaces, so a stale cached chain from an
+earlier configuration cannot leak into a later one. These tests
+exercise the helper without spinning up Redis or FalkorDB.
 """
-import asyncio
-
-import pytest
-
 from backend.app.providers.falkordb_provider import FalkorDBProvider
 
 
-class _FakeRedis:
-    """Records ``delete`` calls. Optional ``raise_on_delete`` simulates
-    a Redis outage to confirm the wipe path is best-effort."""
-
-    def __init__(self, *, raise_on_delete: bool = False):
-        self.deleted_keys: list[str] = []
-        self.raise_on_delete = raise_on_delete
-
-    async def delete(self, *keys):
-        if self.raise_on_delete:
-            raise RuntimeError("simulated redis outage")
-        self.deleted_keys.extend(keys)
-        return len(keys)
-
-
-def _make_provider(redis: _FakeRedis | None = None, graph_name: str = "demo_graph") -> FalkorDBProvider:
-    """Build a provider shell sufficient to exercise the cache helpers
-    without touching a real graph or Redis. ``__init__`` is bypassed so
-    we don't need provider config / connection state."""
+def _make_provider(graph_name: str = "demo_graph") -> FalkorDBProvider:
+    """Build a provider shell sufficient to exercise ``set_containment_edge_types``
+    + ``_ancestors_cache_key`` without provider config / connections."""
     p = FalkorDBProvider.__new__(FalkorDBProvider)
-    p._redis = redis if redis is not None else _FakeRedis()  # type: ignore[attr-defined]
     p._graph_name = graph_name  # type: ignore[attr-defined]
     return p
 
 
-def test_reset_ancestors_cache_calls_redis_delete():
-    redis = _FakeRedis()
-    provider = _make_provider(redis, graph_name="g1")
-    asyncio.run(provider.reset_ancestors_cache())
-    assert redis.deleted_keys == ["g1:ancestors"]
+def test_cache_key_is_stable_for_identical_types():
+    p = _make_provider()
+    p.set_containment_edge_types(["CONTAINS", "HAS_COLUMN"], from_ontology=True)
+    k1 = p._ancestors_cache_key()
+    p.set_containment_edge_types(["CONTAINS", "HAS_COLUMN"], from_ontology=True)
+    k2 = p._ancestors_cache_key()
+    assert k1 == k2
 
 
-def test_reset_ancestors_cache_swallows_redis_errors():
-    redis = _FakeRedis(raise_on_delete=True)
-    provider = _make_provider(redis)
-    # Must not raise — the method is best-effort.
-    asyncio.run(provider.reset_ancestors_cache())
+def test_cache_key_differs_when_types_change():
+    p = _make_provider()
+    p.set_containment_edge_types(["CONTAINS"], from_ontology=True)
+    k_one = p._ancestors_cache_key()
+    p.set_containment_edge_types(["CONTAINS", "HAS_COLUMN"], from_ontology=True)
+    k_two = p._ancestors_cache_key()
+    assert k_one != k_two
 
 
-def test_set_containment_no_op_when_unchanged_does_not_invalidate():
-    redis = _FakeRedis()
-    provider = _make_provider(redis)
-
-    async def run():
-        provider.set_containment_edge_types(["CONTAINS"], from_ontology=True)
-        # Drain any pending tasks.
-        await asyncio.sleep(0)
-        provider.set_containment_edge_types(["contains"], from_ontology=True)
-        await asyncio.sleep(0)
-
-    asyncio.run(run())
-    # The first call is the initial set (no prior state, no
-    # invalidation). The second call's normalized type set
-    # ({"CONTAINS"}) equals the first's, so still no invalidation.
-    assert redis.deleted_keys == []
+def test_cache_key_is_case_insensitive():
+    p1 = _make_provider()
+    p2 = _make_provider()
+    p1.set_containment_edge_types(["contains"], from_ontology=True)
+    p2.set_containment_edge_types(["CONTAINS"], from_ontology=True)
+    assert p1._ancestors_cache_key() == p2._ancestors_cache_key()
 
 
-def test_set_containment_change_triggers_async_invalidation():
-    redis = _FakeRedis()
-    provider = _make_provider(redis)
-
-    async def run():
-        # First set establishes baseline — no invalidation fires.
-        provider.set_containment_edge_types(["CONTAINS"], from_ontology=True)
-        await asyncio.sleep(0)
-        assert redis.deleted_keys == []
-
-        # Genuinely different type set — invalidation must fire.
-        provider.set_containment_edge_types(["CONTAINS", "HAS_COLUMN"], from_ontology=True)
-        # Allow the scheduled task to run.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-    asyncio.run(run())
-    assert redis.deleted_keys == ["demo_graph:ancestors"]
+def test_cache_key_is_order_independent():
+    p1 = _make_provider()
+    p2 = _make_provider()
+    p1.set_containment_edge_types(["A", "B"], from_ontology=True)
+    p2.set_containment_edge_types(["B", "A"], from_ontology=True)
+    assert p1._ancestors_cache_key() == p2._ancestors_cache_key()
 
 
-def test_set_containment_outside_event_loop_does_not_raise():
-    """``set_containment_edge_types`` is sync. When called from a
-    sync context (test bootstrap, ContextEngine in non-async paths)
-    there is no running loop to schedule on; the change-detected
-    branch must skip silently rather than raise. The worker's
-    explicit ``reset_ancestors_cache`` call covers the production
-    path."""
-    redis = _FakeRedis()
-    provider = _make_provider(redis)
+def test_empty_types_have_distinct_fingerprint():
+    """Flat-graph aggregations (intentional empty containment) get
+    their own stable cache namespace, distinct from any populated
+    configuration. Keeps cross-job caching for repeat flat aggregations
+    without ever clashing with a populated config."""
+    p_empty = _make_provider()
+    p_empty.set_containment_edge_types([], from_ontology=True)
+    k_empty = p_empty._ancestors_cache_key()
 
-    # First call: baseline.
-    provider.set_containment_edge_types(["CONTAINS"], from_ontology=True)
-    # Second call (different): change-detection runs but no loop —
-    # must not raise, must not enqueue a task.
-    provider.set_containment_edge_types(["CONTAINS", "HAS_COLUMN"], from_ontology=True)
-    assert redis.deleted_keys == []
+    p_full = _make_provider()
+    p_full.set_containment_edge_types(["CONTAINS"], from_ontology=True)
+    k_full = p_full._ancestors_cache_key()
+
+    assert k_empty != k_full
+    # Empty fingerprint must be deterministic (same provider, same key
+    # across reads) — no random salt or timestamp involvement.
+    assert k_empty == p_empty._ancestors_cache_key()
+
+
+def test_cache_key_namespaces_by_graph_name():
+    """Same containment config on different graphs gets different
+    keys. Prevents one graph's chains from leaking to another."""
+    p1 = _make_provider(graph_name="graph_one")
+    p2 = _make_provider(graph_name="graph_two")
+    p1.set_containment_edge_types(["CONTAINS"], from_ontology=True)
+    p2.set_containment_edge_types(["CONTAINS"], from_ontology=True)
+    assert p1._ancestors_cache_key() != p2._ancestors_cache_key()
+    # Both must follow the documented prefix convention.
+    assert p1._ancestors_cache_key().startswith("graph_one:ancestors:")
+    assert p2._ancestors_cache_key().startswith("graph_two:ancestors:")
+
+
+def test_cache_key_handles_unset_types():
+    """Before ``set_containment_edge_types`` is ever called the helper
+    must still return a stable key (treated the same as empty set).
+    Prevents AttributeError on cold-start callers."""
+    p = _make_provider()
+    k = p._ancestors_cache_key()
+    assert k.startswith("demo_graph:ancestors:")
+    # Match the empty-set key after explicit empty assignment.
+    p.set_containment_edge_types([], from_ontology=True)
+    assert p._ancestors_cache_key() == k
