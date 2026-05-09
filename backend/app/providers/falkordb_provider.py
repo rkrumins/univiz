@@ -3204,13 +3204,18 @@ class FalkorDBProvider(GraphDataProvider):
         """
         if not urns or not ctypes:
             return []
-        # B1 — single walk over all input URNs instead of UNWIND-per-URN.
-        # The planner satisfies `n.urn IN $urns` with one urn-index scan
-        # (one match per anchor was 500 walks for a 500-URN trace; this is 1).
+        # NOTE: an earlier rewrite combined the per-URN UNWIND into a
+        # single MATCH with `n.urn IN $urns`, but that triggers the same
+        # FalkorDB "Type mismatch: expected List or Null but was Edge"
+        # planner bug A1 hit on the descendants side, on graphs where
+        # ``$urns`` exceeds ~few hundred entries. The variable-length
+        # alias ``c`` is misclassified as Edge under that plan shape.
+        # Reverted to UNWIND-per-URN until we have a query form that's
+        # both fast AND survives the planner bug.
         cypher = (
-            "MATCH (n)<-[c*1..10]-(ancestor) "
-            "WHERE n.urn IN $urns "
-            "  AND ALL(rel IN c WHERE type(rel) IN $ctypes) "
+            "UNWIND $urns AS u "
+            "MATCH (n {urn: u})<-[c*1..10]-(ancestor) "
+            "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
             "RETURN DISTINCT ancestor.urn AS ancestorUrn"
         )
         try:
