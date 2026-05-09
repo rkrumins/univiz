@@ -60,6 +60,15 @@ _PROVIDERS: List[ProviderCapabilities] = [
         supportsWriteBack=False,
         defaultPort=None,
     ),
+    ProviderCapabilities(
+        name="spanner",
+        displayName="Google Spanner Graph",
+        supportsMultiGraph=True,        # one Spanner DB can host multiple PROPERTY GRAPHs
+        supportsLineage=True,
+        supportsContainment=True,
+        supportsWriteBack=True,
+        defaultPort=None,               # managed gRPC endpoint; project/instance/database addressing
+    ),
 ]
 
 
@@ -206,5 +215,94 @@ async def ping_datahub(req: DataHubPingRequest = Body(...)):
         raise HTTPException(status_code=504, detail="DataHub ping timed out")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"DataHub ping failed: {exc}")
+    finally:
+        await provider.close()
+
+
+# ------------------------------------------------------------------ #
+# Google Spanner Graph                                                #
+# ------------------------------------------------------------------ #
+
+class SpannerPingRequest(BaseModel):
+    project_id: str
+    instance_id: str
+    database_id: str
+    graph_name: str = "UniViz"
+    use_emulator: bool = False
+    service_account_json: Optional[str] = None
+
+
+@router.post("/spanner/ping")
+async def ping_spanner(req: SpannerPingRequest = Body(...)):
+    """Test connectivity to a Spanner instance without registering a connection.
+
+    Calls ``preflight`` which performs a single Instance metadata RPC; this
+    avoids running schema bootstrap or executing GQL, so the probe stays
+    cheap and survives instances that do not (yet) have the property graph.
+    Returns the latency on success.
+    """
+    from backend.graph.adapters.spanner_provider import SpannerProvider, SpannerEditionError
+    provider = SpannerProvider(
+        project_id=req.project_id,
+        instance_id=req.instance_id,
+        database_id=req.database_id,
+        graph_name=req.graph_name,
+        use_emulator=req.use_emulator,
+        credentials_json=req.service_account_json,
+    )
+    try:
+        t0 = time.perf_counter()
+        result = await asyncio.wait_for(provider.preflight(deadline_s=5.0), timeout=10)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        if not getattr(result, "ok", False):
+            # PreflightResult exposes ``reason`` (canonical contract in
+            # backend/common/interfaces/preflight.py). The earlier code
+            # read ``.detail`` which doesn't exist on the canonical type;
+            # failed pings would surface "unknown" instead of the real
+            # reason code.
+            reason = getattr(result, "reason", None) or getattr(result, "detail", "unknown")
+            raise HTTPException(status_code=502, detail=f"Spanner ping failed: {reason}")
+        return {"status": "healthy", "latencyMs": latency_ms}
+    except SpannerEditionError as exc:
+        # Connection works but the instance is on the wrong edition; surface
+        # this as 400 so the wizard can render the dedicated error card.
+        raise HTTPException(status_code=400, detail=f"Spanner edition error: {exc}")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Spanner ping timed out")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Spanner ping failed: {exc}")
+    finally:
+        await provider.close()
+
+
+@router.post("/spanner/databases")
+async def list_spanner_databases(req: SpannerPingRequest = Body(...)):
+    """List property graphs in the target Spanner database.
+
+    On Spanner the analogue of FalkorDB's GRAPH.LIST / Neo4j's SHOW DATABASES
+    is ``INFORMATION_SCHEMA.PROPERTY_GRAPHS``. Returns an empty list when the
+    database is reachable but no property graph exists yet (e.g. the wizard
+    is connecting before bootstrap), so the UI can offer to create one.
+    """
+    from backend.graph.adapters.spanner_provider import SpannerProvider, SpannerEditionError
+    provider = SpannerProvider(
+        project_id=req.project_id,
+        instance_id=req.instance_id,
+        database_id=req.database_id,
+        graph_name=req.graph_name,
+        use_emulator=req.use_emulator,
+        credentials_json=req.service_account_json,
+    )
+    try:
+        graphs = await asyncio.wait_for(provider.list_graphs(), timeout=15)
+        return {"databases": graphs}
+    except SpannerEditionError as exc:
+        raise HTTPException(status_code=400, detail=f"Spanner edition error: {exc}")
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Spanner timed out while listing property graphs")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to list Spanner property graphs: {exc}")
     finally:
         await provider.close()

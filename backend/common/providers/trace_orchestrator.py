@@ -176,8 +176,12 @@ class TraceOrchestrator:
         include_inherited_lineage: bool = True,
     ) -> TraceResult:
         deadline = time.monotonic() + (timeout_ms / 1000.0)
-        ctypes = [t.upper() for t in (containment_edge_types or [])]
-        ltypes = [t.upper() for t in (lineage_edge_types or [])] if lineage_edge_types else None
+        # Edge-type filter values are forwarded to provider callbacks
+        # verbatim. Providers that need case-folding (e.g. Cypher-canonical
+        # backends) normalise inside the callback; Spanner schemaless
+        # treats labels as case-sensitive data.
+        ctypes = list(containment_edge_types or [])
+        ltypes = list(lineage_edge_types) if lineage_edge_types else None
 
         focus_node = await self._cb.get_node(urn)
         focus_entity_type = focus_node.entity_type if focus_node else "unknown"
@@ -328,8 +332,10 @@ class TraceOrchestrator:
         include_containment_edges: bool = False,  # ignored; hierarchy always included
     ) -> TraceResult:
         deadline = time.monotonic() + (timeout_ms / 1000.0)
-        ctypes = [t.upper() for t in (containment_edge_types or [])]
-        ltypes = [t.upper() for t in (lineage_edge_types or [])] if lineage_edge_types else None
+        # See ``trace_at_level`` for the case-folding rationale: pass
+        # edge-type values through to provider callbacks verbatim.
+        ctypes = list(containment_edge_types or [])
+        ltypes = list(lineage_edge_types) if lineage_edge_types else None
 
         # 1. Collect descendants of source/target at next_level (parallel).
         src_task = self._cb.descendants_at_level(source_urn, next_level, ctypes)

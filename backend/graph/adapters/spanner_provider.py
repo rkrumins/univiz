@@ -29,6 +29,11 @@ import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from backend.common.adapters import CircuitBreakerProxy  # noqa: F401  (re-exported via registry)
+from backend.common.interfaces.preflight import (
+    PreflightResult,
+    _classify as _classify_preflight_exc,
+    tcp_preflight,
+)
 from backend.common.interfaces.provider import (
     GraphDataProvider,
     ProviderConfigurationError,
@@ -53,14 +58,11 @@ from backend.common.models.graph import (
     TopLevelNodesResult,
     TraceResult,
 )
-from backend.common.providers.aggregation import (
-    AggregatedEdgeMaterializer,
-    AncestorResolver,
-    IdempotencyBackend,
-    MaterializationBackend,
-    MaterializerConfig,
-    PairKey,
-)
+# Note: this provider implements aggregation natively against the sidecar
+# table for performance reasons. The shared ``AggregatedEdgeMaterializer``
+# in ``backend/common/providers/aggregation.py`` is kept for FalkorDB and
+# Neo4j (where Redis SADD / Cypher property accumulators are sub-ms per
+# pair); Spanner cannot afford one Spanner round-trip per ancestor pair.
 from backend.common.providers.ancestor_cache import AncestorChainCache
 from backend.common.providers.config import ProviderEnvBudget
 from backend.common.providers.deadlines import DeadlineGuard
@@ -153,6 +155,11 @@ class SpannerProvider(GraphDataProvider):
         self._connect_lock = asyncio.Lock()
         self._connected = False
         self._schema_bootstrapped = False
+        # True iff CREATE PROPERTY GRAPH succeeded. The emulator and
+        # Standard-edition Spanner refuse the DDL — we still bootstrap the
+        # underlying tables and serve SQL paths, but every GQL-using ABC
+        # method must call ``_require_gql`` and surface a clear error.
+        self._has_property_graph: bool = False
 
         # Ontology injection state — populated by ContextEngine.
         self._resolved_containment_types: Set[str] = set()
@@ -170,42 +177,99 @@ class SpannerProvider(GraphDataProvider):
             ttl_s=int(os.getenv("SPANNER_ANCESTOR_CACHE_TTL", "3600")),
         )
         self._trace = TraceOrchestrator(_SpannerTraceCallbacks(self))
-        self._materializer = AggregatedEdgeMaterializer(
-            idempotency=_SpannerJsonArrayIdempotency(self),
-            materialization=_SpannerMaterializationBackend(self),
-            ancestors=_SpannerAncestorResolver(self),
-            config=MaterializerConfig(batch_size=_DEFAULT_MERGE_BATCH),
-        )
         self._introspector = _SpannerSchemaIntrospector(self)
 
     @property
     def name(self) -> str:
         return "spanner"
 
-    async def preflight(self, deadline_s: float = 1.5):
-        """Fast reachability probe; never raises.
+    async def preflight(self, *, deadline_s: float = 1.5) -> PreflightResult:
+        """Fast reachability probe; never raises for connectivity outcomes.
 
-        Returns a duck-typed object with ``.ok`` and ``.detail`` attributes
-        so the registry's preflight check can format consistently.
+        Returns the canonical ``PreflightResult`` from
+        ``backend.common.interfaces.preflight`` so the manager's preflight
+        gate, the ``/providers/test-connection`` endpoint, and the
+        wizard's friendly-error map all read the same fields
+        (``ok`` / ``reason`` / ``elapsed_ms`` / ``peer``).
         """
-        @_PreflightResult.factory
-        async def _check():
-            try:
-                await asyncio.wait_for(self._ensure_client(), timeout=deadline_s)
-                # Touch the instance metadata. This is a single small RPC.
-                await asyncio.wait_for(
-                    to_thread(lambda: self._instance.exists()),
-                    timeout=deadline_s,
-                )
-                return True, "ok"
-            except SpannerEditionError as exc:
-                return False, f"edition_error: {exc}"
-            except asyncio.TimeoutError:
-                return False, "timeout"
-            except Exception as exc:
-                return False, f"error: {exc.__class__.__name__}: {exc}"
+        # Emulator: pure TCP probe of localhost:9010. Reuses the shared
+        # tcp_preflight building block — already returns the canonical type.
+        if self._use_emulator:
+            host, _, port = (
+                os.getenv("SPANNER_EMULATOR_HOST", "localhost:9010").partition(":")
+            )
+            return await tcp_preflight(
+                host or "localhost",
+                int(port or 9010),
+                deadline_s=deadline_s,
+            )
 
-        return await _check()
+        peer = (
+            f"projects/{self._project_id}/instances/{self._instance_id}"
+            f"/databases/{self._database_id}"
+        )
+        t0 = time.monotonic()
+        try:
+            await asyncio.wait_for(self._ensure_client(), timeout=deadline_s)
+            await asyncio.wait_for(
+                to_thread(lambda: self._instance.exists()),
+                timeout=deadline_s,
+            )
+
+            # GQL probe — confirm the configured property graph actually
+            # exists. Without this, a typo in ``extra_config.graphName``
+            # surfaces only on the first user query, well after the
+            # provider has already passed its connectivity check. The
+            # ``information_schema.property_graphs`` view is unavailable
+            # on the emulator (handled above) and on databases without
+            # any property graph defined; we treat the latter as a
+            # configuration failure at registration time.
+            probe_remaining = max(
+                0.05, deadline_s - (time.monotonic() - t0),
+            )
+            try:
+                graph_rows = await asyncio.wait_for(
+                    self._execute_sql(
+                        "SELECT 1 FROM information_schema.property_graphs "
+                        "WHERE property_graph_name = @name LIMIT 1",
+                        params={"name": self._graph_name},
+                        param_types_={"name": _ParamTypes.STRING},
+                    ),
+                    timeout=probe_remaining,
+                )
+            except Exception as exc:
+                # The view itself may be unavailable (Standard edition,
+                # pre-Graph Spanner). Fall back to instance.exists() as
+                # the only signal — log for triage.
+                logger.debug(
+                    "spanner: property_graphs probe failed (%s); accepting "
+                    "instance.exists() as the only preflight signal.", exc,
+                )
+                graph_rows = None
+
+            if graph_rows is not None and not graph_rows:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return PreflightResult.failure(
+                    reason=f"graph_not_found: {self._graph_name}"[:120],
+                    elapsed_ms=elapsed_ms,
+                )
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return PreflightResult.success(peer=peer, elapsed_ms=elapsed_ms)
+        except asyncio.CancelledError:
+            raise
+        except SpannerEditionError as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return PreflightResult.failure(
+                reason=f"edition_error: {exc}"[:120],
+                elapsed_ms=elapsed_ms,
+            )
+        except BaseException as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return PreflightResult.failure(
+                reason=_classify_preflight_exc(exc),
+                elapsed_ms=elapsed_ms,
+            )
 
     async def _ensure_client(self) -> None:
         """Build the spanner.Client + Instance + Database (no DDL).
@@ -284,29 +348,82 @@ class SpannerProvider(GraphDataProvider):
         )
 
     async def _bootstrap_tables(self) -> None:
-        if await self._table_exists("GraphNode") and await self._table_exists("GraphEdge"):
-            return
         ddl: List[str] = []
         if not await self._table_exists("GraphNode"):
             ddl.append(_DDL_CREATE_GRAPH_NODE)
         if not await self._table_exists("GraphEdge"):
             ddl.append(_DDL_CREATE_GRAPH_EDGE)
-        ddl.extend(_DDL_CREATE_INDEXES)
-        await self._apply_ddl(ddl)
+        if not await self._table_exists("GraphEdgeContribution"):
+            ddl.append(_DDL_CREATE_GRAPH_EDGE_CONTRIBUTION)
+        # Indexes are CREATE INDEX IF NOT EXISTS, so safe to send every time;
+        # gating on table existence already above prevents the FK-bearing
+        # tables from being recreated.
+        if ddl:
+            ddl.extend(_DDL_CREATE_INDEXES)
+            ddl.extend(_DDL_CREATE_CONTRIBUTION_INDEXES)
+            await self._apply_ddl(ddl)
 
     async def _bootstrap_property_graph(self) -> None:
-        if await self._property_graph_exists(self._graph_name):
-            return
+        # Two environments cannot host a property graph:
+        #   * cloud-spanner-emulator (no CREATE PROPERTY GRAPH support).
+        #   * Standard-edition Spanner (Graph requires Enterprise+).
+        # In both cases the relational tables are still usable, so the
+        # provider stays functional for ingestion + SQL paths and only
+        # GQL-using methods raise via ``_require_gql``.
+        try:
+            if await self._property_graph_exists(self._graph_name):
+                self._has_property_graph = True
+                return
+        except Exception as exc:
+            # ``information_schema.property_graphs`` itself isn't available
+            # on the emulator. Fall through and try the DDL; the failure
+            # below is handled identically.
+            logger.debug(
+                "spanner: property_graphs view unavailable (%s); "
+                "trying CREATE PROPERTY GRAPH directly", exc,
+            )
+
         try:
             await self._apply_ddl([_DDL_CREATE_PROPERTY_GRAPH(self._graph_name)])
+            self._has_property_graph = True
         except Exception as exc:
             msg = str(exc).lower()
-            if "edition" in msg or "enterprise" in msg or "feature is not enabled" in msg:
+            if (
+                "edition" in msg
+                or "enterprise" in msg
+                or "feature is not enabled" in msg
+            ) and not self._use_emulator:
+                # Real Spanner instance refused the DDL on edition grounds —
+                # surface as a typed error so the wizard can render its
+                # dedicated edition card.
                 raise SpannerEditionError(
                     "Spanner Graph requires Enterprise or Enterprise Plus edition; "
                     f"this instance refused CREATE PROPERTY GRAPH: {exc}"
                 ) from exc
-            raise
+            # Emulator path, or any other failure that we treat as "GQL
+            # unavailable here". Keep the provider usable for SQL.
+            self._has_property_graph = False
+            logger.warning(
+                "spanner: CREATE PROPERTY GRAPH failed (%s). "
+                "Continuing with SQL-only mode; GQL-using methods will raise.",
+                exc,
+            )
+
+    def _require_gql(self) -> None:
+        """Raise for methods that depend on the property graph being live.
+
+        Called at the head of every GQL-using public method. Lets the
+        emulator-backed test suite (and any Standard-edition instance)
+        run the SQL surface without blowing up at import / connect time.
+        """
+        if not self._has_property_graph:
+            raise RuntimeError(
+                "Spanner Graph (GQL) is not available on this connection. "
+                "This is expected on the cloud-spanner-emulator (no GQL "
+                "support) and on Standard-edition Spanner (Graph is an "
+                "Enterprise+ feature). SQL paths (ingestion, schema "
+                "discovery, stats, count_aggregated_edges) still work."
+            )
 
     async def _table_exists(self, table_name: str) -> bool:
         rows = await self._execute_sql(
@@ -361,7 +478,11 @@ class SpannerProvider(GraphDataProvider):
     def set_containment_edge_types(
         self, types: List[str], from_ontology: bool = True,
     ) -> None:
-        self._resolved_containment_types = {t.upper() for t in (types or [])}
+        # Spanner schemaless treats GraphEdge.label as case-sensitive data.
+        # Store edge types verbatim; do NOT normalise case here or in the
+        # query-side filters. ContextEngine is the single source of truth
+        # for which casing the ontology actually uses.
+        self._resolved_containment_types = set(types or [])
         self._resolved_containment_types_set = True
         digest_input = ",".join(sorted(self._resolved_containment_types))
         self._containment_fingerprint = hashlib.sha256(digest_input.encode()).hexdigest()[:16]
@@ -382,7 +503,7 @@ class SpannerProvider(GraphDataProvider):
             return list(self._resolved_containment_types)
         env = os.getenv("CONTAINMENT_EDGE_TYPES", "")
         if env:
-            return [t.strip().upper() for t in env.split(",") if t.strip()]
+            return [t.strip() for t in env.split(",") if t.strip()]
         raise ProviderConfigurationError(
             "Spanner provider has no containment edge types configured. "
             "ContextEngine must call set_containment_edge_types() after "
@@ -398,6 +519,7 @@ class SpannerProvider(GraphDataProvider):
 
     async def get_node(self, urn: str) -> Optional[GraphNode]:
         await self._ensure_connected()
+        self._require_gql()
         rows = await self._guard.run(
             self._execute_gql(
                 f"GRAPH {self._graph_name}\n"
@@ -416,6 +538,7 @@ class SpannerProvider(GraphDataProvider):
 
     async def get_nodes(self, query: NodeQuery) -> List[GraphNode]:
         await self._ensure_connected()
+        self._require_gql()
         params: Dict[str, Any] = {
             "labels": [t for t in (query.entity_types or [])] or None,
             "search": query.search_query or None,
@@ -451,10 +574,11 @@ class SpannerProvider(GraphDataProvider):
 
     async def get_edges(self, query: EdgeQuery) -> List[GraphEdge]:
         await self._ensure_connected()
+        self._require_gql()
         params: Dict[str, Any] = {
             "src": list(query.source_urns) if query.source_urns else None,
             "dst": list(query.target_urns) if query.target_urns else None,
-            "types": [t.upper() for t in (query.edge_types or [])] or None,
+            "types": list(query.edge_types) if query.edge_types else None,
         }
         param_types_ = {
             "src": _ParamTypes.array(_ParamTypes.STRING),
@@ -495,7 +619,8 @@ class SpannerProvider(GraphDataProvider):
         cursor: Optional[str] = None,
     ) -> List[GraphNode]:
         await self._ensure_connected()
-        ctypes = [t.upper() for t in (edge_types or self._containment_types())]
+        self._require_gql()
+        ctypes = list(edge_types) if edge_types else self._containment_types()
         params: Dict[str, Any] = {
             "parent": parent_urn,
             "cont_types": ctypes,
@@ -534,6 +659,7 @@ class SpannerProvider(GraphDataProvider):
 
     async def get_parent(self, child_urn: str) -> Optional[GraphNode]:
         await self._ensure_connected()
+        self._require_gql()
         ctypes = self._containment_types()
         rows = await self._guard.run(
             self._execute_gql(
@@ -567,6 +693,7 @@ class SpannerProvider(GraphDataProvider):
         include_child_count: bool = True,
     ) -> TopLevelNodesResult:
         await self._ensure_connected()
+        self._require_gql()
         ctypes = self._containment_types()
         types_filter = entity_types or root_entity_types or None
         safe_limit = _safe_int(limit, default=100, max_value=1_000)
@@ -670,6 +797,7 @@ class SpannerProvider(GraphDataProvider):
         self, urn: str, depth: int, direction: str,
     ) -> LineageResult:
         await self._ensure_connected()
+        self._require_gql()
         safe_depth = max(1, min(_DEFAULT_MAX_QUANTIFIER_DEPTH, _safe_int(depth, default=3, max_value=_DEFAULT_MAX_QUANTIFIER_DEPTH)))
         ltypes = self._resolved_lineage_types or []
         # Direction shapes the GQL pattern arrows.
@@ -679,7 +807,12 @@ class SpannerProvider(GraphDataProvider):
             pattern = "(focus:Entity {urn: @urn})-[e]->{1," + str(safe_depth) + "}(other:Entity)"
         gql = (
             f"GRAPH {self._graph_name}\n"
-            f"MATCH ANY SHORTEST p = {pattern}\n"
+            # ``ANY SHORTEST`` short-circuits BFS once the first shortest
+            # path between focus and ``other`` is found. The path variable
+            # binding is intentionally omitted -- we use the edge sequence
+            # ``e`` directly. Spanner GQL accepts ``MATCH ANY SHORTEST
+            # <pattern>`` without a path variable.
+            f"MATCH ANY SHORTEST {pattern}\n"
             "WHERE (@ltypes IS NULL OR ALL(edge IN e WHERE edge.label IN UNNEST(@ltypes)))\n"
             "RETURN other.urn AS urn, other.label AS label,\n"
             "       TO_JSON(other.properties) AS properties,\n"
@@ -736,6 +869,7 @@ class SpannerProvider(GraphDataProvider):
         include_inherited_lineage: bool = True,
     ) -> TraceResult:
         await self._ensure_connected()
+        self._require_gql()
         return await self._trace.trace_at_level(
             urn=urn, level=level,
             upstream_depth=upstream_depth, downstream_depth=downstream_depth,
@@ -759,6 +893,7 @@ class SpannerProvider(GraphDataProvider):
         include_containment_edges: bool = False,
     ) -> TraceResult:
         await self._ensure_connected()
+        self._require_gql()
         return await self._trace.expand_aggregated(
             source_urn=source_urn, target_urn=target_urn,
             next_level=next_level,
@@ -795,6 +930,7 @@ class SpannerProvider(GraphDataProvider):
         lineage_edges: List[str],
     ) -> AggregatedEdgeResult:
         await self._ensure_connected()
+        self._require_gql()
         if target_urns:
             gql = (
                 f"GRAPH {self._graph_name}\n"
@@ -857,9 +993,87 @@ class SpannerProvider(GraphDataProvider):
         edge_id: str,
         edge_type: str,
     ) -> None:
+        """Materialise AGGREGATED edges for one new leaf lineage edge.
+
+        Native batched implementation: read ancestor chains (cached),
+        compute the cross-product of pairs, then run one read-write
+        transaction that (a) inserts contribution rows, (b) recomputes
+        weights/types for affected pairs, (c) upserts AGGREGATED edges.
+        Cost: O(1) Spanner round-trips per leaf edge regardless of
+        ancestor depth.
+        """
         await self._ensure_connected()
-        await self._materializer.materialize_lineage_edge(
-            source_urn, target_urn, edge_id, edge_type,
+        # Ancestor-chain fetch goes via GQL. Without a property graph
+        # we cannot materialise reliably; fail loudly so a misconfigured
+        # production deploy doesn't silently lose AGGREGATED edges.
+        self._require_gql()
+
+        s_chain, t_chain = await asyncio.gather(
+            self._fetch_ancestor_chain(source_urn),
+            self._fetch_ancestor_chain(target_urn),
+        )
+        pairs = _ancestor_pairs_for_leaf(s_chain, t_chain, source_urn, target_urn)
+        if not pairs:
+            return
+
+        # Distinct ancestor URN sets — used to scope the recompute query
+        # so we only touch the cells we actually changed.
+        s_urns = sorted({s for s, _ in pairs})
+        t_urns = sorted({t for _, t in pairs})
+
+        contribution_rows = [
+            (s, t, edge_id, edge_type or "")
+            for s, t in pairs
+        ]
+
+        def _txn(transaction):
+            # 1. Idempotent contribution insert. INSERT OR UPDATE on the
+            #    (source_urn, target_urn, contributor_id) PK is naturally
+            #    a no-op if the contribution is already recorded.
+            transaction.insert_or_update(
+                "GraphEdgeContribution",
+                columns=("source_urn", "target_urn", "contributor_id", "contributor_type"),
+                values=contribution_rows,
+            )
+
+            # 2. Recompute weight + type aggregates for every pair we
+            #    just touched. ARRAY_AGG(DISTINCT) collapses repeats.
+            cursor = transaction.execute_sql(
+                "SELECT source_urn, target_urn, COUNT(*) AS weight, "
+                "       ARRAY_AGG(DISTINCT contributor_type "
+                "                 IGNORE NULLS) AS types "
+                "FROM GraphEdgeContribution "
+                "WHERE source_urn IN UNNEST(@s) AND target_urn IN UNNEST(@t) "
+                "GROUP BY source_urn, target_urn",
+                params={"s": s_urns, "t": t_urns},
+                param_types={
+                    "s": _ParamTypes.array(_ParamTypes.STRING),
+                    "t": _ParamTypes.array(_ParamTypes.STRING),
+                },
+            )
+
+            # 3. Upsert AGGREGATED GraphEdge rows from the recompute.
+            agg_rows: List[Tuple[str, str, str, str, str]] = []
+            for row in cursor:
+                s, t, weight, types = row[0], row[1], int(row[2]), list(row[3] or [])
+                agg_rows.append((
+                    s, t, _agg_edge_id(s, t), _AGG_LABEL,
+                    json.dumps({
+                        "weight": weight,
+                        "source_edge_types": sorted(t_ for t_ in types if t_),
+                    }, separators=(",", ":")),
+                ))
+            if agg_rows:
+                transaction.insert_or_update(
+                    "GraphEdge",
+                    columns=("urn", "dest_urn", "edge_id", "label", "properties"),
+                    values=agg_rows,
+                )
+
+        await self._guard.run(
+            to_thread(self._database.run_in_transaction, _txn),
+            op_name="on_lineage_edge_written",
+            timeout_s=self._budget.write,
         )
 
     async def on_lineage_edge_deleted(
@@ -868,26 +1082,173 @@ class SpannerProvider(GraphDataProvider):
         target_urn: str,
         edge_id: str,
     ) -> None:
+        """Symmetric to ``on_lineage_edge_written``: drop the contribution,
+        then recompute / delete affected AGGREGATED edges in one transaction.
+        """
         await self._ensure_connected()
-        await self._materializer.remove_lineage_edge(source_urn, target_urn, edge_id)
+        self._require_gql()
+
+        s_chain, t_chain = await asyncio.gather(
+            self._fetch_ancestor_chain(source_urn),
+            self._fetch_ancestor_chain(target_urn),
+        )
+        pairs = _ancestor_pairs_for_leaf(s_chain, t_chain, source_urn, target_urn)
+        if not pairs:
+            return
+
+        s_urns = sorted({s for s, _ in pairs})
+        t_urns = sorted({t for _, t in pairs})
+
+        def _txn(transaction):
+            # 1. Drop every contribution this leaf-edge produced. DML
+            #    DELETE returns the affected row count for telemetry.
+            transaction.execute_update(
+                "DELETE FROM GraphEdgeContribution "
+                "WHERE source_urn IN UNNEST(@s) "
+                "  AND target_urn IN UNNEST(@t) "
+                "  AND contributor_id = @c",
+                params={"s": s_urns, "t": t_urns, "c": edge_id},
+                param_types={
+                    "s": _ParamTypes.array(_ParamTypes.STRING),
+                    "t": _ParamTypes.array(_ParamTypes.STRING),
+                    "c": _ParamTypes.STRING,
+                },
+            )
+
+            # 2. Recompute remaining aggregates for the affected pairs.
+            cursor = transaction.execute_sql(
+                "SELECT source_urn, target_urn, COUNT(*) AS weight, "
+                "       ARRAY_AGG(DISTINCT contributor_type "
+                "                 IGNORE NULLS) AS types "
+                "FROM GraphEdgeContribution "
+                "WHERE source_urn IN UNNEST(@s) AND target_urn IN UNNEST(@t) "
+                "GROUP BY source_urn, target_urn",
+                params={"s": s_urns, "t": t_urns},
+                param_types={
+                    "s": _ParamTypes.array(_ParamTypes.STRING),
+                    "t": _ParamTypes.array(_ParamTypes.STRING),
+                },
+            )
+
+            surviving: Dict[Tuple[str, str], Tuple[int, List[str]]] = {}
+            for row in cursor:
+                s, t, weight, types = row[0], row[1], int(row[2]), list(row[3] or [])
+                surviving[(s, t)] = (weight, types)
+
+            # 3a. Upsert AGGREGATED rows that still have contributors.
+            keep_rows: List[Tuple[str, str, str, str, str]] = []
+            drop_pairs: List[Tuple[str, str]] = []
+            for pair in pairs:
+                s, t = pair
+                if pair in surviving:
+                    weight, types = surviving[pair]
+                    keep_rows.append((
+                        s, t, _agg_edge_id(s, t), _AGG_LABEL,
+                        json.dumps({
+                            "weight": weight,
+                            "source_edge_types": sorted(t_ for t_ in types if t_),
+                        }, separators=(",", ":")),
+                    ))
+                else:
+                    drop_pairs.append(pair)
+
+            if keep_rows:
+                transaction.insert_or_update(
+                    "GraphEdge",
+                    columns=("urn", "dest_urn", "edge_id", "label", "properties"),
+                    values=keep_rows,
+                )
+
+            # 3b. Delete AGGREGATED rows whose count fell to zero. DML
+            #     because Spanner mutations don't accept WHERE clauses
+            #     beyond the PK, and we want to guard on label = AGGREGATED.
+            if drop_pairs:
+                drop_s = [p[0] for p in drop_pairs]
+                drop_t = [p[1] for p in drop_pairs]
+                drop_ids = [_agg_edge_id(s, t) for s, t in drop_pairs]
+                transaction.execute_update(
+                    "DELETE FROM GraphEdge "
+                    "WHERE label = @agg "
+                    "  AND urn IN UNNEST(@s) "
+                    "  AND dest_urn IN UNNEST(@t) "
+                    "  AND edge_id IN UNNEST(@ids)",
+                    params={
+                        "agg": _AGG_LABEL,
+                        "s": drop_s, "t": drop_t, "ids": drop_ids,
+                    },
+                    param_types={
+                        "agg": _ParamTypes.STRING,
+                        "s": _ParamTypes.array(_ParamTypes.STRING),
+                        "t": _ParamTypes.array(_ParamTypes.STRING),
+                        "ids": _ParamTypes.array(_ParamTypes.STRING),
+                    },
+                )
+
+        await self._guard.run(
+            to_thread(self._database.run_in_transaction, _txn),
+            op_name="on_lineage_edge_deleted",
+            timeout_s=self._budget.write,
+        )
 
     async def on_containment_changed(self, urn: str) -> None:
         await self._ancestor_cache.invalidate(urn, fingerprint=self._containment_fingerprint)
 
     async def count_aggregated_edges(self) -> int:
         await self._ensure_connected()
-        return await self._materializer.count()
+        rows = await self._execute_sql(
+            "SELECT COUNT(*) AS n FROM GraphEdge WHERE label = @agg",
+            params={"agg": _AGG_LABEL},
+            param_types_={"agg": _ParamTypes.STRING},
+        )
+        return int(rows[0]["n"]) if rows else 0
 
     async def purge_aggregated_edges(
         self,
         *,
-        batch_size: int = 10_000,
+        batch_size: int = 10_000,  # noqa: ARG002 — see below
         progress_callback: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> int:
+        """Delete every AGGREGATED edge + contribution row.
+
+        Drops the sidecar table contents AFTER the GraphEdge purge so
+        a crash mid-purge cannot leave the sidecar pointing at deleted
+        AGGREGATED rows (the next ``on_lineage_edge_written`` would
+        otherwise no-op against missing edges).
+
+        ``batch_size`` is part of the ABC signature; Spanner DML accepts
+        a single bulk ``DELETE WHERE TRUE`` so we don't chunk on the
+        client side. Kept for cross-provider call-site compatibility.
+        """
+        del batch_size  # explicitly unused on this path
         await self._ensure_connected()
-        return await self._materializer.purge_all(
-            batch_size=batch_size, progress_callback=progress_callback,
-        )
+        deleted = 0
+
+        def _purge_edges_txn(transaction):
+            return int(transaction.execute_update(
+                "DELETE FROM GraphEdge WHERE label = @agg",
+                params={"agg": _AGG_LABEL},
+                param_types={"agg": _ParamTypes.STRING},
+            ) or 0)
+
+        def _purge_contrib_txn(transaction):
+            return int(transaction.execute_update(
+                "DELETE FROM GraphEdgeContribution WHERE TRUE",
+            ) or 0)
+
+        deleted += await to_thread(self._database.run_in_transaction, _purge_edges_txn)
+        # Sidecar cleanup; failure here is logged but doesn't roll back the
+        # GraphEdge purge that the user asked for.
+        try:
+            await to_thread(self._database.run_in_transaction, _purge_contrib_txn)
+        except Exception as exc:
+            logger.warning("spanner: GraphEdgeContribution cleanup failed: %s", exc)
+
+        if progress_callback is not None:
+            try:
+                await progress_callback(deleted)
+            except Exception:
+                pass
+        return deleted
 
     # ----- Metadata --------------------------------------------------------
 
@@ -964,6 +1325,7 @@ class SpannerProvider(GraphDataProvider):
         self, urn: str, limit: int = 100, offset: int = 0,
     ) -> List[GraphNode]:
         await self._ensure_connected()
+        self._require_gql()
         chain = await self._fetch_ancestor_chain(urn)
         if not chain:
             return []
@@ -981,6 +1343,7 @@ class SpannerProvider(GraphDataProvider):
         offset: int = 0,
     ) -> List[GraphNode]:
         await self._ensure_connected()
+        self._require_gql()
         ctypes = self._containment_types()
         safe_depth = max(1, min(_DEFAULT_MAX_QUANTIFIER_DEPTH, depth))
         gql = (
@@ -1074,27 +1437,39 @@ class SpannerProvider(GraphDataProvider):
         self, edge_id: str, properties: Dict[str, Any],
     ) -> Optional[GraphEdge]:
         await self._ensure_connected()
-        # Read-modify-write the JSON properties column.
-        rows = await self._execute_sql(
-            "SELECT urn, dest_urn, edge_id, label, TO_JSON(properties) AS properties "
-            "FROM GraphEdge WHERE edge_id = @id LIMIT 1",
-            params={"id": edge_id},
-            param_types_={"id": _ParamTypes.STRING},
-        )
-        if not rows:
-            return None
-        existing_props = _decode_json(rows[0].get("properties")) or {}
-        merged = {**existing_props, **(properties or {})}
+
+        # Read-modify-write the JSON properties column under one read-write
+        # transaction so two concurrent ``update_edge`` calls cannot race
+        # and lose intermediate writes. The SELECT must run on the same
+        # transaction object as the UPDATE.
+        patch = dict(properties or {})
 
         def _txn(transaction):
+            cursor = transaction.execute_sql(
+                "SELECT urn, dest_urn, edge_id, label, TO_JSON(properties) AS properties "
+                "FROM GraphEdge WHERE edge_id = @id LIMIT 1",
+                params={"id": edge_id},
+                param_types={"id": _ParamTypes.STRING},
+            )
+            fields = [f.name for f in cursor.fields]
+            row_tuple = next(iter(cursor), None)
+            if row_tuple is None:
+                return None
+            row = {fields[i]: row_tuple[i] for i in range(len(fields))}
+            existing = _decode_json(row.get("properties")) or {}
+            merged = {**existing, **patch}
             transaction.execute_update(
                 "UPDATE GraphEdge SET properties = JSON @props WHERE edge_id = @id",
                 params={"props": merged, "id": edge_id},
                 param_types={"props": _ParamTypes.JSON, "id": _ParamTypes.STRING},
             )
-        await to_thread(self._database.run_in_transaction, _txn)
+            return row, merged
 
-        return self._row_to_edge({**rows[0], "properties": json.dumps(merged)})
+        result = await to_thread(self._database.run_in_transaction, _txn)
+        if result is None:
+            return None
+        row, merged = result
+        return self._row_to_edge({**row, "properties": json.dumps(merged)})
 
     async def delete_edge(self, edge_id: str) -> bool:
         await self._ensure_connected()
@@ -1540,187 +1915,69 @@ class _SpannerTraceCallbacks(TraceCallbacks):
 
 
 # ===========================================================================
-# Aggregation backends
+# Aggregation — Spanner-native batched implementation
 # ===========================================================================
+#
+# Architecture (replaces the prior JSON-array-on-edge model):
+#
+# * ``GraphEdgeContribution(source_urn, target_urn, contributor_id,
+#   contributor_type)`` is the source of truth for who contributes to
+#   each AGGREGATED pair. Every row is one (leaf-edge, AGGREGATED-pair)
+#   contribution. INSERT OR UPDATE on the (s, t, c) primary key is
+#   naturally idempotent.
+#
+# * ``GraphEdge`` rows with ``label = 'AGGREGATED'`` are the user-visible
+#   AGGREGATED edges. ``properties.weight`` and
+#   ``properties.source_edge_types`` are recomputed from the sidecar
+#   after every contribution write. The edge_id is deterministic
+#   (``agg:<s>|<t>``) so the upsert key is stable.
+#
+# * ``on_lineage_edge_written`` and ``on_lineage_edge_deleted`` drive
+#   the lifecycle in ONE read-write transaction:
+#     1. Read source + target ancestor chains (cached, one batched read).
+#     2. INSERT OR UPDATE / DELETE all sidecar contribution rows in
+#        a single batched mutation.
+#     3. SELECT the new aggregated counts + types for affected pairs in
+#        one SQL.
+#     4. INSERT OR UPDATE / DELETE the AGGREGATED GraphEdge rows in
+#        one batched mutation.
+#   Net cost: O(1) round-trips per leaf edge regardless of ancestor depth.
 
-class _SpannerJsonArrayIdempotency(IdempotencyBackend):
-    """Idempotency tracked as a JSON array property on the AGGREGATED edge.
 
-    An add/remove writes the entire properties JSON in a single
-    read-modify-write transaction. For our batch sizes (<= 1000 pairs)
-    this is acceptable; in higher throughput regimes we'd swap this for
-    a sidecar table keyed on (s_urn, t_urn, edge_id).
+def _agg_edge_id(s: str, t: str) -> str:
+    """Deterministic edge_id for the AGGREGATED edge between (s, t)."""
+    return f"agg:{s}|{t}"
+
+
+def _ancestor_pairs_for_leaf(
+    s_chain: List[str],
+    t_chain: List[str],
+    source_urn: str,
+    target_urn: str,
+) -> List[Tuple[str, str]]:
+    """Cross-product of ancestor chains, excluding self-loops.
+
+    Always includes the leaf endpoints themselves (chains may be empty
+    if the leaf has no ancestors yet).
     """
-
-    def __init__(self, provider: SpannerProvider) -> None:
-        self._p = provider
-
-    async def add(self, pair: PairKey, edge_id: str, edge_type: str) -> bool:
-        s, t = pair
-        props = await self._read_pair_props(s, t)
-        ids = list(props.get("source_edge_ids") or [])
-        if edge_id in ids:
-            return False
-        ids.append(edge_id)
-        types = list(props.get("source_edge_types") or [])
-        if edge_type and edge_type not in types:
-            types.append(edge_type)
-        props["source_edge_ids"] = ids
-        props["source_edge_types"] = types
-        props["weight"] = len(ids)
-        await self._write_pair_props(s, t, props)
-        return True
-
-    async def remove(self, pair: PairKey, edge_id: str) -> bool:
-        s, t = pair
-        props = await self._read_pair_props(s, t)
-        ids = list(props.get("source_edge_ids") or [])
-        if edge_id not in ids:
-            return False
-        ids.remove(edge_id)
-        props["source_edge_ids"] = ids
-        props["weight"] = len(ids)
-        await self._write_pair_props(s, t, props)
-        return True
-
-    async def count(self, pair: PairKey) -> int:
-        s, t = pair
-        props = await self._read_pair_props(s, t)
-        ids = props.get("source_edge_ids") or []
-        return len(ids)
-
-    async def edge_types(self, pair: PairKey) -> List[str]:
-        s, t = pair
-        props = await self._read_pair_props(s, t)
-        return list(props.get("source_edge_types") or [])
-
-    async def purge_namespace(self) -> None:
-        # No sidecar bookkeeping; the AGGREGATED rows ARE the bookkeeping.
-        return
-
-    async def _read_pair_props(self, s: str, t: str) -> Dict[str, Any]:
-        rows = await self._p._execute_sql(
-            "SELECT TO_JSON(properties) AS properties "
-            "FROM GraphEdge WHERE urn = @s AND dest_urn = @t AND label = @agg "
-            "LIMIT 1",
-            params={"s": s, "t": t, "agg": _AGG_LABEL},
-            param_types_={
-                "s": _ParamTypes.STRING, "t": _ParamTypes.STRING,
-                "agg": _ParamTypes.STRING,
-            },
-        )
-        if not rows:
-            return {}
-        return _decode_json(rows[0].get("properties")) or {}
-
-    async def _write_pair_props(self, s: str, t: str, props: Dict[str, Any]) -> None:
-        edge_id = f"agg:{s}|{t}"
-        await self._p._upsert_edges([
-            GraphEdge(
-                id=edge_id,
-                sourceUrn=s, targetUrn=t,
-                edgeType=_AGG_LABEL,
-                properties=props,
-            ),
-        ])
-
-
-class _SpannerMaterializationBackend(MaterializationBackend):
-    def __init__(self, provider: SpannerProvider) -> None:
-        self._p = provider
-
-    async def upsert_aggregated_edges(
-        self,
-        pairs: List[Tuple[PairKey, int, List[str]]],
-    ) -> None:
-        # The idempotency backend already wrote the edge properties; this is a
-        # no-op in the JSON-array model. Kept for symmetry / future Spanner
-        # sidecar-table model.
-        return
-
-    async def delete_aggregated_edge(self, pair: PairKey) -> None:
-        s, t = pair
-
-        def _txn(transaction):
-            transaction.execute_update(
-                "DELETE FROM GraphEdge WHERE urn = @s AND dest_urn = @t AND label = @agg",
-                params={"s": s, "t": t, "agg": _AGG_LABEL},
-                param_types={
-                    "s": _ParamTypes.STRING, "t": _ParamTypes.STRING,
-                    "agg": _ParamTypes.STRING,
-                },
-            )
-
-        await to_thread(self._p._database.run_in_transaction, _txn)
-
-    async def update_aggregated_edge(
-        self, pair: PairKey, weight: int, source_edge_types: List[str],
-    ) -> None:
-        # Same semantics as upsert in our model — the idempotency backend
-        # has already written the new properties.
-        return
-
-    async def count_all(self) -> int:
-        rows = await self._p._execute_sql(
-            "SELECT COUNT(*) AS n FROM GraphEdge WHERE label = @agg",
-            params={"agg": _AGG_LABEL},
-            param_types_={"agg": _ParamTypes.STRING},
-        )
-        return int(rows[0]["n"]) if rows else 0
-
-    async def purge_all(
-        self,
-        *,
-        batch_size: int,
-        progress_callback: Optional[Callable[[int], Awaitable[None]]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> int:
-        deleted = 0
-        while True:
-            if should_cancel and should_cancel():
-                break
-            # Spanner DML supports DELETE without LIMIT, but we batch
-            # to give cooperative cancellation a foothold.
-            def _txn(transaction):
-                # Delete a batch; Spanner returns the affected row count.
-                count = transaction.execute_update(
-                    "DELETE FROM GraphEdge "
-                    "WHERE label = @agg "
-                    "AND STARTS_WITH(edge_id, @prefix)",
-                    params={"agg": _AGG_LABEL, "prefix": "agg:"},
-                    param_types={
-                        "agg": _ParamTypes.STRING,
-                        "prefix": _ParamTypes.STRING,
-                    },
-                )
-                return int(count or 0)
-
-            n = await to_thread(self._p._database.run_in_transaction, _txn)
-            if not n:
-                break
-            deleted += int(n)
-            if progress_callback is not None:
-                try:
-                    await progress_callback(deleted)
-                except Exception:
-                    pass
-            if int(n) < batch_size:
-                break
-        return deleted
-
-
-class _SpannerAncestorResolver(AncestorResolver):
-    def __init__(self, provider: SpannerProvider) -> None:
-        self._p = provider
-
-    async def chain(self, urn: str) -> List[str]:
-        return await self._p._fetch_ancestor_chain(urn)
-
-    async def chains(self, urns: List[str]) -> Dict[str, List[str]]:
-        out: Dict[str, List[str]] = {}
-        for u in urns:
-            out[u] = await self._p._fetch_ancestor_chain(u)
-        return out
+    s_list = list(s_chain or []) or [source_urn]
+    if source_urn not in s_list:
+        s_list = [source_urn] + s_list
+    t_list = list(t_chain or []) or [target_urn]
+    if target_urn not in t_list:
+        t_list = [target_urn] + t_list
+    seen: Set[Tuple[str, str]] = set()
+    out: List[Tuple[str, str]] = []
+    for s in s_list:
+        for t in t_list:
+            if s == t:
+                continue
+            pair = (s, t)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            out.append(pair)
+    return out
 
 
 # ===========================================================================
@@ -1775,24 +2032,6 @@ class _SpannerSchemaIntrospector(SchemaIntrospector):
 # ===========================================================================
 # Helpers
 # ===========================================================================
-
-class _PreflightResult:
-    """Lightweight result type compatible with the registry's ``preflight()``
-    contract (``.ok`` and ``.detail`` attributes)."""
-
-    __slots__ = ("ok", "detail")
-
-    def __init__(self, ok: bool, detail: str) -> None:
-        self.ok = ok
-        self.detail = detail
-
-    @classmethod
-    def factory(cls, async_fn):
-        async def _wrap(*args, **kwargs):
-            ok, detail = await async_fn(*args, **kwargs)
-            return cls(ok, detail)
-        return _wrap
-
 
 class _ParamTypes:
     """Lazy accessors for spanner.param_types so importing this module
@@ -1923,6 +2162,27 @@ _DDL_CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS IDX_NODE_LEVEL ON GraphNode (level, label)",
     "CREATE INDEX IF NOT EXISTS IDX_NODE_QUALIFIED ON GraphNode (qualified_name)",
     "CREATE INDEX IF NOT EXISTS IDX_NODE_LAYER ON GraphNode (layer_assignment)",
+]
+
+# Sidecar bookkeeping table for AGGREGATED edge contributions.
+# Each row records that ``contributor_id`` (a leaf-level lineage edge) is
+# one of the source edges aggregated into the AGGREGATED edge between
+# ``source_urn`` and ``target_urn``. INSERT OR UPDATE on the (s,t,c)
+# triple is naturally idempotent; counting and edge-type aggregation
+# happen with normal SQL. This replaces the prior JSON-array-on-edge
+# read-modify-write model that incurred 3-5 round-trips per ancestor pair.
+_DDL_CREATE_GRAPH_EDGE_CONTRIBUTION = """
+CREATE TABLE GraphEdgeContribution (
+  source_urn STRING(MAX) NOT NULL,
+  target_urn STRING(MAX) NOT NULL,
+  contributor_id STRING(MAX) NOT NULL,
+  contributor_type STRING(MAX) NOT NULL,
+) PRIMARY KEY (source_urn, target_urn, contributor_id)
+""".strip()
+
+_DDL_CREATE_CONTRIBUTION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS IDX_CONTRIB_BY_PAIR ON GraphEdgeContribution (source_urn, target_urn)",
+    "CREATE INDEX IF NOT EXISTS IDX_CONTRIB_BY_CONTRIBUTOR ON GraphEdgeContribution (contributor_id)",
 ]
 
 

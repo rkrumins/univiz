@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import pytest
 
+from backend.common.interfaces.preflight import PreflightResult
 from backend.graph.adapters.spanner_provider import (
     SpannerEditionError,
     SpannerProvider,
+    _DDL_CREATE_CONTRIBUTION_INDEXES,
     _DDL_CREATE_GRAPH_EDGE,
+    _DDL_CREATE_GRAPH_EDGE_CONTRIBUTION,
     _DDL_CREATE_GRAPH_NODE,
     _DDL_CREATE_INDEXES,
     _DDL_CREATE_PROPERTY_GRAPH,
+    _agg_edge_id,
+    _ancestor_pairs_for_leaf,
     _decode_json,
     _safe_int,
 )
@@ -120,3 +125,64 @@ def test_edition_error_is_runtime_error_subclass():
     # The wizard catches RuntimeError generically; SpannerEditionError must
     # subclass it so the existing error funnel renders the message.
     assert issubclass(SpannerEditionError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# Sidecar bookkeeping (Phase I.2)
+# ---------------------------------------------------------------------------
+
+def test_sidecar_table_uses_three_part_primary_key():
+    ddl = _DDL_CREATE_GRAPH_EDGE_CONTRIBUTION
+    assert "CREATE TABLE GraphEdgeContribution" in ddl
+    assert "PRIMARY KEY (source_urn, target_urn, contributor_id)" in ddl
+    # No interleave: contribution rows live independently of GraphNode
+    # so a contributor edge being deleted does not cascade-delete the
+    # AGGREGATED contribution row out from under the materialiser.
+    assert "INTERLEAVE" not in ddl
+
+
+def test_sidecar_indexes_cover_pair_lookup_and_contributor_lookup():
+    by_pair = any("IDX_CONTRIB_BY_PAIR" in d for d in _DDL_CREATE_CONTRIBUTION_INDEXES)
+    by_contributor = any(
+        "IDX_CONTRIB_BY_CONTRIBUTOR" in d for d in _DDL_CREATE_CONTRIBUTION_INDEXES
+    )
+    assert by_pair and by_contributor
+
+
+def test_agg_edge_id_is_deterministic():
+    # Stable encoding so re-materialisation finds the existing row.
+    assert _agg_edge_id("a", "b") == "agg:a|b"
+    assert _agg_edge_id("urn:x", "urn:y") == "agg:urn:x|urn:y"
+
+
+def test_ancestor_pairs_for_leaf_excludes_self_loops_and_dedupes():
+    # Domain shared on both sides — the (domain, domain) pair must drop.
+    pairs = _ancestor_pairs_for_leaf(
+        ["leaf1", "schema1", "domain"],
+        ["leaf2", "schema2", "domain"],
+        "leaf1", "leaf2",
+    )
+    assert ("domain", "domain") not in pairs
+    # Cross-product cardinality minus the one self-loop.
+    assert len(pairs) == 3 * 3 - 1
+
+
+def test_ancestor_pairs_for_leaf_includes_endpoints_when_chains_empty():
+    # If the ancestor cache returns empty (e.g. fresh database), the
+    # leaf endpoints themselves form the only AGGREGATED pair so the
+    # materialiser still produces a usable AGGREGATED edge.
+    pairs = _ancestor_pairs_for_leaf([], [], "leaf1", "leaf2")
+    assert pairs == [("leaf1", "leaf2")]
+
+
+# ---------------------------------------------------------------------------
+# Preflight contract (Phase I.1)
+# ---------------------------------------------------------------------------
+
+def test_preflight_returns_canonical_result_type_annotation():
+    import typing
+
+    # ``from __future__ import annotations`` defers evaluation, so we
+    # use get_type_hints to resolve the string to the actual class.
+    hints = typing.get_type_hints(SpannerProvider.preflight)
+    assert hints.get("return") is PreflightResult

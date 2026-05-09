@@ -115,20 +115,14 @@ async def spanner_provider():
         database_id=database_id, graph_name="UniViz",
         use_emulator=True,
     )
-    # Bypass property-graph DDL on the emulator (it's unsupported).
-    # ``_ensure_connected`` runs ``_bootstrap_property_graph`` which will raise;
-    # we tolerate that exception and proceed with SQL-only tests.
-    try:
-        await provider._ensure_connected()
-    except Exception as exc:
-        # Expected on the emulator: CREATE PROPERTY GRAPH is unsupported.
-        # Tables and indexes were created by ``_bootstrap_tables`` first;
-        # mark connected so subsequent SQL paths work.
-        if "property" in str(exc).lower() or "graph" in str(exc).lower():
-            provider._connected = True
-            provider._schema_bootstrapped = True
-        else:
-            raise
+    # ``_bootstrap_property_graph`` swallows the emulator's refusal of
+    # CREATE PROPERTY GRAPH and sets ``_has_property_graph = False``.
+    # Tables, indexes, and the SQL surface remain usable; GQL methods
+    # raise a clear ``RuntimeError`` via ``_require_gql``.
+    await provider._ensure_connected()
+    assert provider._has_property_graph is False, (
+        "expected emulator to NOT host a property graph"
+    )
 
     yield provider
 

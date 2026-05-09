@@ -73,7 +73,13 @@ class SchemaIntrospector:
         return {}
 
     async def discover(self) -> Dict[str, Any]:
-        """Returns the ``discover_schema`` payload consumed by the wizard."""
+        """Returns the ``discover_schema`` payload consumed by the wizard.
+
+        The key for edge types is ``relationshipTypes`` to match the
+        frontend ``SchemaDiscoveryResult`` contract in
+        ``frontend/src/services/providerService.ts`` and the existing
+        Neo4j payload shape in ``backend/graph/adapters/neo4j_provider.py``.
+        """
         labels = await self.labels()
         edge_types = await self.edge_types()
         label_keys: Dict[str, List[str]] = {}
@@ -91,7 +97,7 @@ class SchemaIntrospector:
         suggested = suggest_mapping(payload)
         return {
             "labels": labels,
-            "edgeTypes": edge_types,
+            "relationshipTypes": edge_types,
             "labelDetails": {
                 label: {"propertyKeys": keys}
                 for label, keys in label_keys.items()
