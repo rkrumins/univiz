@@ -2826,14 +2826,11 @@ class FalkorDBProvider(GraphDataProvider):
                     list(nodes_by_urn.keys()), ctypes,
                 )
             except Exception:
-                # Lineage was already collected — fall back silently so the
-                # trace returns the lineage even when the hierarchy fetch
-                # hiccups. The frontend's hierarchy hook tolerates missing
-                # ancestors (per the safety-net pattern). We do NOT set a
-                # truncationReason here: the BFS data isn't truncated, only
-                # hydration is partial, and surfacing it as truncation
-                # produces a misleading "size limit" banner.
+                # Lineage was already collected; surface the partial result
+                # via truncationReason so the frontend safety-net renders
+                # the lineage without the (now-missing) ancestor chain.
                 ancestor_urns = []
+                truncation_reason = truncation_reason or "ancestors_failed"
             new_ancestors = [u for u in ancestor_urns if u not in nodes_by_urn]
             if new_ancestors:
                 ancestor_nodes = await self.get_nodes_batch(new_ancestors)
@@ -2884,10 +2881,8 @@ class FalkorDBProvider(GraphDataProvider):
 
         # Single-query pair fetch: source + target descendants in one
         # UNION'd Cypher round-trip. Saves one planner pass and frees a
-        # pool slot for the duration. On failure, fall back to an empty
-        # pair silently — surfacing this as truncationReason produced a
-        # misleading "size limit" banner; the empty result already
-        # signals to the frontend that nothing was found.
+        # pool slot for the duration. Surfaces the (now-single) failure
+        # mode via truncationReason rather than aborting the expand.
         truncation_reason: Optional[str] = None
         try:
             s_urns, t_urns = await self._collect_descendants_pair_at_level(
@@ -2895,9 +2890,10 @@ class FalkorDBProvider(GraphDataProvider):
             )
         except Exception:
             s_urns, t_urns = [], []
+            truncation_reason = "descendants_failed"
 
         if time.monotonic() > deadline:
-            truncation_reason = "timeout"
+            truncation_reason = truncation_reason or "timeout"
 
         # Step 3: edges between the two URN sets — set membership, not Cartesian
         edges: List[GraphEdge] = []
@@ -2933,9 +2929,8 @@ class FalkorDBProvider(GraphDataProvider):
                     list(nodes_by_urn.keys()), ctypes,
                 )
             except Exception:
-                # See trace_at_level: hierarchy failure ≠ truncation; fall
-                # back silently and let the frontend safety-net handle it.
                 ancestor_urns = []
+                truncation_reason = truncation_reason or "ancestors_failed"
             new_ancestors = [u for u in ancestor_urns if u not in nodes_by_urn]
             if new_ancestors:
                 ancestor_nodes = await self.get_nodes_batch(new_ancestors)
@@ -2994,28 +2989,17 @@ class FalkorDBProvider(GraphDataProvider):
             # Without a label filter we'd unconditionally walk up containment;
             # safer to return the focus as-is and let the BFS try its luck.
             return urn
-        # Same inline-ctype trick as `_collect_ancestor_urns`: encoding the
-        # containment edge types directly in the pattern (`[:T1|T2*0..10]`)
-        # instead of binding `c` and filtering via `ALL(...)` avoids the
-        # FalkorDB "Type mismatch: expected List or Null but was Edge"
-        # planner bug. Also drops the path variable — `length(path)` had
-        # been throwing `_AR_EXP_UpdateEntityIdx: Unable to locate a value
-        # with alias path within the record` when OPTIONAL MATCH found no
-        # ancestor; we order by `coalesce(size(c'), 0)` via a CASE on the
-        # path-shape instead.
-        ctype_pattern = "|".join(_sanitize_label(t) for t in ctypes if t)
-        if not ctype_pattern:
-            return urn
         cypher = (
             "MATCH (focus {urn: $urn}) "
-            f"OPTIONAL MATCH (focus)<-[:{ctype_pattern}*0..10]-(anc) "
-            "WHERE labels(anc)[0] IN $types "
+            "OPTIONAL MATCH path = (focus)<-[c*0..10]-(anc) "
+            "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
+            "  AND labels(anc)[0] IN $types "
             "RETURN coalesce(anc.urn, focus.urn) AS anchorUrn "
-            "LIMIT 1"
+            "ORDER BY length(path) ASC LIMIT 1"
         )
         try:
             result = await self._ro_query(
-                cypher, params={"urn": urn, "types": types},
+                cypher, params={"urn": urn, "ctypes": ctypes, "types": types},
             )
             rows = result.result_set or []
             if rows and rows[0]:
@@ -3220,33 +3204,32 @@ class FalkorDBProvider(GraphDataProvider):
         """
         if not urns or not ctypes:
             return []
-        # Inline the containment-type filter into the pattern (`[:T1|T2*1..10]`)
-        # instead of binding a variable-length list and filtering via
-        # `ALL(rel IN c WHERE type(rel) IN $ctypes)`. The latter form
-        # consistently triggers FalkorDB's "Type mismatch: expected List
-        # or Null but was Edge" planner bug — `c` is misclassified as a
-        # singleton Edge for 1-edge paths. With the type filter inline,
-        # `c` is never bound, the planner has no list to coerce, and the
-        # bug is dodged. Same trick A1 applied on the descendants side.
-        ctype_pattern = "|".join(_sanitize_label(t) for t in ctypes if t)
-        if not ctype_pattern:
-            return []
+        # NOTE: an earlier rewrite combined the per-URN UNWIND into a
+        # single MATCH with `n.urn IN $urns`, but that triggers the same
+        # FalkorDB "Type mismatch: expected List or Null but was Edge"
+        # planner bug A1 hit on the descendants side, on graphs where
+        # ``$urns`` exceeds ~few hundred entries. The variable-length
+        # alias ``c`` is misclassified as Edge under that plan shape.
+        # Reverted to UNWIND-per-URN until we have a query form that's
+        # both fast AND survives the planner bug.
         cypher = (
             "UNWIND $urns AS u "
-            f"MATCH (n {{urn: u}})<-[:{ctype_pattern}*1..10]-(ancestor) "
+            "MATCH (n {urn: u})<-[c*1..10]-(ancestor) "
+            "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
             "RETURN DISTINCT ancestor.urn AS ancestorUrn"
         )
         try:
-            result = await self._ro_query(cypher, params={"urns": urns})
+            result = await self._ro_query(cypher, params={"urns": urns, "ctypes": ctypes})
             out: List[str] = []
             for row in (result.result_set or []):
                 if row and row[0]:
                     out.append(row[0])
             return out
         except Exception as exc:
-            # Re-raise so the caller decides what to do — for trace v2 the
-            # caller catches and falls back silently, but the WARNING log
-            # remains so the failure is visible in operator dashboards.
+            # Re-raise so callers can preserve already-fetched lineage and
+            # surface ``truncationReason="ancestors_failed"`` instead of
+            # silently dropping the containment chain (which produces
+            # canvas orphans).
             logger.warning("trace_at_level: ancestor collection failed for %d urns: %s", len(urns), exc)
             raise
 
@@ -3286,31 +3269,29 @@ class FalkorDBProvider(GraphDataProvider):
                 "source": source_urn, "target": target_urn, "types": types,
             }
         else:
-            # UNION over per-anchor branches with inline ctypes pattern
-            # (`[:T1|T2*0..10]`) so the variable-length list `c` is never
-            # bound — same trick used for `_collect_ancestor_urns` to
-            # dodge FalkorDB's "Type mismatch: expected List or Null but
-            # was Edge" planner bug. Per-side `$limit` still streams via
-            # `WITH DISTINCT … LIMIT` before `collect()`.
-            ctype_pattern = "|".join(_sanitize_label(t) for t in ctypes if t)
-            if not ctype_pattern:
-                return [], []
+            # UNION over per-anchor branches — same `WITH DISTINCT … LIMIT`
+            # streaming pattern as the single-anchor helper used to (A1) so
+            # the per-side `$limit` applies before ``collect()`` and the
+            # path-alias never enters a slice context. One round-trip
+            # instead of the prior two.
             cypher = (
-                f"MATCH (a {{urn: $source}})-[:{ctype_pattern}*0..10]->(child) "
-                "WHERE labels(child)[0] IN $types "
+                "MATCH (a {urn: $source})-[c*0..10]->(child) "
+                "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
+                "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
                 "LIMIT $limit "
                 "RETURN 's' AS side, collect(urn) AS urns "
                 "UNION "
-                f"MATCH (b {{urn: $target}})-[:{ctype_pattern}*0..10]->(child) "
-                "WHERE labels(child)[0] IN $types "
+                "MATCH (b {urn: $target})-[c*0..10]->(child) "
+                "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
+                "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
                 "LIMIT $limit "
                 "RETURN 't' AS side, collect(urn) AS urns"
             )
             params = {
                 "source": source_urn, "target": target_urn,
-                "types": types, "limit": limit,
+                "ctypes": ctypes, "types": types, "limit": limit,
             }
         try:
             result = await self._ro_query(cypher, params=params)
