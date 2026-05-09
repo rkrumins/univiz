@@ -88,6 +88,34 @@ export const DataHubLogo: React.FC<LogoProps> = ({ className }) => (
 );
 
 /**
+ * Google Cloud Spanner Graph logo — four-coloured "G" mark in the
+ * Google brand palette (#4285F4 blue, #EA4335 red, #FBBC04 yellow,
+ * #34A853 green). Stylised as a single closed loop suggesting both
+ * the "G" and the global-distribution motif of Spanner.
+ */
+export const SpannerLogo: React.FC<LogoProps> = ({ className }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    className={className}
+  >
+    {/* Outer four-colour ring quartered in the Google palette. */}
+    <path d="M12 3a9 9 0 0 1 7.794 4.5l-2.598 1.5A6 6 0 0 0 12 6V3Z" fill="#EA4335" />
+    <path d="M19.794 7.5A9 9 0 0 1 21 12h-3a6 6 0 0 0-.804-3l2.598-1.5Z" fill="#FBBC04" />
+    <path d="M21 12a9 9 0 0 1-1.206 4.5l-2.598-1.5A6 6 0 0 0 18 12h3Z" fill="#34A853" />
+    <path d="M19.794 16.5A9 9 0 0 1 12 21v-3a6 6 0 0 0 5.196-3l2.598 1.5Z" fill="#4285F4" />
+    <path d="M12 21a9 9 0 0 1-9-9h3a6 6 0 0 0 6 6v3Z" fill="#4285F4" />
+    <path d="M3 12a9 9 0 0 1 9-9v3a6 6 0 0 0-6 6H3Z" fill="#4285F4" />
+    {/* Inner "G" notch — open-right hint borrowed from the Google G. */}
+    <path
+      d="M12 9.25h3.5v3.5h-2v-1.5H12a2.25 2.25 0 1 0 2.196 2.75h2.052A4.25 4.25 0 1 1 12 9.25Z"
+      fill="white"
+    />
+  </svg>
+);
+
+/**
  * Returns the matching provider logo component for a given provider type string.
  * Falls back to FalkorDBLogo for unknown types.
  */
@@ -99,6 +127,7 @@ export function getProviderLogo(
   if (key.includes("neo4j")) return Neo4jLogo;
   if (key.includes("falkor")) return FalkorDBLogo;
   if (key.includes("datahub")) return DataHubLogo;
+  if (key.includes("spanner")) return SpannerLogo;
 
   return FalkorDBLogo;
 }

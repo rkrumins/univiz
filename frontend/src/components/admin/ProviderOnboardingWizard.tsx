@@ -34,7 +34,7 @@ import {
 } from '@/services/providerService'
 import { useToast } from '@/components/ui/toast'
 import { useWizardKeyboard } from './AssetOnboardingWizard/hooks/useWizardKeyboard'
-import { DataHubLogo, FalkorDBLogo, Neo4jLogo } from './ProviderLogos'
+import { DataHubLogo, FalkorDBLogo, Neo4jLogo, SpannerLogo } from './ProviderLogos'
 
 type ProviderWizardStep = 'type' | 'connection' | 'schema' | 'review'
 type WizardPhase = 'steps' | 'success'
@@ -51,6 +51,15 @@ interface SchemaMappingState {
   entityTypeField: string
 }
 
+interface SpannerFormState {
+  projectId: string
+  instanceId: string
+  databaseId: string
+  graphName: string
+  serviceAccountJson: string
+  useEmulator: boolean
+}
+
 interface ProviderOnboardingFormData {
   providerType: ProviderType | ''
   name: string
@@ -61,6 +70,9 @@ interface ProviderOnboardingFormData {
   password: string
   schemaMappingEnabled: boolean
   schemaMapping: SchemaMappingState
+  // Spanner uses project/instance/database identifiers rather than host/port.
+  // Field is optional because non-Spanner providers ignore it.
+  spanner?: SpannerFormState
 }
 
 interface ConnectivityCheck {
@@ -107,7 +119,23 @@ const PROVIDER_TYPES: Array<{
     color: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20',
     desc: 'LinkedIn metadata platform',
   },
+  {
+    type: 'spanner',
+    label: 'Google Spanner Graph',
+    Logo: SpannerLogo,
+    color: 'text-sky-500 bg-sky-500/10 border-sky-500/20',
+    desc: 'Cloud-native distributed property graph (GQL). Requires Enterprise edition.',
+  },
 ]
+
+const DEFAULT_SPANNER_STATE: SpannerFormState = {
+  projectId: '',
+  instanceId: '',
+  databaseId: '',
+  graphName: 'UniViz',
+  serviceAccountJson: '',
+  useEmulator: false,
+}
 
 const DEFAULT_SCHEMA_MAPPING: SchemaMappingState = {
   identityField: 'urn',
@@ -126,11 +154,21 @@ function getProviderConfig(type: string) {
 function defaultPortForProvider(type: ProviderType | ''): number {
   if (type === 'neo4j') return 7687
   if (type === 'datahub') return 8080
+  // Spanner has no port concept (managed gRPC); the form hides the
+  // port field when type === 'spanner'. We still return a sentinel so
+  // ``ProviderOnboardingFormData.port`` stays a number.
+  if (type === 'spanner') return 0
   return 6379
+}
+
+function isSpanner(type: ProviderType | ''): boolean {
+  return type === 'spanner'
 }
 
 function buildInitialFormData(provider?: ProviderResponse | null): ProviderOnboardingFormData {
   const schemaMapping = provider?.extraConfig?.schemaMapping
+  const extra = provider?.extraConfig ?? {}
+  const isSpannerProvider = provider?.providerType === 'spanner'
 
   return {
     providerType: provider?.providerType ?? '',
@@ -150,14 +188,25 @@ function buildInitialFormData(provider?: ProviderResponse | null): ProviderOnboa
       entityTypeStrategy: schemaMapping?.entity_type_strategy ?? DEFAULT_SCHEMA_MAPPING.entityTypeStrategy,
       entityTypeField: schemaMapping?.entity_type_field ?? DEFAULT_SCHEMA_MAPPING.entityTypeField,
     },
+    spanner: isSpannerProvider
+      ? {
+          projectId: extra.projectId ?? '',
+          instanceId: extra.instanceId ?? '',
+          databaseId: extra.databaseId ?? '',
+          graphName: extra.graphName ?? DEFAULT_SPANNER_STATE.graphName,
+          // Service-account JSON is not echoed back from the API for security.
+          serviceAccountJson: '',
+          useEmulator: Boolean(extra.useEmulator),
+        }
+      : { ...DEFAULT_SPANNER_STATE },
   }
 }
 
 function buildExtraConfig(formData: ProviderOnboardingFormData) {
-  if (!formData.schemaMappingEnabled) return undefined
+  const out: Record<string, any> = {}
 
-  return {
-    schemaMapping: {
+  if (formData.schemaMappingEnabled) {
+    out.schemaMapping = {
       identity_field: formData.schemaMapping.identityField,
       display_name_field: formData.schemaMapping.displayNameField,
       qualified_name_field: formData.schemaMapping.qualifiedNameField,
@@ -165,20 +214,46 @@ function buildExtraConfig(formData: ProviderOnboardingFormData) {
       tags_field: formData.schemaMapping.tagsField,
       entity_type_strategy: formData.schemaMapping.entityTypeStrategy,
       entity_type_field: formData.schemaMapping.entityTypeField,
-    },
+    }
   }
+
+  if (isSpanner(formData.providerType) && formData.spanner) {
+    const s = formData.spanner
+    if (s.projectId) out.projectId = s.projectId
+    if (s.instanceId) out.instanceId = s.instanceId
+    if (s.databaseId) out.databaseId = s.databaseId
+    if (s.graphName) out.graphName = s.graphName
+    if (s.useEmulator) out.useEmulator = true
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 function buildConnectivityRequest(formData: ProviderOnboardingFormData): ProviderCreateRequest {
+  // Spanner doesn't use host/port/username/password; build credentials and
+  // skip host/port for that branch. Other providers stay on the legacy shape.
+  const isSpannerType = isSpanner(formData.providerType)
+
+  const credentials = isSpannerType
+    ? (
+        formData.spanner?.serviceAccountJson || formData.spanner?.projectId
+          ? {
+              project_id: formData.spanner?.projectId || undefined,
+              service_account_json: formData.spanner?.serviceAccountJson || undefined,
+            }
+          : undefined
+      )
+    : (formData.username || formData.password)
+      ? { username: formData.username || undefined, password: formData.password || undefined }
+      : undefined
+
   return {
     name: formData.name.trim() || 'Connectivity Check',
     providerType: formData.providerType as ProviderType,
-    host: formData.host || undefined,
-    port: formData.port || undefined,
+    host: isSpannerType ? undefined : (formData.host || undefined),
+    port: isSpannerType ? undefined : (formData.port || undefined),
     tlsEnabled: formData.tlsEnabled,
-    credentials: (formData.username || formData.password)
-      ? { username: formData.username || undefined, password: formData.password || undefined }
-      : undefined,
+    credentials,
     extraConfig: buildExtraConfig(formData),
   }
 }
@@ -305,7 +380,10 @@ export function ProviderOnboardingWizard({
 
     flow.push({ id: 'connection', title: 'Connection', icon: Globe })
 
-    if (formData.providerType === 'neo4j') {
+    // Schema-mapping step appears for any non-canonical-schema provider.
+    // FalkorDB and DataHub use the canonical Synodic property names; Neo4j
+    // and Spanner can map foreign properties via SchemaMapping.
+    if (formData.providerType === 'neo4j' || formData.providerType === 'spanner') {
       flow.push({ id: 'schema', title: 'Schema Mapping', icon: Scan })
     }
 
@@ -330,8 +408,18 @@ export function ProviderOnboardingWizard({
     switch (currentStep) {
       case 'type':
         return Boolean(formData.providerType)
-      case 'connection':
-        return Boolean(formData.name.trim()) && !nameDuplicate
+      case 'connection': {
+        if (!formData.name.trim() || nameDuplicate) return false
+        // Spanner needs project + instance + database before we can probe.
+        if (isSpanner(formData.providerType)) {
+          const s = formData.spanner
+          if (!s) return false
+          if (!s.projectId.trim() || !s.instanceId.trim() || !s.databaseId.trim()) return false
+          // In emulator mode the service-account JSON is optional.
+          if (!s.useEmulator && !s.serviceAccountJson.trim()) return false
+        }
+        return true
+      }
       case 'schema':
         return true
       case 'review':
@@ -688,48 +776,147 @@ export function ProviderOnboardingWizard({
             />
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
-            <div className="col-span-2">
-              <label className="mb-1.5 block text-sm font-medium text-ink">Host</label>
-              <input
-                value={formData.host}
-                onChange={(event) => updateFormData({ host: event.target.value })}
-                placeholder="localhost"
-                className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
-              />
-            </div>
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-ink">Port</label>
-              <input
-                type="number"
-                value={formData.port}
-                onChange={(event) => updateFormData({ port: Number(event.target.value) })}
-                className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
-              />
-            </div>
-          </div>
+          {isSpanner(formData.providerType) ? (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">GCP Project ID</label>
+                  <input
+                    value={formData.spanner?.projectId ?? ''}
+                    onChange={(event) =>
+                      updateFormData({
+                        spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), projectId: event.target.value },
+                      })
+                    }
+                    placeholder="my-gcp-project"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Instance ID</label>
+                  <input
+                    value={formData.spanner?.instanceId ?? ''}
+                    onChange={(event) =>
+                      updateFormData({
+                        spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), instanceId: event.target.value },
+                      })
+                    }
+                    placeholder="uniViz-instance"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Database ID</label>
+                  <input
+                    value={formData.spanner?.databaseId ?? ''}
+                    onChange={(event) =>
+                      updateFormData({
+                        spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), databaseId: event.target.value },
+                      })
+                    }
+                    placeholder="uniViz"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Property graph name</label>
+                  <input
+                    value={formData.spanner?.graphName ?? ''}
+                    onChange={(event) =>
+                      updateFormData({
+                        spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), graphName: event.target.value },
+                      })
+                    }
+                    placeholder="UniViz"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+              </div>
+              <label className="flex items-center justify-between rounded-xl border border-glass-border bg-black/5 px-4 py-3 dark:bg-white/5">
+                <div>
+                  <p className="text-sm font-medium text-ink">Use cloud-spanner-emulator</p>
+                  <p className="text-xs text-ink-muted">
+                    Routes the client to <code>localhost:9010</code>. The emulator does not implement GQL —
+                    schema bootstrap and queries succeed, but property-graph DDL fails.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={Boolean(formData.spanner?.useEmulator)}
+                  onChange={(event) =>
+                    updateFormData({
+                      spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), useEmulator: event.target.checked },
+                    })
+                  }
+                  className="h-4 w-4 rounded border-glass-border text-indigo-500 focus:ring-indigo-500/50"
+                />
+              </label>
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-ink">
+                  Service account JSON
+                  {formData.spanner?.useEmulator ? <span className="text-ink-muted"> (optional in emulator mode)</span> : null}
+                </label>
+                <textarea
+                  value={formData.spanner?.serviceAccountJson ?? ''}
+                  onChange={(event) =>
+                    updateFormData({
+                      spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), serviceAccountJson: event.target.value },
+                    })
+                  }
+                  placeholder='{"type":"service_account","project_id":"...", ...}'
+                  rows={6}
+                  className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 font-mono text-xs text-ink placeholder:text-ink-muted focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="col-span-2">
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Host</label>
+                  <input
+                    value={formData.host}
+                    onChange={(event) => updateFormData({ host: event.target.value })}
+                    placeholder="localhost"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Port</label>
+                  <input
+                    type="number"
+                    value={formData.port}
+                    onChange={(event) => updateFormData({ port: Number(event.target.value) })}
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+              </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-ink">Username</label>
-              <input
-                value={formData.username}
-                onChange={(event) => updateFormData({ username: event.target.value })}
-                placeholder="optional"
-                className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
-              />
-            </div>
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-ink">Password</label>
-              <input
-                type="password"
-                value={formData.password}
-                onChange={(event) => updateFormData({ password: event.target.value })}
-                placeholder="optional"
-                className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
-              />
-            </div>
-          </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Username</label>
+                  <input
+                    value={formData.username}
+                    onChange={(event) => updateFormData({ username: event.target.value })}
+                    placeholder="optional"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-ink">Password</label>
+                  <input
+                    type="password"
+                    value={formData.password}
+                    onChange={(event) => updateFormData({ password: event.target.value })}
+                    placeholder="optional"
+                    className="w-full rounded-xl border border-glass-border bg-black/5 px-4 py-2.5 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-indigo-500/50 dark:bg-white/5"
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="space-y-4 rounded-2xl border border-glass-border bg-gradient-to-br from-slate-50 to-white p-5 dark:from-slate-800 dark:to-slate-900">

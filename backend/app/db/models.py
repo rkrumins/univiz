@@ -241,7 +241,7 @@ class ProviderORM(Base):
 
     id = Column(Text, primary_key=True, default=lambda: f"prov_{uuid.uuid4().hex[:12]}")
     name = Column(Text, nullable=False)
-    provider_type = Column(Text, nullable=False)      # falkordb | neo4j | datahub | mock
+    provider_type = Column(Text, nullable=False)      # falkordb | neo4j | datahub | spanner | mock
     host = Column(Text, nullable=True)
     port = Column(Integer, nullable=True)
     credentials = Column(Text, nullable=True)         # Fernet-encrypted JSON blob
@@ -265,7 +265,7 @@ class ProviderORM(Base):
     __table_args__ = (
         Index("idx_providers_type", "provider_type"),
         CheckConstraint(
-            "provider_type IN ('falkordb', 'neo4j', 'datahub', 'mock')",
+            "provider_type IN ('falkordb', 'neo4j', 'datahub', 'spanner', 'mock')",
             name="ck_providers_provider_type",
         ),
     )
