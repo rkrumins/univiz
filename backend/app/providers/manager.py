@@ -690,6 +690,31 @@ class ProviderManager:
                 token=creds.get("token"),
             )
 
+        elif ptype == "spanner":
+            # Spanner uses GCP project/instance/database identifiers rather
+            # than host/port. They live on extra_config; credentials carry
+            # the service-account JSON.
+            from backend.graph.adapters.spanner_provider import SpannerProvider
+            cfg = dict(extra_config or {})
+            project_id = cfg.get("projectId") or creds.get("project_id")
+            instance_id = cfg.get("instanceId")
+            database_id = cfg.get("databaseId") or graph_name
+            if not project_id or not instance_id or not database_id:
+                raise ValueError(
+                    "Spanner provider requires extra_config.projectId, "
+                    "extra_config.instanceId, and (extra_config.databaseId or graph_name). "
+                    f"Got project={project_id!r} instance={instance_id!r} database={database_id!r}."
+                )
+            return SpannerProvider(
+                project_id=project_id,
+                instance_id=instance_id,
+                database_id=database_id,
+                graph_name=cfg.get("graphName") or "UniViz",
+                credentials_json=creds.get("service_account_json"),
+                use_emulator=bool(cfg.get("useEmulator", False)),
+                extra_config=cfg,
+            )
+
         raise ValueError(f"Unknown provider_type: {ptype!r}")
 
     # ------------------------------------------------------------------ #

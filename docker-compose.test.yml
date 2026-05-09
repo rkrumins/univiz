@@ -1,0 +1,40 @@
+version: "3.9"
+
+# Test-only services. Bring up just the one(s) you need:
+#
+#     docker compose -f docker-compose.test.yml up -d spanner-emulator
+#
+# After the emulator is healthy, bootstrap an instance + database:
+#
+#     export SPANNER_EMULATOR_HOST=localhost:9010
+#     gcloud config configurations create emulator
+#     gcloud config set auth/disable_credentials true
+#     gcloud config set project test-project
+#     gcloud config set api_endpoint_overrides/spanner http://localhost:9020/
+#     gcloud spanner instances create test-instance \
+#         --config=emulator-config --description="Test" --nodes=1
+#     gcloud spanner databases create "test_db_$$" --instance=test-instance \
+#         --ddl="CREATE TABLE _bootstrap (id INT64 NOT NULL) PRIMARY KEY (id)"
+#
+# Then:
+#     pytest backend/tests/test_spanner_provider_emulator.py -v
+#
+# Note: the emulator does NOT support Spanner Graph (CREATE PROPERTY GRAPH / GQL).
+# The emulator suite covers SQL paths only; for GQL, point
+# ``SPANNER_TEST_INSTANCE`` at a real Enterprise-edition database and run
+# backend/tests/integration/test_spanner_provider_real.py.
+
+services:
+  spanner-emulator:
+    image: gcr.io/cloud-spanner-emulator/emulator:latest
+    container_name: synodic-spanner-emulator
+    ports:
+      - "9010:9010"   # gRPC
+      - "9020:9020"   # REST
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9010"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

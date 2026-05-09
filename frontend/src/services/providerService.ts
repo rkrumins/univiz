@@ -14,7 +14,7 @@ const ADMIN_API = '/api/v1/admin/providers'
 // returns a `computing` envelope.
 const INSIGHTS_API = '/api/v1/admin/insights'
 
-export type ProviderType = 'falkordb' | 'neo4j' | 'datahub' | 'mock'
+export type ProviderType = 'falkordb' | 'neo4j' | 'datahub' | 'spanner' | 'mock'
 
 export interface ProviderCreateRequest {
     name: string
@@ -25,6 +25,10 @@ export interface ProviderCreateRequest {
         username?: string
         password?: string
         token?: string
+        // Spanner: GCP project + service-account JSON. service_account_json
+        // is optional when extraConfig.useEmulator is true.
+        project_id?: string
+        service_account_json?: string
     }
     tlsEnabled?: boolean
     extraConfig?: Record<string, any>
@@ -39,6 +43,8 @@ export interface ProviderUpdateRequest {
         username?: string
         password?: string
         token?: string
+        project_id?: string
+        service_account_json?: string
     }
     tlsEnabled?: boolean
     isActive?: boolean

@@ -14,12 +14,13 @@ import { useProviderStatusStore } from '@/store/providerStatus'
 import { DeleteProviderDialog } from './DeleteProviderDialog'
 import { FirstRunHero } from './FirstRunHero'
 import { ProviderOnboardingWizard } from './ProviderOnboardingWizard'
-import { Neo4jLogo, FalkorDBLogo, DataHubLogo } from './ProviderLogos'
+import { Neo4jLogo, FalkorDBLogo, DataHubLogo, SpannerLogo } from './ProviderLogos'
 
 const PROVIDER_TYPES = [
     { type: 'falkordb' as const, label: 'FalkorDB', Logo: FalkorDBLogo, color: 'text-amber-500 bg-amber-500/10 border-amber-500/20', desc: 'High-performance graph database' },
     { type: 'neo4j' as const, label: 'Neo4j', Logo: Neo4jLogo, color: 'text-blue-500 bg-blue-500/10 border-blue-500/20', desc: 'The original graph database' },
     { type: 'datahub' as const, label: 'DataHub', Logo: DataHubLogo, color: 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20', desc: 'LinkedIn metadata platform' },
+    { type: 'spanner' as const, label: 'Google Spanner Graph', Logo: SpannerLogo, color: 'text-sky-500 bg-sky-500/10 border-sky-500/20', desc: 'Globally-distributed property graph on Spanner' },
 ]
 
 function getProviderConfig(type: string) {
