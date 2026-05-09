@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -355,13 +356,37 @@ class SpannerProvider(GraphDataProvider):
             ddl.append(_DDL_CREATE_GRAPH_EDGE)
         if not await self._table_exists("GraphEdgeContribution"):
             ddl.append(_DDL_CREATE_GRAPH_EDGE_CONTRIBUTION)
-        # Indexes are CREATE INDEX IF NOT EXISTS, so safe to send every time;
-        # gating on table existence already above prevents the FK-bearing
-        # tables from being recreated.
+
+        # Index DDL is filtered through information_schema.indexes so we
+        # never re-send a CREATE INDEX for one that already exists. Cloud
+        # Spanner supports ``IF NOT EXISTS`` on CREATE INDEX as of 2024,
+        # but the emulator's parser is uneven and earlier Spanner releases
+        # rejected the form outright. Pre-filtering is correct on every
+        # supported configuration.
+        existing_indexes = await self._existing_index_names()
+        for stmt in (*_DDL_CREATE_INDEXES, *_DDL_CREATE_CONTRIBUTION_INDEXES):
+            name = _index_name_from_ddl(stmt)
+            if name and name not in existing_indexes:
+                ddl.append(stmt)
+
         if ddl:
-            ddl.extend(_DDL_CREATE_INDEXES)
-            ddl.extend(_DDL_CREATE_CONTRIBUTION_INDEXES)
             await self._apply_ddl(ddl)
+
+    async def _existing_index_names(self) -> Set[str]:
+        try:
+            rows = await self._execute_sql(
+                "SELECT index_name FROM information_schema.indexes "
+                "WHERE table_schema = '' "
+                "AND table_name IN ('GraphNode', 'GraphEdge', 'GraphEdgeContribution')"
+            )
+        except Exception as exc:
+            # information_schema.indexes is universally available on real
+            # Spanner; the emulator may lag. Treat lookup failure as
+            # "unknown" — fall back to sending the DDL and let
+            # IF NOT EXISTS / driver semantics handle it.
+            logger.debug("spanner: index introspection failed (%s); will send all DDL", exc)
+            return set()
+        return {str(r["index_name"]) for r in rows if r.get("index_name")}
 
     async def _bootstrap_property_graph(self) -> None:
         # Two environments cannot host a property graph:
@@ -1677,7 +1702,10 @@ class SpannerProvider(GraphDataProvider):
                     out.append({fields[i]: row[i] for i in range(len(fields))})
                 return out
 
-        return await to_thread(_do)
+        # OpenTelemetry span name for this call. The seam attaches an
+        # otel span around the threadpool wait + gRPC round-trip when otel
+        # is available, otherwise it's a free passthrough.
+        return await to_thread(_do, op_name="spanner.execute_sql")
 
     async def _execute_gql(
         self,
@@ -1709,16 +1737,26 @@ class _SpannerTraceCallbacks(TraceCallbacks):
     async def resolve_anchor_at_level(
         self, urn: str, level: int, containment_edge_types: List[str],
     ) -> str:
+        # Fast path: focus URN is already at the requested level. The
+        # common case for level="auto" requests is the focus IS the
+        # anchor — so resolving the chain + batch-hydrating ancestors
+        # would be wasted work. One get_node call covers it.
+        focus = await self._p.get_node(urn)
+        if focus is not None:
+            focus_level = self._p._entity_type_levels.get(focus.entity_type)
+            if focus_level == level:
+                return urn
+
+        # Climb path: fetch ancestor chain, then a single batch-fetch for
+        # their levels. We exclude ``urn`` from the batch since we already
+        # have its node above.
         chain = await self._p._fetch_ancestor_chain(urn)
-        # Walk up until we find an ancestor with matching level. We don't
-        # know levels of ancestors without querying; do a batch fetch.
-        candidates = [urn] + (chain or [])
-        nodes = await self._p.get_nodes_batch(candidates)
-        nodes_by_urn = {n.urn: n for n in nodes}
-        for u in candidates:
-            n = nodes_by_urn.get(u)
-            if n and self._p._entity_type_levels.get(n.entity_type) == level:
-                return u
+        if not chain:
+            return urn
+        nodes = await self._p.get_nodes_batch(chain)
+        for n in nodes:
+            if self._p._entity_type_levels.get(n.entity_type) == level:
+                return n.urn
         return urn
 
     async def has_aggregated_at_level(self, urn: str, level: int) -> bool:
@@ -2033,68 +2071,70 @@ class _SpannerSchemaIntrospector(SchemaIntrospector):
 # Helpers
 # ===========================================================================
 
-class _ParamTypes:
-    """Lazy accessors for spanner.param_types so importing this module
-    doesn't require google-cloud-spanner installed."""
+class _ParamTypesMeta(type):
+    """Metaclass enabling ``_ParamTypes.STRING`` / ``_ParamTypes.INT64`` etc.
+    to lazily resolve to ``spanner.param_types.STRING``.
+
+    Importing this module must not require ``google-cloud-spanner`` to
+    be installed (so tests that touch only DDL/template helpers can run
+    in a minimal env). The lazy ``__getattr__`` is the entire mechanism;
+    when ``spanner.param_types`` is unavailable the attribute access
+    raises ``ImportError`` at the point of use, exactly when a query
+    parameter type is genuinely needed.
+    """
 
     _cache: Dict[str, Any] = {}
 
-    def __class_getitem__(cls, name: str) -> Any:  # pragma: no cover
-        return cls._get(name)
-
-    def __init__(self):  # pragma: no cover
-        raise TypeError("Use _ParamTypes.STRING etc. directly.")
-
-    @classmethod
-    def _get(cls, name: str) -> Any:
+    def __getattr__(cls, name: str) -> Any:
         cached = cls._cache.get(name)
         if cached is not None:
             return cached
         from google.cloud import spanner  # type: ignore
-        cached = getattr(spanner.param_types, name)
-        cls._cache[name] = cached
-        return cached
+        try:
+            value = getattr(spanner.param_types, name)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"spanner.param_types has no attribute {name!r}"
+            ) from exc
+        cls._cache[name] = value
+        return value
+
+
+class _ParamTypes(metaclass=_ParamTypesMeta):
+    """Namespace for Spanner parameter type constructors.
+
+    Use ``_ParamTypes.STRING``, ``_ParamTypes.INT64``, ``_ParamTypes.JSON``
+    etc. to reference scalar types; ``_ParamTypes.array(element_type)`` for
+    homogeneous array parameters.
+    """
 
     @classmethod
     def array(cls, element_type: Any) -> Any:
         from google.cloud import spanner  # type: ignore
         return spanner.param_types.Array(element_type)
 
-    # Convenience class-level descriptors.
-    def __getattribute__(self, name):  # pragma: no cover  -- never used, see __class_getattr__
-        return _ParamTypes._get(name)
-
-
-def __getattr_param_types(name):
-    return _ParamTypes._get(name)
-
-
-# Make _ParamTypes.STRING etc. resolve lazily at attribute access time.
-_ParamTypes.STRING = property(lambda self: _ParamTypes._get("STRING"))  # type: ignore[attr-defined]
-
-
-# Bind class-level descriptors at module import. Avoids per-call lookup cost.
-def _bind_param_types() -> None:
-    for n in ("STRING", "INT64", "BOOL", "FLOAT64", "BYTES", "TIMESTAMP", "DATE", "JSON"):
-        try:
-            setattr(_ParamTypes, n, _ParamTypes._get(n))
-        except Exception:
-            # google-cloud-spanner not installed -- leave as a class attribute
-            # backed by lazy lookup. Tests that don't import the module's
-            # query templates won't hit this path.
-            pass
-
-
-# Best-effort eager binding; harmless if it fails.
-try:  # pragma: no cover  -- exercised only when google-cloud-spanner present.
-    _bind_param_types()
-except Exception:
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
+
+_INDEX_NAME_RE = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+|NULL_FILTERED\s+)*INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _index_name_from_ddl(stmt: str) -> Optional[str]:
+    """Extract the index name from a ``CREATE INDEX`` DDL statement.
+
+    Used by the bootstrap path to filter out indexes that already exist,
+    so we don't depend on the database parser accepting
+    ``IF NOT EXISTS`` on every supported version. Returns None if the
+    statement isn't recognisable as a CREATE INDEX.
+    """
+    m = _INDEX_NAME_RE.search(stmt or "")
+    return m.group(1) if m else None
+
 
 def _decode_json(raw: Any) -> Any:
     if raw is None:

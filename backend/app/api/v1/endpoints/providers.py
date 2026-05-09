@@ -285,6 +285,21 @@ async def list_providers(
 async def test_unsaved_provider_connection(
     req: ProviderCreateRequest = Body(...),
 ):
+    # Spanner is a managed gRPC service keyed on project / instance /
+    # database (in extra_config). It does NOT use host/port. Reject
+    # ambiguous requests so a misconfigured client doesn't silently
+    # bypass the project/instance/database addressing — emulator mode
+    # is opt-in via extra_config.useEmulator, not via host=localhost.
+    if (req.provider_type or "").lower() == "spanner":
+        if req.host or req.port:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Spanner is a managed service; host/port are not used. "
+                    "Provide projectId, instanceId, databaseId via extra_config; "
+                    "for the cloud-spanner-emulator set extra_config.useEmulator=true."
+                ),
+            )
     creds = req.credentials.model_dump() if req.credentials else None
     return await _run_connectivity_probe(
         provider_type=req.provider_type,
