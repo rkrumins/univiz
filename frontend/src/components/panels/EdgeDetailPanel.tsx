@@ -248,12 +248,13 @@ export function EdgeDetailPanel({
     return (
         <motion.div
             ref={panelRef}
+            data-panel="edge-detail-panel"
             initial={{ x: 300, opacity: 0 }}
             animate={{ x: 0, opacity: 1 }}
             exit={{ x: 300, opacity: 0 }}
             transition={{ type: 'spring', damping: 25, stiffness: 300 }}
             className={cn(
-                "absolute right-0 top-0 bottom-0 w-96 z-20",
+                "absolute right-0 top-0 bottom-0 w-[clamp(400px,28vw,520px)] z-20",
                 "bg-canvas-elevated/95 backdrop-blur-lg border-l border-glass-border",
                 "flex flex-col shadow-lg",
                 className
@@ -763,12 +764,12 @@ function EdgeCard({
             </div>
 
             {/* Source → Target */}
-            <div className="px-3 pb-2 flex items-center gap-2 text-xs">
-                <span className="truncate max-w-[120px] text-ink-secondary">
+            <div className="px-3 pb-2 flex items-center gap-2 text-xs min-w-0">
+                <span className="truncate flex-1 min-w-0 text-ink-secondary" title={sourceNode?.data.label as string ?? edge.source}>
                     {sourceNode?.data.label || edge.source}
                 </span>
                 <ArrowRight className="w-3 h-3 text-ink-muted flex-shrink-0" />
-                <span className="truncate max-w-[120px] text-ink-secondary">
+                <span className="truncate flex-1 min-w-0 text-ink-secondary" title={targetNode?.data.label as string ?? edge.target}>
                     {targetNode?.data.label || edge.target}
                 </span>
             </div>

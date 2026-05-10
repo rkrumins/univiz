@@ -26,6 +26,7 @@ interface FlatTreeItemProps {
   isHoverHighlighted?: boolean
   isDimmedByHighlight?: boolean
   isFocused?: boolean
+  isTracing?: boolean
   onSelect: (id: string) => void
   onToggle: (id: string) => void
   onContextMenu: (e: React.MouseEvent, id: string) => void
@@ -53,6 +54,7 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
   isHoverHighlighted = false,
   isDimmedByHighlight = false,
   isFocused = false,
+  isTracing = false,
   onSelect,
   onToggle,
   onContextMenu,
@@ -120,7 +122,13 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
 
   const childCount = (node.data.childCount as number) || (node.data._collapsedChildCount as number) || 0
   const hasChildren = node.children.length > 0 || childCount > 0
-  const descendantCount = hasChildren && !isExpanded ? (childCount || node.children.length) : 0
+  // In trace mode, useTraceFilteredHierarchy already prunes node.children to
+  // the trace context, so children.length reflects what the user will see on
+  // expand. The graph-wide childCount would mislead them with siblings the
+  // trace filter immediately hides.
+  const descendantCount = hasChildren && !isExpanded
+    ? (isTracing ? node.children.length : (childCount || node.children.length))
+    : 0
 
   // IMPROVED SIZING - Keep items readable at ALL depths
   // Root items are slightly larger, but children remain very readable

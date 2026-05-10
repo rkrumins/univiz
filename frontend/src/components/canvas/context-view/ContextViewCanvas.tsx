@@ -596,6 +596,81 @@ export function ContextViewCanvas({
   // Ref to trigger edge redraw from child components
   const triggerEdgeRedrawRef = useRef<(() => void) | null>(null)
 
+  // Horizontal scroll container — used by the drawer-aware autoscroll effect
+  // below to keep the selected column in the un-occluded region whenever a
+  // side panel (EntityDrawer / EdgeDetailPanel) is open.
+  const horizontalScrollRef = useRef<HTMLDivElement | null>(null)
+  const lastAutoScrolledForSelectionRef = useRef<string | null>(null)
+
+  // Drawer-aware horizontal autoscroll: when a side panel opens (EntityDrawer
+  // for selected nodes or EdgeDetailPanel for selected edges) the right edge
+  // of the canvas is reserved via padding, but a node already sitting on the
+  // far right would still be visually clipped. This effect smoothly slides the
+  // selected node's column into the un-occluded region. One-shot per
+  // selection so the user retains scroll control afterwards (mirrors the
+  // trace-focus auto-scroll guard in LayerColumn).
+  useEffect(() => {
+    const drawerOpen = !!selectedNodeId
+    if (!drawerOpen && !isEdgePanelOpen) {
+      lastAutoScrolledForSelectionRef.current = null
+      return
+    }
+    if (!selectedNodeId) return
+    if (lastAutoScrolledForSelectionRef.current === selectedNodeId) return
+
+    const layerId = effectiveAssignments.get(selectedNodeId)?.layerId
+    if (!layerId) return
+
+    // Defer two frames: first to let React commit the padding change, second
+    // to let layout settle so getBoundingClientRect reads the new geometry.
+    let cancelRaf2: number | null = null
+    const raf1 = requestAnimationFrame(() => {
+      cancelRaf2 = requestAnimationFrame(() => {
+        const container = horizontalScrollRef.current
+        if (!container) return
+        const column = container.querySelector(
+          `[data-layer-id="${CSS.escape(layerId)}"]`,
+        ) as HTMLElement | null
+        if (!column) return
+
+        // Read actual rendered panel widths (responsive clamp() values) so the
+        // math doesn't over- or under-shift on different viewport sizes.
+        const drawerEl = document.querySelector('[data-panel="entity-drawer"]') as HTMLElement | null
+        const edgePanelEl = document.querySelector('[data-panel="edge-detail-panel"]') as HTMLElement | null
+        const reservedRight = drawerEl?.offsetWidth ?? edgePanelEl?.offsetWidth ?? 0
+
+        const cRect = container.getBoundingClientRect()
+        const colRect = column.getBoundingClientRect()
+        const margin = 24
+
+        const viewportLeft = cRect.left
+        const viewportRight = cRect.right - reservedRight
+
+        let delta = 0
+        if (colRect.right > viewportRight) {
+          delta = colRect.right - viewportRight + margin
+        } else if (colRect.left < viewportLeft) {
+          delta = colRect.left - viewportLeft - margin
+        }
+
+        if (delta !== 0) {
+          container.scrollTo({
+            left: container.scrollLeft + delta,
+            behavior: 'smooth',
+          })
+          // Lineage edges measure node positions from the DOM; redraw once the
+          // smooth scroll has settled so trace edges follow the column.
+          setTimeout(() => triggerEdgeRedrawRef.current?.(), 350)
+        }
+        lastAutoScrolledForSelectionRef.current = selectedNodeId
+      })
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      if (cancelRaf2 != null) cancelAnimationFrame(cancelRaf2)
+    }
+  }, [selectedNodeId, isEdgePanelOpen, effectiveAssignments])
+
   const handleLayerScroll = useCallback(() => {
     if (triggerEdgeRedrawRef.current) {
       triggerEdgeRedrawRef.current()
@@ -1245,21 +1320,37 @@ export function ContextViewCanvas({
           }
         }} />
 
-        {/* Edge Legend — shifts left when EntityDrawer is open to avoid overlap (3.3)
-             receives only the projected visible edges, not all canvas edges (3.2) */}
-        <div className={cn(
-          "absolute bottom-40 z-30 w-64 pointer-events-auto transition-all duration-300 ease-out",
-          selectedNodeId ? "right-[420px]" : "right-4"
-        )}>
+        {/* Edge Legend — shifts left when EntityDrawer or EdgeDetailPanel is
+             open to avoid overlap (3.3). Offsets track the panels' actual
+             clamp() widths plus a 16px buffer so the legend always sits flush
+             alongside the panel, no matter the viewport. Receives only the
+             projected visible edges (3.2). */}
+        <div
+          className="absolute bottom-40 z-30 w-64 pointer-events-auto transition-all duration-300 ease-out"
+          style={{
+            right: selectedNodeId
+              ? 'calc(clamp(420px, 32vw, 560px) + 16px)'
+              : isEdgePanelOpen
+                ? 'calc(clamp(400px, 28vw, 520px) + 16px)'
+                : '1rem',
+          }}
+        >
           <EdgeLegend defaultExpanded={false} visibleEdges={visibleLineageEdges} />
         </div>
 
-        {/* Layer Columns */}
+        {/* Layer Columns. Padding tracks the drawer/edge-panel clamp() widths
+            exactly so the rightmost layer is never hidden behind a panel,
+            regardless of viewport width. */}
         <div
-          className={cn(
-            "flex-1 overflow-auto relative scroll-smooth transition-[padding] duration-300 ease-out",
-            selectedNodeId ? "pr-[420px]" : ""
-          )}
+          ref={horizontalScrollRef}
+          className="flex-1 overflow-auto relative scroll-smooth transition-[padding] duration-300 ease-out"
+          style={{
+            paddingRight: selectedNodeId
+              ? 'clamp(420px, 32vw, 560px)'
+              : isEdgePanelOpen
+                ? 'clamp(400px, 28vw, 520px)'
+                : undefined,
+          }}
           onClick={handleBackgroundClick}
         >
           {/* Lineage Flow Overlay - Render BEFORE columns to be behind them (z-index managed in component to 0, cols should be higher) */}
@@ -1305,6 +1396,7 @@ export function ContextViewCanvas({
                 traceFocusId={trace.focusId}
                 traceNodes={trace.visibleTraceNodes}
                 traceContextSet={traceContextSet}
+                isTracing={trace.isTracing}
                 highlightedNodes={mergedHighlightNodes}
                 isHighlightActive={isHighlightActive}
                 isHoverHighlight={isHoverActive && !isClickHighlightActive}

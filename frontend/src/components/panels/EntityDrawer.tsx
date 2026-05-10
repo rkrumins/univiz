@@ -226,12 +226,13 @@ export function EntityDrawer({
     <AnimatePresence>
       <motion.aside
         ref={drawerRef}
+        data-panel="entity-drawer"
         initial={{ x: '100%', opacity: 0 }}
         animate={{ x: 0, opacity: 1 }}
         exit={{ x: '100%', opacity: 0 }}
         transition={{ type: 'spring', stiffness: 400, damping: 35 }}
         className={cn(
-          "fixed right-0 top-0 bottom-0 w-[400px] z-50",
+          "fixed right-0 top-0 bottom-0 w-[clamp(420px,32vw,560px)] z-50",
           "bg-canvas-elevated/98 backdrop-blur-2xl",
           "border-l border-glass-border shadow-lg shadow-black/20",
           "flex flex-col overflow-hidden"
@@ -629,8 +630,8 @@ function ViewModeContent({
                   <span className="text-sm text-ink-muted capitalize min-w-[100px]">
                     {key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim()}
                   </span>
-                  <span className="text-sm text-ink text-right truncate max-w-[200px]" title={displayValue}>
-                    {displayValue.length > 50 ? displayValue.slice(0, 50) + '...' : displayValue}
+                  <span className="text-sm text-ink text-right truncate flex-1 min-w-0" title={displayValue}>
+                    {displayValue.length > 80 ? displayValue.slice(0, 80) + '...' : displayValue}
                   </span>
                 </div>
               )

@@ -37,6 +37,7 @@ interface LayerColumnProps {
   traceFocusId: string | null
   traceNodes: Set<string>
   traceContextSet: Set<string>
+  isTracing?: boolean
   highlightedNodes?: Set<string>
   isHighlightActive?: boolean
   isHoverHighlight?: boolean
@@ -75,6 +76,7 @@ export const LayerColumn = React.memo(function LayerColumn({
   traceFocusId,
   traceNodes: _traceNodes,
   traceContextSet,
+  isTracing = false,
   highlightedNodes,
   isHighlightActive = false,
   isHoverHighlight = false,
@@ -210,7 +212,10 @@ export const LayerColumn = React.memo(function LayerColumn({
         // Push children onto stack in reverse order (+ optional loadMore at bottom)
         const displayChildren = node.children
         const activeQuery = childSearchQueries[node.id]?.trim().toLowerCase()
-        const hasMore = node.children.length < childCount && !activeQuery
+        // In trace mode the trace API already returns the complete set of
+        // trace-relevant nodes; pulling more siblings just produces noise that
+        // useTraceFilteredHierarchy hides anyway. Suppress the "X more" pill.
+        const hasMore = !isTracing && node.children.length < childCount && !activeQuery
 
         if (hasMore) {
           stack.push({ kind: 'loadMore', parent: node, depth: depth + 1, parentIsLast: childParentIsLast, count: childCount - node.children.length })
@@ -229,7 +234,7 @@ export const LayerColumn = React.memo(function LayerColumn({
     }
 
     return result
-  }, [nodes, expandedNodes, localFocusId, activeSearchNodes, childSearchQueries, loadingNodes, failedNodes])
+  }, [nodes, expandedNodes, localFocusId, activeSearchNodes, childSearchQueries, loadingNodes, failedNodes, isTracing])
 
   // Count total including nested
   const totalCount = useMemo(() => {
@@ -427,8 +432,67 @@ export const LayerColumn = React.memo(function LayerColumn({
   // Get total items at current level
   const visibleCount = flatTree.length
 
+  // ── Overflow chips: track scroll position so we can show accurate
+  // "↑ N above / ↓ N below" indicators that respond to user scroll. ─────────
+  const [scrollTick, setScrollTick] = useState(0)
+  const handleScroll = useCallback(() => {
+    onScroll?.()
+    // Bump tick so the memoized counts re-derive from fresh scrollTop/clientHeight.
+    setScrollTick(t => (t + 1) & 0xffff)
+  }, [onScroll])
+
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => setScrollTick(t => (t + 1) & 0xffff))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const isRealRow = useCallback((it: FlatTreeNode) =>
+    !it.isSkeleton && !it.isSearchBox && !it.isFailed && !it.isLoadMore
+  , [])
+
+  const overflowCounts = useMemo(() => {
+    void scrollTick
+    const el = scrollContainerRef.current
+    if (!el || flatTree.length === 0) return { above: 0, below: 0 }
+    const scrollTop = el.scrollTop
+    const viewportBottom = scrollTop + el.clientHeight
+    const items = virtualizer.getVirtualItems()
+    if (items.length === 0) return { above: 0, below: 0 }
+
+    let firstVisibleFlatIndex = -1
+    let lastVisibleFlatIndex = -1
+    for (const it of items) {
+      const startsBeforeBottom = it.start < viewportBottom - 1
+      const endsAfterTop = it.end > scrollTop + 1
+      if (startsBeforeBottom && endsAfterTop) {
+        if (firstVisibleFlatIndex === -1) firstVisibleFlatIndex = it.index
+        lastVisibleFlatIndex = it.index
+      }
+    }
+    if (firstVisibleFlatIndex === -1) return { above: 0, below: 0 }
+
+    let above = 0
+    for (let i = 0; i < firstVisibleFlatIndex; i++) {
+      if (isRealRow(flatTree[i])) above++
+    }
+    let below = 0
+    for (let i = lastVisibleFlatIndex + 1; i < flatTree.length; i++) {
+      if (isRealRow(flatTree[i])) below++
+    }
+    return { above, below }
+  }, [scrollTick, flatTree, virtualizer, isRealRow])
+
+  const scrollToFlatIndex = useCallback((index: number, align: 'start' | 'end') => {
+    if (index < 0 || index >= flatTree.length) return
+    virtualizer.scrollToIndex(index, { align, behavior: 'smooth' })
+  }, [virtualizer, flatTree.length])
+
   return (
     <motion.div
+      data-layer-id={layer.id}
       className={cn(
         "flex flex-col relative group/column transition-all duration-300",
         isCollapsed ? "min-w-[60px] max-w-[60px]" : "flex-1 min-w-[320px] max-w-[480px]"
@@ -629,15 +693,67 @@ export const LayerColumn = React.memo(function LayerColumn({
 
       {/* Flat Tree Content - Virtualized, hidden when collapsed */}
       {!isCollapsed && (
-        <div
-          ref={scrollContainerRef}
-          onScroll={onScroll}
-          onKeyDown={handleKeyDown}
-          tabIndex={0}
-          className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar relative outline-none focus-visible:ring-1 focus-visible:ring-accent-lineage/30 focus-visible:ring-inset"
-        >
-          {/* Subtle top fade for scroll indication */}
-          <div className="absolute top-0 left-0 right-0 h-4 bg-gradient-to-b from-canvas/80 to-transparent pointer-events-none z-10" />
+        <div className="flex-1 relative flex flex-col min-h-0">
+          {/* Top overflow chip — shown when items are clipped above the viewport.
+              Lives outside the scroll container so it stays anchored to the
+              viewport edge instead of scrolling with content. */}
+          <AnimatePresence>
+            {overflowCounts.above > 0 && (
+              <motion.button
+                key="above"
+                initial={{ opacity: 0, y: -6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.15, ease: [0.4, 0, 0.2, 1] }}
+                onClick={() => scrollToFlatIndex(0, 'start')}
+                className="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-full backdrop-blur-md border border-white/10 shadow-md text-[11px] font-medium pointer-events-auto hover:scale-105 active:scale-95 transition-transform"
+                style={{
+                  backgroundColor: `${layer.color}22`,
+                  color: layer.color,
+                  boxShadow: `0 4px 14px ${layer.color}25`,
+                }}
+                title="Scroll to top"
+              >
+                <LucideIcons.ChevronUp className="w-3 h-3" />
+                <span className="tabular-nums">{overflowCounts.above} above</span>
+              </motion.button>
+            )}
+          </AnimatePresence>
+
+          {/* Bottom overflow chip — shown when items are clipped below the viewport. */}
+          <AnimatePresence>
+            {overflowCounts.below > 0 && (
+              <motion.button
+                key="below"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 6 }}
+                transition={{ duration: 0.15, ease: [0.4, 0, 0.2, 1] }}
+                onClick={() => scrollToFlatIndex(flatTree.length - 1, 'end')}
+                className="absolute bottom-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-full backdrop-blur-md border border-white/10 shadow-md text-[11px] font-medium pointer-events-auto hover:scale-105 active:scale-95 transition-transform"
+                style={{
+                  backgroundColor: `${layer.color}22`,
+                  color: layer.color,
+                  boxShadow: `0 4px 14px ${layer.color}25`,
+                }}
+                title="Scroll to bottom"
+              >
+                <LucideIcons.ChevronDown className="w-3 h-3" />
+                <span className="tabular-nums">{overflowCounts.below} below</span>
+              </motion.button>
+            )}
+          </AnimatePresence>
+
+          <div
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            onKeyDown={handleKeyDown}
+            tabIndex={0}
+            className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar relative outline-none focus-visible:ring-1 focus-visible:ring-accent-lineage/30 focus-visible:ring-inset"
+          >
+          {/* Subtle top fade for scroll indication — slimmer now that the
+              floating chip handles the indicator role. */}
+          <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-b from-canvas/80 to-transparent pointer-events-none z-10" />
 
           {flatTree.length === 0 ? (
             <motion.div
@@ -839,6 +955,7 @@ export const LayerColumn = React.memo(function LayerColumn({
                         isSearchResult={searchResults.includes(node.id)}
                         isHighlighted={traceContextSet.has(node.id)}
                         isFocusNode={traceFocusId === node.id}
+                        isTracing={isTracing}
                         isClickHighlighted={isHighlightActive && !isHoverHighlight && (highlightedNodes?.has(node.id) ?? false)}
                         isHoverHighlighted={isHighlightActive && isHoverHighlight && (highlightedNodes?.has(node.id) ?? false)}
                         isDimmedByHighlight={isHighlightActive && !(highlightedNodes?.has(node.id) ?? false)}
@@ -859,8 +976,10 @@ export const LayerColumn = React.memo(function LayerColumn({
             </div>
           )}
 
-          {/* Bottom fade */}
-          <div className="absolute bottom-0 left-0 right-0 h-4 bg-gradient-to-t from-canvas/80 to-transparent pointer-events-none z-10" />
+          {/* Bottom fade — slimmer now that the floating chip handles the
+              indicator role. Sits beneath the bottom chip as a soft mask. */}
+          <div className="absolute bottom-0 left-0 right-0 h-3 bg-gradient-to-t from-canvas/80 to-transparent pointer-events-none z-10" />
+          </div>
         </div>
       )}
     </motion.div>
