@@ -120,6 +120,15 @@ class FalkorDBProvider(GraphDataProvider):
         # materialization tracking) but does NOT fail availability —
         # mirroring Neo4j's pattern at line 271-276 of neo4j_provider.py.
         self._redis_available: bool = True
+        # Application-layer concurrency cap for Cypher queries. Pool size
+        # is FALKORDB_GRAPH_POOL_SIZE (default 24); we cap query-issuing
+        # tasks below that so a burst of slow traces cannot exhaust the
+        # pool and surface as opaque socket timeouts. The remaining pool
+        # headroom is reserved for non-trace work (writes, schema
+        # introspection, health checks).
+        self._query_semaphore = asyncio.Semaphore(
+            int(os.getenv("FALKORDB_QUERY_CONCURRENCY", "20"))
+        )
 
     @property
     def _proj(self):
@@ -346,37 +355,48 @@ class FalkorDBProvider(GraphDataProvider):
     _READ_TIMEOUT = float(os.getenv("FALKORDB_QUERY_TIMEOUT", "5"))
     _WRITE_TIMEOUT = float(os.getenv("FALKORDB_WRITE_TIMEOUT", "15"))
 
+    # FalkorDB engine cancels the query 500ms before the asyncio deadline so
+    # the DB-side cancel races first (frees the worker thread + the pool
+    # connection); asyncio.wait_for is the safety net for socket-level hangs.
+    @staticmethod
+    def _db_timeout_ms(seconds: float) -> int:
+        return max(500, int(seconds * 1000) - 500)
+
     async def _ro_query(self, cypher: str, params: dict = None, *, timeout: float = None):
         """Timeout-guarded read-only query on the source graph."""
         t = timeout if timeout is not None else self._READ_TIMEOUT
-        return await asyncio.wait_for(
-            self._graph.ro_query(cypher, params=params or {}),
-            timeout=t,
-        )
+        async with self._query_semaphore:
+            return await asyncio.wait_for(
+                self._graph.ro_query(cypher, params=params or {}, timeout=self._db_timeout_ms(t)),
+                timeout=t,
+            )
 
     async def _query(self, cypher: str, params: dict = None, *, timeout: float = None):
         """Timeout-guarded write query on the source graph."""
         t = timeout if timeout is not None else self._WRITE_TIMEOUT
-        return await asyncio.wait_for(
-            self._graph.query(cypher, params=params or {}),
-            timeout=t,
-        )
+        async with self._query_semaphore:
+            return await asyncio.wait_for(
+                self._graph.query(cypher, params=params or {}, timeout=self._db_timeout_ms(t)),
+                timeout=t,
+            )
 
     async def _proj_ro_query(self, cypher: str, params: dict = None, *, timeout: float = None):
         """Timeout-guarded read-only query on the projection graph."""
         t = timeout if timeout is not None else self._READ_TIMEOUT
-        return await asyncio.wait_for(
-            self._proj.ro_query(cypher, params=params or {}),
-            timeout=t,
-        )
+        async with self._query_semaphore:
+            return await asyncio.wait_for(
+                self._proj.ro_query(cypher, params=params or {}, timeout=self._db_timeout_ms(t)),
+                timeout=t,
+            )
 
     async def _proj_query(self, cypher: str, params: dict = None, *, timeout: float = None):
         """Timeout-guarded write query on the projection graph."""
         t = timeout if timeout is not None else self._WRITE_TIMEOUT
-        return await asyncio.wait_for(
-            self._proj.query(cypher, params=params or {}),
-            timeout=t,
-        )
+        async with self._query_semaphore:
+            return await asyncio.wait_for(
+                self._proj.query(cypher, params=params or {}, timeout=self._db_timeout_ms(t)),
+                timeout=t,
+            )
 
     async def _seed_from_file(self):
         """Load graph from seed JSON file if graph is empty."""
@@ -1154,13 +1174,21 @@ class FalkorDBProvider(GraphDataProvider):
         # Structural top-level predicate — the whole point of this method.
         # Empty containment set = flat graph, skip the predicate entirely.
         #
-        # IMPORTANT: Use openCypher 1.0 pattern negation `NOT ()-[:T]->(n)`
-        # NOT `NOT EXISTS { MATCH ... }` which is Neo4j 4.x+ / ISO GQL syntax
-        # and is NOT supported by FalkorDB. The subquery form silently throws,
-        # gets caught below, and returns empty — which was the original bug.
+        # Direction-reversed from the original `NOT ()-[:T]->(n)` so n
+        # (already bound by the outer MATCH) is the anchor of the pattern.
+        # Same semantics — "no incoming :T edge to n" — but the planner
+        # walks n's incoming adjacency list directly instead of scanning
+        # all :T relationships. Avoids the O(N) full-graph scan that was
+        # a top contributor to the FalkorDB CPU pin under load.
+        #
+        # IMPORTANT: keep the openCypher-1.0 pattern-negation form. Do NOT
+        # rewrite to `NOT EXISTS { MATCH ... }` — that is Neo4j 4.x+ / ISO
+        # GQL syntax and is NOT supported by FalkorDB. The subquery form
+        # silently throws, gets caught below, and returns empty — which
+        # was the original bug.
         if containment_rel_types:
             filter_fragments.append(
-                "NOT ()-[:" + containment_rel_types + "]->(n)"
+                "NOT (n)<-[:" + containment_rel_types + "]-()"
             )
 
         # ── Build MATCH clause: label UNION if entity_types specified ─────
@@ -2793,9 +2821,16 @@ class FalkorDBProvider(GraphDataProvider):
         # ignored here: hierarchy context is non-optional for trace responses.
         containment_edges_list: List[GraphEdge] = []
         if ctypes and nodes_by_urn:
-            ancestor_urns = await self._collect_ancestor_urns(
-                list(nodes_by_urn.keys()), ctypes,
-            )
+            try:
+                ancestor_urns = await self._collect_ancestor_urns(
+                    list(nodes_by_urn.keys()), ctypes,
+                )
+            except Exception:
+                # Lineage was already collected; surface the partial result
+                # via truncationReason so the frontend safety-net renders
+                # the lineage without the (now-missing) ancestor chain.
+                ancestor_urns = []
+                truncation_reason = truncation_reason or "ancestors_failed"
             new_ancestors = [u for u in ancestor_urns if u not in nodes_by_urn]
             if new_ancestors:
                 ancestor_nodes = await self.get_nodes_batch(new_ancestors)
@@ -2844,14 +2879,21 @@ class FalkorDBProvider(GraphDataProvider):
         ctypes = [t.upper() for t in (containment_edge_types or [])]
         ltypes = [t.upper() for t in (lineage_edge_types or [])] if lineage_edge_types else None
 
-        # Steps 1+2 in parallel: collect descendants of each anchor at next_level
-        s_task = self._collect_descendants_at_level(source_urn, next_level, ctypes, max_nodes)
-        t_task = self._collect_descendants_at_level(target_urn, next_level, ctypes, max_nodes)
-        s_urns, t_urns = await asyncio.gather(s_task, t_task)
-
+        # Single-query pair fetch: source + target descendants in one
+        # UNION'd Cypher round-trip. Saves one planner pass and frees a
+        # pool slot for the duration. Surfaces the (now-single) failure
+        # mode via truncationReason rather than aborting the expand.
         truncation_reason: Optional[str] = None
+        try:
+            s_urns, t_urns = await self._collect_descendants_pair_at_level(
+                source_urn, target_urn, next_level, ctypes, max_nodes,
+            )
+        except Exception:
+            s_urns, t_urns = [], []
+            truncation_reason = "descendants_failed"
+
         if time.monotonic() > deadline:
-            truncation_reason = "timeout"
+            truncation_reason = truncation_reason or "timeout"
 
         # Step 3: edges between the two URN sets — set membership, not Cartesian
         edges: List[GraphEdge] = []
@@ -2882,9 +2924,13 @@ class FalkorDBProvider(GraphDataProvider):
         # intentionally ignored because hierarchy context is non-optional.
         containment_edges_list: List[GraphEdge] = []
         if ctypes and nodes_by_urn:
-            ancestor_urns = await self._collect_ancestor_urns(
-                list(nodes_by_urn.keys()), ctypes,
-            )
+            try:
+                ancestor_urns = await self._collect_ancestor_urns(
+                    list(nodes_by_urn.keys()), ctypes,
+                )
+            except Exception:
+                ancestor_urns = []
+                truncation_reason = truncation_reason or "ancestors_failed"
             new_ancestors = [u for u in ancestor_urns if u not in nodes_by_urn]
             if new_ancestors:
                 ancestor_nodes = await self.get_nodes_batch(new_ancestors)
@@ -3158,6 +3204,14 @@ class FalkorDBProvider(GraphDataProvider):
         """
         if not urns or not ctypes:
             return []
+        # NOTE: an earlier rewrite combined the per-URN UNWIND into a
+        # single MATCH with `n.urn IN $urns`, but that triggers the same
+        # FalkorDB "Type mismatch: expected List or Null but was Edge"
+        # planner bug A1 hit on the descendants side, on graphs where
+        # ``$urns`` exceeds ~few hundred entries. The variable-length
+        # alias ``c`` is misclassified as Edge under that plan shape.
+        # Reverted to UNWIND-per-URN until we have a query form that's
+        # both fast AND survives the planner bug.
         cypher = (
             "UNWIND $urns AS u "
             "MATCH (n {urn: u})<-[c*1..10]-(ancestor) "
@@ -3172,45 +3226,95 @@ class FalkorDBProvider(GraphDataProvider):
                     out.append(row[0])
             return out
         except Exception as exc:
+            # Re-raise so callers can preserve already-fetched lineage and
+            # surface ``truncationReason="ancestors_failed"`` instead of
+            # silently dropping the containment chain (which produces
+            # canvas orphans).
             logger.warning("trace_at_level: ancestor collection failed for %d urns: %s", len(urns), exc)
-            return []
+            raise
 
-    async def _collect_descendants_at_level(
-        self, anchor_urn: str, target_level: int, ctypes: List[str], limit: int,
-    ) -> List[str]:
-        """Collect URNs of descendants of ``anchor_urn`` whose entity type
-        sits at ``target_level``. Bounded depth-10 containment descent;
-        capped by limit. Filters by labels (always present) rather than
-        ``n.level`` (requires backfill).
+    async def _collect_descendants_pair_at_level(
+        self,
+        source_urn: str,
+        target_urn: str,
+        target_level: int,
+        ctypes: List[str],
+        limit: int,
+    ) -> Tuple[List[str], List[str]]:
+        """Collect descendants of both anchors in a SINGLE Cypher round-trip.
+
+        Bounded depth-10 containment descent; per-anchor row LIMIT applied
+        before ``collect()`` so the slice form (which previously tripped
+        FalkorDB's "expected List or Null but was Edge" planner error) is
+        never used.
+
+        Returns ``(source_urns, target_urns)``. Either side may be empty if
+        the anchor's label does not match ``target_level``'s type set.
         """
         types = self._types_at_level(target_level)
         if not types:
-            return []
+            return [], []
 
         if not ctypes:
+            # Empty containment — descendants of each anchor reduce to
+            # the anchor itself, but only if its label matches.
             cypher = (
-                "MATCH (a {urn: $anchor}) WHERE labels(a)[0] IN $types "
-                "RETURN [a.urn] AS urns"
+                "MATCH (a {urn: $source}) WHERE labels(a)[0] IN $types "
+                "RETURN 's' AS side, [a.urn] AS urns "
+                "UNION "
+                "MATCH (b {urn: $target}) WHERE labels(b)[0] IN $types "
+                "RETURN 't' AS side, [b.urn] AS urns"
             )
-            params = {"anchor": anchor_urn, "types": types}
+            params: Dict[str, Any] = {
+                "source": source_urn, "target": target_urn, "types": types,
+            }
         else:
+            # UNION over per-anchor branches — same `WITH DISTINCT … LIMIT`
+            # streaming pattern as the single-anchor helper used to (A1) so
+            # the per-side `$limit` applies before ``collect()`` and the
+            # path-alias never enters a slice context. One round-trip
+            # instead of the prior two.
             cypher = (
-                "MATCH (a {urn: $anchor})-[c*0..10]->(child) "
+                "MATCH (a {urn: $source})-[c*0..10]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
-                "RETURN collect(DISTINCT child.urn)[..$limit] AS urns"
+                "WITH DISTINCT child.urn AS urn "
+                "LIMIT $limit "
+                "RETURN 's' AS side, collect(urn) AS urns "
+                "UNION "
+                "MATCH (b {urn: $target})-[c*0..10]->(child) "
+                "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
+                "  AND labels(child)[0] IN $types "
+                "WITH DISTINCT child.urn AS urn "
+                "LIMIT $limit "
+                "RETURN 't' AS side, collect(urn) AS urns"
             )
-            params = {"anchor": anchor_urn, "ctypes": ctypes, "types": types, "limit": limit}
+            params = {
+                "source": source_urn, "target": target_urn,
+                "ctypes": ctypes, "types": types, "limit": limit,
+            }
         try:
             result = await self._ro_query(cypher, params=params)
-            rows = result.result_set or []
-            if rows and rows[0]:
-                value = rows[0][0]
-                if isinstance(value, list):
-                    return [u for u in value if u]
         except Exception as exc:
-            logger.warning("trace_at_level: descendant collection failed for %s: %s", anchor_urn, exc)
-        return []
+            logger.warning(
+                "trace_at_level: descendant pair collection failed for (%s, %s): %s",
+                source_urn, target_urn, exc,
+            )
+            raise
+
+        s_urns: List[str] = []
+        t_urns: List[str] = []
+        for row in (result.result_set or []):
+            if not row or len(row) < 2:
+                continue
+            side = row[0]
+            urns = row[1] if isinstance(row[1], list) else []
+            urn_list = [u for u in urns if u]
+            if side == 's':
+                s_urns = urn_list
+            elif side == 't':
+                t_urns = urn_list
+        return s_urns, t_urns
 
     async def _edges_between_sets(
         self, s_urns: List[str], t_urns: List[str], level: int,
