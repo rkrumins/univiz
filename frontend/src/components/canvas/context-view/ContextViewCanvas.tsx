@@ -72,7 +72,7 @@ import { ContextViewHeader } from './ContextViewHeader'
 import { useLoadingToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
-import { TraceContextViewSurface } from '../trace/TraceContextViewSurface'
+import { TraceBottomDock } from '../trace/TraceBottomDock'
 
 // Re-export for backward compatibility
 export { defaultReferenceModelLayers } from './constants'
@@ -508,6 +508,31 @@ export function ContextViewCanvas({
 
   // Edge direction toggle — controls arrowheads + animated mid-edge chevron
   const [showEdgeDirection, setShowEdgeDirection] = useState(true)
+
+  // Trace bottom dock — expanded vs compact. Lifted to the canvas so a
+  // global Cmd/Ctrl+I shortcut can toggle it from anywhere.
+  const [dockExpanded, setDockExpanded] = useState(false)
+  // Auto-collapse the dock when trace exits so a stale open state doesn't
+  // immediately reappear next time the user starts a trace.
+  useEffect(() => {
+    if (!trace.isTracing && dockExpanded) setDockExpanded(false)
+  }, [trace.isTracing, dockExpanded])
+  // Cmd/Ctrl+I toggles the dock's expanded state while a trace is active.
+  useEffect(() => {
+    if (!trace.isTracing) return
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      const isMod = e.metaKey || e.ctrlKey
+      if (!isMod || e.shiftKey) return
+      if (e.key.toLowerCase() === 'i') {
+        e.preventDefault()
+        setDockExpanded(v => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [trace.isTracing])
 
   // Sync ontology-derived lineage edge types into trace config so the trace
   // backend traverses TRANSFORMS, AGGREGATED, and any other ontology-classified
@@ -1218,24 +1243,28 @@ export function ContextViewCanvas({
         onRedo={redoStagedChange}
       />
 
-      <div className="flex-1 w-full h-full relative overflow-hidden bg-canvas flex flex-col">
-        {/* Premium trace surface — pill, history, narrative banners, details panel.
-            Mounted inside the canvas-body (which is `relative`) so the floating
-            elements sit cleanly above the layer columns without being clipped
-            by stacking-context boundaries. z-50 keeps it above EdgeLegend (z-30)
-            and the column wrapper (z-10). */}
-        <TraceContextViewSurface
-          trace={trace}
-          displayMap={displayMap}
-          availableEdgeTypes={lineageEdgeTypes}
-          granularityOptions={granularityOptions}
-          resolveEdgeColor={resolveEdgeColor}
-          onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
-          onJumpToUrn={(urn) => {
-            const id = urnToIdMap.get(urn) ?? urn
-            startTraceWithSmartLevel(id)
-          }}
-        />
+      <div data-canvas-body className="flex-1 w-full h-full relative overflow-hidden bg-canvas flex flex-col">
+        {/* Trace UI lives in TraceBottomDock at the bottom of canvas-body.
+            EntityDrawer keeps the right rail. Both surfaces are independent. */}
+        <AnimatePresence>
+          {trace.isTracing && (
+            <TraceBottomDock
+              trace={trace}
+              displayMap={displayMap}
+              availableEdgeTypes={lineageEdgeTypes}
+              granularityOptions={granularityOptions}
+              resolveEdgeColor={resolveEdgeColor}
+              expanded={dockExpanded}
+              onToggleExpanded={() => setDockExpanded(v => !v)}
+              onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+              onJumpToUrn={(urn) => {
+                const id = urnToIdMap.get(urn) ?? urn
+                startTraceWithSmartLevel(id)
+              }}
+            />
+          )}
+        </AnimatePresence>
+
         {/* Aggregation truncation banner — backend signal that the visible
             edge set was capped. The "computing" and "last computed Xh ago"
             banners were removed: the materialization-triggered flag was
@@ -1326,8 +1355,12 @@ export function ContextViewCanvas({
              alongside the panel, no matter the viewport. Receives only the
              projected visible edges (3.2). */}
         <div
-          className="absolute bottom-40 z-30 w-64 pointer-events-auto transition-all duration-300 ease-out"
+          className="absolute z-30 w-64 pointer-events-auto transition-all duration-300 ease-out"
           style={{
+            // Lift above TraceBottomDock when present. The dock writes its
+            // height (incl. floating-shelf gap) to `--trace-dock-height` on
+            // the canvas-body root; legend baseline 160px (Tailwind bottom-40).
+            bottom: 'calc(160px + var(--trace-dock-height, 0px))',
             right: selectedNodeId
               ? 'calc(clamp(420px, 32vw, 560px) + 16px)'
               : isEdgePanelOpen

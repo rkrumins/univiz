@@ -1,8 +1,13 @@
 /**
- * ContextViewHeader - Toolbar, search, and trace controls for Context View
+ * ContextViewHeader - Toolbar, search, and authoring controls for Context View.
  *
  * Receives all state as props from ContextViewCanvas — no store access here.
  * Keeps the orchestrator lean and makes the header independently testable.
+ *
+ * The header is INTENTIONALLY trace-agnostic. Trace UI lives in the
+ * `TraceBottomDock` mounted inside ContextViewCanvas's canvas-body, in a
+ * separate layout slot from the right-rail EntityDrawer. The header here
+ * is purely about authoring + display-mode controls.
  */
 
 import { useRef } from 'react'
@@ -56,10 +61,6 @@ export interface ContextViewHeaderProps {
   canRedo?: boolean
   onUndo?: () => void
   onRedo?: () => void
-
-  // Trace surface is now mounted directly in ContextViewCanvas's canvas-body
-  // so it floats above the layer columns rather than being clipped by the
-  // canvas-body's stacking context. No trace props needed here.
 }
 
 export function ContextViewHeader({
@@ -220,7 +221,6 @@ export function ContextViewHeader({
               </span>
             </div>
           )}
-          {/* Premium Undo / Redo cluster — segmented control, surfaces only when there's history. */}
           {(canUndo || canRedo) && (
             <div className="flex items-stretch rounded-xl overflow-hidden bg-gradient-to-b from-white/[0.06] to-white/[0.02] border border-white/[0.08] shadow-sm shadow-black/20">
               <button
@@ -257,7 +257,6 @@ export function ContextViewHeader({
             </div>
           )}
 
-          {/* Pending-changes badge — premium pill that opens the review modal. */}
           {pendingChangeCount > 0 && onOpenStagedChanges && (
             <button
               onClick={onOpenStagedChanges}
@@ -347,11 +346,6 @@ export function ContextViewHeader({
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Trace surface is mounted in ContextViewCanvas's canvas-body — see
-          TraceContextViewSurface there. Keeping it out of the header avoids
-          the canvas-body's stacking context clipping the floating panel. */}
     </div>
   )
 }
-
