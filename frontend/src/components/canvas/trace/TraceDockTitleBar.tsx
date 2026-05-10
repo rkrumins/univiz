@@ -120,12 +120,6 @@ export function TraceDockTitleBar({
     >
       <span className="sr-only" aria-live="polite" aria-atomic="true">{liveMsg}</span>
 
-      {/* Subtle ambient gradient overlay — same idiom as ContextViewHeader */}
-      <div
-        className="absolute inset-0 bg-gradient-to-r from-accent-lineage/[0.04] via-transparent to-purple-500/[0.03] pointer-events-none"
-        aria-hidden
-      />
-
       {/* Section identity — solid accent badge for high-contrast readability */}
       <div className="relative flex items-center gap-2.5 shrink-0">
         <div

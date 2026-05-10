@@ -1194,6 +1194,22 @@ export function ContextViewCanvas({
       data-trace-active={trace.isTracing ? 'true' : 'false'}
       className={cn("h-full w-full flex flex-col overflow-hidden bg-gradient-to-br from-canvas via-canvas to-canvas-elevated/30", className)}
     >
+      {/* Node Palette - Drag and drop entity creation */}
+      <AnimatePresence>
+        {isPaletteOpen && (
+          <NodePalette
+            isOpen={isPaletteOpen}
+            onClose={() => setPaletteOpen(false)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Row layout: canvas column + right-rail panels.
+          When a panel opens it joins the row as a flex sibling so the entire
+          canvas (header + body) shrinks horizontally rather than being
+          overlaid. Only one right-rail panel is mounted at a time. */}
+      <div className="flex-1 flex flex-row min-h-0 overflow-hidden">
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden relative">
       {/* Editor Toolbar - Unified with LineageCanvas */}
       <div className="absolute top-4 left-4 z-30">
         <EditorToolbar
@@ -1204,16 +1220,6 @@ export function ContextViewCanvas({
           onSelectEdgeType={setActiveEdgeType}
         />
       </div>
-
-      {/* Node Palette - Drag and drop entity creation */}
-      <AnimatePresence>
-        {isPaletteOpen && (
-          <NodePalette
-            isOpen={isPaletteOpen}
-            onClose={() => setPaletteOpen(false)}
-          />
-        )}
-      </AnimatePresence>
 
       <ContextViewHeader
         searchQuery={searchQuery}
@@ -1229,9 +1235,11 @@ export function ContextViewCanvas({
         onToggleEdgeDirection={() => setShowEdgeDirection(v => !v)}
         traceActive={trace.isTracing}
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
-        onStartTrace={() => { if (selectedNodeIds[0]) traceFullLineageWithSmartLevel(selectedNodeIds[0]) }}
+        onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
         onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
         onAddEntity={() => { setIsCreatingEntity(true); setCreationParentId(null); setCreationLayerId(null) }}
+        viewName={activeView?.name}
+        entityTypeCount={activeView?.content.visibleEntityTypes.length}
         activeWorkspaceId={activeWorkspaceId}
         activeContextModelName={activeContextModelName}
         syncStatus={syncStatus}
@@ -1299,43 +1307,6 @@ export function ContextViewCanvas({
             </button>
           </div>
         )}
-        {/* Edge Panel */}
-        <AnimatePresence>
-          {isEdgePanelOpen && (
-            <EdgeDetailPanel
-              isOpen={isEdgePanelOpen}
-              onClose={closeEdgePanel}
-              edgeFilters={dynamicEdgeFilters}
-              onToggleFilter={toggleEdgeFilter}
-            />
-          )}
-
-          {/* Entity Drawer - Unified view & edit */}
-          <EntityDrawer
-            onTraceUp={(nodeId) => traceUpstreamWithSmartLevel(nodeId)}
-            onTraceDown={(nodeId) => traceDownstreamWithSmartLevel(nodeId)}
-            onFullTrace={(nodeId) => traceFullLineageWithSmartLevel(nodeId)}
-          />
-
-          {/* Entity Creation Panel */}
-          <EntityCreationPanel
-            isOpen={isCreatingEntity}
-            onClose={() => {
-              setIsCreatingEntity(false)
-              setCreationParentId(null)
-              setCreationLayerId(null)
-            }}
-            parentId={creationParentId}
-            layerId={creationLayerId}
-            onEntityCreated={(_nodeId, parentUrn) => {
-              // Auto-expand parent if a child was created
-              if (parentUrn) {
-                setExpandedNodes(prev => new Set([...prev, parentUrn]))
-              }
-            }}
-          />
-        </AnimatePresence>
-
         {/* Save Confirmation Modal — opens when the user clicks Save Blueprint
              or the pending-changes badge. Single source of truth for reviewing
              and confirming a batch of staged edits before they hit the backend. */}
@@ -1350,41 +1321,24 @@ export function ContextViewCanvas({
           }
         }} />
 
-        {/* Edge Legend — shifts left when EntityDrawer or EdgeDetailPanel is
-             open to avoid overlap (3.3). Offsets track the panels' actual
-             clamp() widths plus a 16px buffer so the legend always sits flush
-             alongside the panel, no matter the viewport. Receives only the
-             projected visible edges (3.2). */}
+        {/* Edge Legend — sits at the bottom-right of the (possibly shrunken)
+            canvas. Right-rail panels are now flex siblings, so the canvas
+            itself shrinks when one opens — the legend doesn't need its own
+            offset logic. Lifts above TraceBottomDock via --trace-dock-height. */}
         <div
           className="absolute z-30 w-64 pointer-events-auto transition-all duration-300 ease-out"
           style={{
-            // Lift above TraceBottomDock when present. The dock writes its
-            // height (incl. floating-shelf gap) to `--trace-dock-height` on
-            // the canvas-body root; legend baseline 160px (Tailwind bottom-40).
             bottom: 'calc(160px + var(--trace-dock-height, 0px))',
-            right: selectedNodeId
-              ? 'calc(clamp(420px, 32vw, 560px) + 16px)'
-              : isEdgePanelOpen
-                ? 'calc(clamp(400px, 28vw, 520px) + 16px)'
-                : '1rem',
+            right: '1rem',
           }}
         >
           <EdgeLegend defaultExpanded={false} visibleEdges={visibleLineageEdges} />
         </div>
 
-        {/* Layer Columns. Padding tracks the drawer/edge-panel clamp() widths
-            exactly so the rightmost layer is never hidden behind a panel,
-            regardless of viewport width. */}
+        {/* Layer Columns. */}
         <div
           ref={horizontalScrollRef}
-          className="flex-1 overflow-auto relative scroll-smooth transition-[padding] duration-300 ease-out"
-          style={{
-            paddingRight: selectedNodeId
-              ? 'clamp(420px, 32vw, 560px)'
-              : isEdgePanelOpen
-                ? 'clamp(400px, 28vw, 520px)'
-                : undefined,
-          }}
+          className="flex-1 overflow-auto relative scroll-smooth"
           onClick={handleBackgroundClick}
         >
           {/* Lineage Flow Overlay - Render BEFORE columns to be behind them (z-index managed in component to 0, cols should be higher) */}
@@ -1449,6 +1403,50 @@ export function ContextViewCanvas({
 
         </div>
       </div>
+      </div>{/* end canvas column */}
+
+      {/* Right-rail panels — flex siblings of the canvas column.
+          Mutual exclusion: selection > edge-panel > creation. Only one is
+          ever mounted at a time, so the canvas shrinks by exactly one
+          panel's width whenever any of them opens. */}
+      <AnimatePresence>
+        {selectedNodeId && (
+          <EntityDrawer
+            key="entity-drawer"
+            onTraceUp={(nodeId) => traceUpstreamWithSmartLevel(nodeId)}
+            onTraceDown={(nodeId) => traceDownstreamWithSmartLevel(nodeId)}
+            onFullTrace={(nodeId) => traceFullLineageWithSmartLevel(nodeId)}
+          />
+        )}
+        {!selectedNodeId && isEdgePanelOpen && (
+          <EdgeDetailPanel
+            key="edge-detail-panel"
+            isOpen={isEdgePanelOpen}
+            onClose={closeEdgePanel}
+            edgeFilters={dynamicEdgeFilters}
+            onToggleFilter={toggleEdgeFilter}
+          />
+        )}
+        {!selectedNodeId && !isEdgePanelOpen && isCreatingEntity && (
+          <EntityCreationPanel
+            key="entity-creation-panel"
+            isOpen={isCreatingEntity}
+            onClose={() => {
+              setIsCreatingEntity(false)
+              setCreationParentId(null)
+              setCreationLayerId(null)
+            }}
+            parentId={creationParentId}
+            layerId={creationLayerId}
+            onEntityCreated={(_nodeId, parentUrn) => {
+              if (parentUrn) {
+                setExpandedNodes(prev => new Set([...prev, parentUrn]))
+              }
+            }}
+          />
+        )}
+      </AnimatePresence>
+      </div>{/* end flex-row wrapper */}
 
       {/* === UX-FIRST INTERACTION COMPONENTS === */}
 
