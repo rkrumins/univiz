@@ -1,4 +1,4 @@
-import { Zap, Database, Clock, Layers } from 'lucide-react'
+import { Zap, Database, Clock, Layers, Activity } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TraceMeta } from '@/services/traceApi'
 
@@ -6,86 +6,136 @@ export interface TraceDockPerformanceProps {
   meta: TraceMeta | undefined
 }
 
-const REGIME_TINT: Record<string, string> = {
-  materialized: 'text-emerald-600 dark:text-emerald-400',
-  runtime: 'text-blue-600 dark:text-blue-400',
-  demoted: 'text-amber-600 dark:text-amber-400',
+interface Tone {
+  iconBg: string
+  iconBorder: string
 }
 
-const CACHE_TINT: Record<string, string> = {
-  hit: 'text-emerald-600 dark:text-emerald-400',
-  miss: 'text-amber-600 dark:text-amber-400',
-  bypass: 'text-ink-muted',
+const NEUTRAL: Tone = {
+  iconBg: 'bg-white/[0.10]',
+  iconBorder: 'border-white/[0.20]',
+}
+
+const REGIME_TONE: Record<string, Tone> = {
+  materialized: { iconBg: 'bg-emerald-500', iconBorder: 'border-emerald-500' },
+  runtime: { iconBg: 'bg-blue-500', iconBorder: 'border-blue-500' },
+  demoted: { iconBg: 'bg-amber-500', iconBorder: 'border-amber-500' },
+}
+
+const CACHE_TONE: Record<string, Tone> = {
+  hit: { iconBg: 'bg-emerald-500', iconBorder: 'border-emerald-500' },
+  miss: { iconBg: 'bg-amber-500', iconBorder: 'border-amber-500' },
+  bypass: NEUTRAL,
+}
+
+const LATENCY_TONE: Tone = {
+  iconBg: 'bg-accent-lineage',
+  iconBorder: 'border-accent-lineage',
 }
 
 /**
- * Single-line performance badges. Cache · regime · latency · materialised
- * hit-rate, all dense and inline. Empty state when meta isn't emitted.
+ * Performance telemetry — five neutral-glass cells, each with a solid
+ * accent icon container on the left and bright `text-ink` values on the
+ * right. High contrast in both light and dark mode; no tinted-text-on-
+ * tinted-bg fade.
  */
 export function TraceDockPerformance({ meta }: TraceDockPerformanceProps) {
   if (!meta) {
     return (
-      <div className="px-4 py-1.5 flex items-center gap-1.5 text-[11px] text-ink-muted/60">
-        <Zap className="w-3 h-3 opacity-60" />
+      <div
+        className={cn(
+          'flex items-center gap-2.5 px-3 h-10 rounded-xl',
+          'bg-white/[0.04] border border-white/[0.10]',
+          'text-xs text-ink-muted',
+        )}
+      >
+        <Activity className="w-4 h-4" />
         <span>Performance metrics unavailable for this trace.</span>
       </div>
     )
   }
 
   const hitPct = Math.round((meta.materializedHitRate ?? 0) * 100)
+  const cacheTone = CACHE_TONE[meta.cacheStatus] ?? NEUTRAL
+  const regimeTone = REGIME_TONE[meta.regime] ?? NEUTRAL
+  const materialisedTone: Tone = hitPct >= 80 ? REGIME_TONE.materialized : NEUTRAL
 
   return (
-    <div className="px-4 py-1.5 flex items-center gap-3 text-[11px] flex-wrap">
-      <Badge
-        icon={<Database className="w-3 h-3" />}
-        label="cache"
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+      <PerfCell
+        icon={<Database className="w-4 h-4" strokeWidth={2.4} />}
+        label="Cache"
         value={meta.cacheStatus}
-        valueClass={CACHE_TINT[meta.cacheStatus] ?? 'text-ink-muted'}
+        tone={cacheTone}
       />
-      <span className="text-ink-muted/30 select-none">·</span>
-      <Badge
-        icon={<Zap className="w-3 h-3" />}
-        label="regime"
+      <PerfCell
+        icon={<Zap className="w-4 h-4" strokeWidth={2.4} />}
+        label="Regime"
         value={meta.regime}
-        valueClass={REGIME_TINT[meta.regime] ?? 'text-ink-muted'}
+        tone={regimeTone}
       />
-      <span className="text-ink-muted/30 select-none">·</span>
-      <Badge
-        icon={<Clock className="w-3 h-3" />}
-        label="latency"
+      <PerfCell
+        icon={<Clock className="w-4 h-4" strokeWidth={2.4} />}
+        label="Latency"
         value={`${meta.queryMs.toLocaleString()}ms`}
-        valueClass="text-accent-lineage"
+        tone={LATENCY_TONE}
       />
-      <span className="text-ink-muted/30 select-none">·</span>
-      <Badge
-        icon={<Layers className="w-3 h-3" />}
-        label="materialised"
+      <PerfCell
+        icon={<Layers className="w-4 h-4" strokeWidth={2.4} />}
+        label="Materialised"
         value={`${hitPct}%`}
-        valueClass={hitPct >= 80 ? 'text-emerald-600 dark:text-emerald-400' : 'text-ink'}
+        tone={materialisedTone}
       />
-      <span className="text-ink-muted/30 select-none">·</span>
-      <span className="inline-flex items-center gap-1 text-ink-muted">
-        <span className="text-[10px] uppercase tracking-wider font-semibold">level</span>
-        <span className="text-ink tabular-nums">L{meta.targetLevel}</span>
-        <span className="text-ink-muted/60 text-[10px]">({meta.targetLevelSource})</span>
-      </span>
+      <PerfCell
+        icon={<Layers className="w-4 h-4" strokeWidth={2.4} />}
+        label="Target Level"
+        value={`L${meta.targetLevel}`}
+        tone={NEUTRAL}
+        sublabel={meta.targetLevelSource}
+      />
     </div>
   )
 }
 
-interface BadgeProps {
+interface PerfCellProps {
   icon: React.ReactNode
   label: string
   value: string
-  valueClass?: string
+  tone: Tone
+  sublabel?: string
 }
 
-function Badge({ icon, label, value, valueClass }: BadgeProps) {
+function PerfCell({ icon, label, value, tone, sublabel }: PerfCellProps) {
   return (
-    <span className="inline-flex items-center gap-1 text-ink-muted">
-      <span className="opacity-70">{icon}</span>
-      <span className="text-[10px] uppercase tracking-wider font-semibold">{label}</span>
-      <span className={cn('font-semibold uppercase tabular-nums', valueClass)}>{value}</span>
-    </span>
+    <div
+      className={cn(
+        'flex items-center gap-2.5 px-2.5 py-2 rounded-xl min-w-0',
+        'bg-white/[0.04] border border-white/[0.10]',
+      )}
+    >
+      <div
+        className={cn(
+          'shrink-0 w-8 h-8 rounded-lg flex items-center justify-center',
+          tone.iconBg,
+          'border',
+          tone.iconBorder,
+        )}
+      >
+        <span className="text-white" aria-hidden>{icon}</span>
+      </div>
+      <div className="flex flex-col gap-0.5 min-w-0">
+        <span className="text-[10px] uppercase tracking-[0.14em] font-bold text-ink-muted truncate">
+          {label}
+        </span>
+        <div className="flex items-baseline gap-1.5 min-w-0">
+          <span className="text-sm font-bold uppercase tabular-nums tracking-tight truncate text-ink">
+            {value}
+          </span>
+          {sublabel && (
+            <span className="text-[10px] text-ink-muted truncate">({sublabel})</span>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }

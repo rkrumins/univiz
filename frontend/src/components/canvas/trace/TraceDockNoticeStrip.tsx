@@ -1,4 +1,4 @@
-import { AlertTriangle, Info } from 'lucide-react'
+import { AlertTriangle, Info, ArrowRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TraceResult } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from '@/types/hierarchy'
@@ -11,8 +11,9 @@ export interface TraceDockNoticeStripProps {
 }
 
 /**
- * Inline notice strip — appears at the top of the dock body when the trace
- * result is truncated or inherited. Single dense line: icon + message + action.
+ * Inline notice — only renders when something is worth saying. Premium
+ * gradient pill-card with a glowing icon container and a gradient action
+ * button. Mirrors the ContextViewHeader's pending-changes treatment.
  */
 export function TraceDockNoticeStrip({
   result,
@@ -22,17 +23,17 @@ export function TraceDockNoticeStrip({
 }: TraceDockNoticeStripProps) {
   if (!result) return null
 
-  // Inheritance takes priority — explains *why* the trace shows ancestor lineage.
   if (result.isInherited && result.inheritedFromUrn) {
     const ancestor = displayMap.get(result.inheritedFromUrn)
     const ancestorName = ancestor?.name ?? result.inheritedFromUrn
     return (
       <Strip
         tone="info"
-        icon={<Info className="w-3.5 h-3.5" />}
+        icon={<Info className="w-4 h-4" strokeWidth={2.2} />}
+        title="Lineage inherited"
         message={
           <>
-            Lineage inherited from <span className="font-semibold text-ink">{ancestorName}</span> — this entity has no direct edges.
+            From <span className="font-semibold text-ink">{ancestorName}</span> — this entity has no direct edges of its own.
           </>
         }
         actionLabel="View parent"
@@ -49,10 +50,11 @@ export function TraceDockNoticeStrip({
     return (
       <Strip
         tone="warn"
-        icon={<AlertTriangle className="w-3.5 h-3.5" />}
+        icon={<AlertTriangle className="w-4 h-4" strokeWidth={2.2} />}
+        title="Trace truncated"
         message={
           <>
-            Showing top <span className="font-semibold text-ink tabular-nums">{total.toLocaleString()}</span> — {reason}. Try narrowing depth or filtering edge types.
+            Showing top <span className="font-semibold text-ink tabular-nums">{total.toLocaleString()}</span> nodes — {reason}. Try narrowing depth or filtering edge types.
           </>
         }
         actionLabel="Reduce depth"
@@ -67,39 +69,100 @@ export function TraceDockNoticeStrip({
 interface StripProps {
   tone: 'info' | 'warn'
   icon: React.ReactNode
+  title: string
   message: React.ReactNode
   actionLabel: string
   onAction: () => void
 }
 
-function Strip({ tone, icon, message, actionLabel, onAction }: StripProps) {
+const TONE = {
+  info: {
+    bg: 'bg-white/[0.04]',
+    border: 'border-accent-lineage/40',
+    iconBg: 'bg-accent-lineage',
+    iconBorder: 'border-accent-lineage',
+    iconText: 'text-white',
+    titleText: 'text-accent-lineage',
+    glow: 'shadow-accent-lineage/15',
+    btnBg: 'bg-accent-lineage',
+    btnBorder: 'border-accent-lineage',
+    btnText: 'text-white',
+    btnHover: 'hover:bg-purple-500 hover:border-purple-500 hover:shadow-lg hover:shadow-accent-lineage/30',
+    ring: 'focus-visible:ring-accent-lineage/50',
+  },
+  warn: {
+    bg: 'bg-white/[0.04]',
+    border: 'border-amber-400/40',
+    iconBg: 'bg-amber-500',
+    iconBorder: 'border-amber-500',
+    iconText: 'text-white',
+    titleText: 'text-amber-600 dark:text-amber-300',
+    glow: 'shadow-amber-500/15',
+    btnBg: 'bg-amber-500',
+    btnBorder: 'border-amber-500',
+    btnText: 'text-white',
+    btnHover: 'hover:bg-amber-600 hover:border-amber-600 hover:shadow-lg hover:shadow-amber-500/30',
+    ring: 'focus-visible:ring-amber-500/50',
+  },
+} as const
+
+function Strip({ tone, icon, title, message, actionLabel, onAction }: StripProps) {
+  const palette = TONE[tone]
   return (
     <div
       role="status"
       aria-live="polite"
       className={cn(
-        'flex items-center gap-2 px-4 py-1.5 text-[11px] border-b',
-        tone === 'info'
-          ? 'bg-accent-lineage/8 border-accent-lineage/20'
-          : 'bg-amber-500/8 border-amber-500/20',
+        'mx-5 mt-4 mb-1 flex items-start gap-3 px-3 py-2.5 rounded-xl',
+        palette.bg,
+        'border',
+        palette.border,
+        'shadow-md',
+        palette.glow,
       )}
     >
-      <span className={cn(
-        'shrink-0',
-        tone === 'info' ? 'text-accent-lineage' : 'text-amber-600 dark:text-amber-400',
-      )}>{icon}</span>
-      <span className="text-ink-muted flex-1 truncate">{message}</span>
+      <div
+        className={cn(
+          'shrink-0 w-8 h-8 rounded-lg flex items-center justify-center',
+          palette.iconBg,
+          'border',
+          palette.iconBorder,
+        )}
+      >
+        <span className={palette.iconText}>{icon}</span>
+      </div>
+
+      <div className="flex-1 min-w-0 flex flex-col gap-0.5 pt-0.5">
+        <span
+          className={cn(
+            'text-[10px] uppercase tracking-[0.14em] font-bold',
+            palette.titleText,
+          )}
+        >
+          {title}
+        </span>
+        <span className="text-xs text-ink leading-relaxed">{message}</span>
+      </div>
+
       <button
         type="button"
         onClick={onAction}
         className={cn(
-          'shrink-0 ml-1 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide transition-colors',
-          tone === 'info'
-            ? 'bg-accent-lineage/15 hover:bg-accent-lineage/25 text-accent-lineage focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/50'
-            : 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-700 dark:text-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/50',
+          'shrink-0 inline-flex items-center gap-1.5 px-3 h-8 rounded-xl',
+          'text-xs font-bold tracking-tight',
+          palette.btnBg,
+          'border',
+          palette.btnBorder,
+          palette.btnText,
+          'transition-all duration-200',
+          palette.btnHover,
+          'hover:scale-[1.02] active:scale-[0.98]',
+          'focus-visible:outline-none focus-visible:ring-2',
+          palette.ring,
         )}
       >
         {actionLabel}
+        <ArrowRight className="w-3.5 h-3.5" strokeWidth={2.4} />
       </button>
     </div>
   )

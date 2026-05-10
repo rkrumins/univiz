@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { motion, LayoutGroup } from 'framer-motion'
 import {
   ArrowUp,
@@ -8,8 +8,7 @@ import {
   ChevronUp,
   Clock,
   X,
-  AlertTriangle,
-  Info,
+  Workflow,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
@@ -34,15 +33,18 @@ function deriveDirection(showUpstream: boolean, showDownstream: boolean): Direct
 }
 
 /**
- * The always-visible 52px title row that lives at the top of TraceBottomDock.
- * In compact mode this IS the dock; in expanded mode it sits above the
- * content sections. Sticky so it stays visible during internal scroll.
+ * The always-visible 56px title row. Mirrors the ContextViewHeader vocabulary:
+ *   - 9x9 gradient identity icon ("section badge")
+ *   - Gradient-tinted focus chip with type + level micro-pills
+ *   - Counts as gradient pills with semantic accent
+ *   - Vertical hairline dividers between major groups (gradient)
+ *   - rounded-xl buttons with gradient hover + glow shadow
  *
  * A11y model:
- *  - `role="toolbar"` with roving tabindex (single Tab stop, arrow keys rove)
- *  - Direction segmented control is `role="radiogroup"` (one Tab stop)
- *  - Pulsing dot is decorative, gated by `prefers-reduced-motion`
- *  - Live region announces trace start (consolidated single message)
+ *  - `role="toolbar"` with roving tabindex
+ *  - Direction segmented control is `role="radiogroup"`
+ *  - Pulsing badge gated by `prefers-reduced-motion`
+ *  - Live region announces trace start
  */
 export function TraceDockTitleBar({
   trace,
@@ -72,12 +74,6 @@ export function TraceDockTitleBar({
     else { trace.setShowUpstream(true); trace.setShowDownstream(true) }
   }
 
-  const hasNotice = trace.result?.truncated || (trace.result?.isInherited && trace.result?.inheritedFromUrn)
-  const noticeKind: 'warn' | 'info' | null = trace.result?.truncated
-    ? 'warn'
-    : trace.result?.isInherited && trace.result?.inheritedFromUrn ? 'info' : null
-
-  // Roving tabindex across all interactive controls.
   const controlsRef = useRef<HTMLElement[]>([])
   useEffect(() => {
     const root = containerRef.current
@@ -107,10 +103,6 @@ export function TraceDockTitleBar({
     }
   }
 
-  const handleNoticeClick = useCallback(() => {
-    if (!expanded) onToggleExpanded()
-  }, [expanded, onToggleExpanded])
-
   return (
     <div
       ref={containerRef}
@@ -122,101 +114,137 @@ export function TraceDockTitleBar({
       onFocus={onContainerFocus}
       data-canvas-interactive
       className={cn(
-        'flex items-center gap-2.5 px-4 h-[52px] shrink-0',
+        'relative flex items-center gap-3 px-5 h-14 shrink-0',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40 focus-visible:ring-inset',
-        'text-xs',
       )}
     >
-      {/* Live-region for screen readers */}
       <span className="sr-only" aria-live="polite" aria-atomic="true">{liveMsg}</span>
 
-      {/* Pulsing dot */}
-      <span className="relative inline-flex items-center justify-center w-2.5 h-2.5 shrink-0" aria-hidden="true">
-        <span className="absolute inset-0 rounded-full bg-accent-lineage opacity-60 animate-pulse motion-reduce:animate-none" />
-        <span className="relative w-1.5 h-1.5 rounded-full bg-accent-lineage" />
-      </span>
+      {/* Subtle ambient gradient overlay — same idiom as ContextViewHeader */}
+      <div
+        className="absolute inset-0 bg-gradient-to-r from-accent-lineage/[0.04] via-transparent to-purple-500/[0.03] pointer-events-none"
+        aria-hidden
+      />
 
-      <span className="font-semibold text-accent-lineage uppercase tracking-[0.12em] text-[10px] shrink-0">
-        {trace.isLoading ? 'Tracing…' : 'Tracing'}
-      </span>
+      {/* Section identity — solid accent badge for high-contrast readability */}
+      <div className="relative flex items-center gap-2.5 shrink-0">
+        <div
+          className={cn(
+            'relative w-9 h-9 rounded-xl flex items-center justify-center shrink-0',
+            'bg-gradient-to-br from-accent-lineage to-purple-600',
+            'border border-accent-lineage/60',
+            'shadow-lg shadow-accent-lineage/30',
+          )}
+        >
+          <Workflow className="w-4 h-4 text-white drop-shadow-[0_0_4px_rgba(168,85,247,0.6)]" strokeWidth={2.4} aria-hidden />
+          {/* Pulsing live indicator — anchored to the badge bottom-right */}
+          <span
+            className="absolute -bottom-0.5 -right-0.5 inline-flex w-2.5 h-2.5"
+            aria-hidden="true"
+          >
+            <span className="absolute inset-0 rounded-full bg-accent-lineage/60 animate-ping motion-reduce:animate-none" />
+            <span className="relative w-2.5 h-2.5 rounded-full bg-accent-lineage border-2 border-canvas-elevated" />
+          </span>
+        </div>
+        <div className="flex flex-col leading-tight">
+          <span className="text-[11px] font-bold text-ink uppercase tracking-[0.18em]">
+            {trace.isLoading ? 'Tracing…' : 'Active Trace'}
+          </span>
+          <span className="text-[10px] text-ink-muted tracking-wide">
+            {trace.isLoading ? 'computing lineage' : 'live lineage view'}
+          </span>
+        </div>
+      </div>
 
-      <span className="w-px h-4 bg-glass-border/60 shrink-0" aria-hidden />
+      {/* Vertical hairline divider — matches ContextViewHeader idiom */}
+      <span
+        className="w-px h-7 bg-gradient-to-b from-transparent via-white/10 to-transparent shrink-0"
+        aria-hidden
+      />
 
-      {/* Focus identity */}
-      <div className="flex items-center gap-1.5 min-w-0 shrink">
-        <span className="font-semibold text-ink truncate max-w-[180px]" title={focusName}>
+      {/* Focus chip — neutral glass with bright name + accent micro-pills */}
+      <div
+        className={cn(
+          'flex items-center gap-2 px-2.5 h-8 rounded-xl min-w-0 shrink',
+          'bg-white/[0.06] border border-white/[0.12]',
+        )}
+        title={focusName}
+      >
+        <span className="text-sm font-display font-semibold text-ink truncate max-w-[180px] tracking-tight">
           {focusName}
         </span>
         {focusType && (
-          <span className="hidden xl:inline-flex px-1.5 py-0.5 rounded-md bg-accent-lineage/10 text-accent-lineage text-[10px] font-semibold uppercase tracking-wide shrink-0">
+          <span className="hidden xl:inline-flex shrink-0 px-1.5 py-0.5 rounded-md bg-accent-lineage/20 text-accent-lineage text-[10px] font-bold uppercase tracking-wider border border-accent-lineage/30">
             {focusType}
           </span>
         )}
         {typeof trace.result?.effectiveLevel === 'number' && (
-          <span className="hidden 2xl:inline-flex px-1.5 py-0.5 rounded-md bg-white/5 text-ink-muted text-[10px] font-semibold tabular-nums shrink-0">
+          <span className="hidden 2xl:inline-flex shrink-0 px-1.5 py-0.5 rounded-md bg-white/[0.10] text-ink text-[10px] font-bold tabular-nums">
             L{trace.result.effectiveLevel}
           </span>
         )}
       </div>
 
-      <span className="w-px h-4 bg-glass-border/60 shrink-0" aria-hidden />
-
-      {/* Counts — animated */}
+      {/* Counts — neutral glass pills with accent icon + bright value */}
       <div className="flex items-center gap-1.5 shrink-0">
         <span
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-semibold tabular-nums bg-blue-500/10 text-blue-600 dark:text-blue-400"
+          className={cn(
+            'inline-flex items-center gap-1.5 px-2 h-7 rounded-lg',
+            'bg-white/[0.06] border border-blue-400/40',
+          )}
           aria-label={`${trace.upstreamCount} upstream nodes`}
         >
-          <ArrowUp className="w-3 h-3" aria-hidden /> {upDisplay}
+          <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" strokeWidth={2.4} aria-hidden />
+          <span className="text-xs font-bold tabular-nums text-ink">{upDisplay.toLocaleString()}</span>
         </span>
         <span
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-semibold tabular-nums bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+          className={cn(
+            'inline-flex items-center gap-1.5 px-2 h-7 rounded-lg',
+            'bg-white/[0.06] border border-emerald-400/40',
+          )}
           aria-label={`${trace.downstreamCount} downstream nodes`}
         >
-          <ArrowDown className="w-3 h-3" aria-hidden /> {downDisplay}
+          <ArrowDown className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" strokeWidth={2.4} aria-hidden />
+          <span className="text-xs font-bold tabular-nums text-ink">{downDisplay.toLocaleString()}</span>
         </span>
       </div>
 
-      <span className="w-px h-4 bg-glass-border/60 shrink-0" aria-hidden />
+      <span
+        className="w-px h-7 bg-gradient-to-b from-transparent via-white/10 to-transparent shrink-0"
+        aria-hidden
+      />
 
       {/* Direction radiogroup with sliding underline */}
       <LayoutGroup id="trace-dock-direction">
         <div
           role="radiogroup"
           aria-label="Trace direction visibility"
-          className="inline-flex items-center rounded-lg bg-black/5 dark:bg-white/5 p-0.5 gap-0.5 shrink-0"
+          className={cn(
+            'inline-flex items-center rounded-xl p-1 gap-0.5 shrink-0',
+            'bg-white/[0.06] border border-white/[0.12]',
+          )}
         >
-          <DirRadio checked={direction === 'up'} onSelect={() => setDirection('up')} icon={<ArrowUp className="w-3 h-3" />} label="Upstream only" />
-          <DirRadio checked={direction === 'both'} onSelect={() => setDirection('both')} icon={<ArrowUpDown className="w-3 h-3" />} label="Both directions" />
-          <DirRadio checked={direction === 'down'} onSelect={() => setDirection('down')} icon={<ArrowDown className="w-3 h-3" />} label="Downstream only" />
+          <DirRadio
+            checked={direction === 'up'}
+            onSelect={() => setDirection('up')}
+            icon={<ArrowUp className="w-4 h-4" strokeWidth={2.4} />}
+            label="Upstream only"
+          />
+          <DirRadio
+            checked={direction === 'both'}
+            onSelect={() => setDirection('both')}
+            icon={<ArrowUpDown className="w-4 h-4" strokeWidth={2.4} />}
+            label="Both directions"
+          />
+          <DirRadio
+            checked={direction === 'down'}
+            onSelect={() => setDirection('down')}
+            icon={<ArrowDown className="w-4 h-4" strokeWidth={2.4} />}
+            label="Downstream only"
+          />
         </div>
       </LayoutGroup>
 
-      {/* Notice icon — only when notice is active */}
-      {hasNotice && (
-        <button
-          type="button"
-          data-trace-control
-          onClick={handleNoticeClick}
-          aria-label={
-            noticeKind === 'warn'
-              ? `Trace truncated. ${expanded ? 'See notice in dock.' : 'Click to expand dock and see notice.'}`
-              : `Lineage inherited from parent. ${expanded ? 'See notice in dock.' : 'Click to expand dock and see notice.'}`
-          }
-          className={cn(
-            'inline-flex items-center justify-center w-6 h-6 rounded-md shrink-0',
-            'transition-colors duration-150',
-            'focus-visible:outline-none focus-visible:ring-2',
-            noticeKind === 'warn'
-              ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 hover:bg-amber-500/25 focus-visible:ring-amber-500/40'
-              : 'bg-accent-lineage/15 text-accent-lineage hover:bg-accent-lineage/25 focus-visible:ring-accent-lineage/40',
-          )}
-        >
-          {noticeKind === 'warn' ? <AlertTriangle className="w-3.5 h-3.5" /> : <Info className="w-3.5 h-3.5" />}
-        </button>
-      )}
-
-      {/* Spacer pushes the right cluster to the edge */}
       <div className="flex-1 min-w-2" />
 
       {/* Recent popover trigger */}
@@ -231,17 +259,25 @@ export function TraceDockTitleBar({
             aria-label={`Recent trace history, ${recentCount} ${recentCount === 1 ? 'entry' : 'entries'}`}
             onClick={() => setRecentOpen(v => !v)}
             className={cn(
-              'inline-flex items-center gap-1.5 px-2 h-7 rounded-md text-[11px] font-medium',
-              'transition-colors duration-150',
+              'inline-flex items-center gap-1.5 px-3 h-8 rounded-xl text-xs font-semibold',
+              'transition-all duration-200',
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
               recentOpen
-                ? 'bg-accent-lineage/15 text-accent-lineage'
-                : 'text-ink-muted hover:text-ink hover:bg-white/5',
+                ? 'bg-accent-lineage text-white border border-accent-lineage shadow-lg shadow-accent-lineage/30'
+                : 'bg-white/[0.08] border border-white/[0.15] text-ink hover:bg-white/[0.14] hover:border-white/[0.25]',
             )}
           >
-            <Clock className="w-3 h-3" />
-            <span className="hidden md:inline">Recent</span>
-            <span className="px-1 py-px rounded-full bg-accent-lineage/15 text-accent-lineage text-[9px] font-bold tabular-nums leading-none">
+            <Clock className="w-4 h-4" strokeWidth={2.4} />
+            <span className="hidden md:inline tracking-tight">Recent</span>
+            <span
+              className={cn(
+                'inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full',
+                'text-[10px] font-bold tabular-nums leading-none',
+                recentOpen
+                  ? 'bg-white/25 text-white'
+                  : 'bg-white/[0.15] text-ink',
+              )}
+            >
               {recentCount}
             </span>
           </button>
@@ -268,16 +304,18 @@ export function TraceDockTitleBar({
         aria-keyshortcuts="Control+I Meta+I"
         onClick={onToggleExpanded}
         className={cn(
-          'inline-flex items-center gap-1.5 px-2 h-7 rounded-md text-[11px] font-medium shrink-0',
-          'transition-colors duration-150',
+          'inline-flex items-center gap-1.5 px-3 h-8 rounded-xl text-xs font-semibold shrink-0',
+          'transition-all duration-200',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
           expanded
-            ? 'bg-accent-lineage/15 text-accent-lineage'
-            : 'text-ink-muted hover:text-ink hover:bg-white/5',
+            ? 'bg-accent-lineage text-white border border-accent-lineage shadow-lg shadow-accent-lineage/30'
+            : 'bg-white/[0.08] border border-white/[0.15] text-ink hover:bg-white/[0.14] hover:border-white/[0.25]',
         )}
       >
-        <span className="hidden md:inline">{expanded ? 'Compact' : 'Expand'}</span>
-        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+        <span className="hidden md:inline tracking-tight">{expanded ? 'Compact' : 'Expand'}</span>
+        {expanded
+          ? <ChevronDown className="w-4 h-4" strokeWidth={2.4} />
+          : <ChevronUp className="w-4 h-4" strokeWidth={2.4} />}
       </button>
 
       {/* Exit */}
@@ -288,14 +326,14 @@ export function TraceDockTitleBar({
         aria-label="Exit trace"
         onClick={onExit}
         className={cn(
-          'inline-flex items-center gap-1.5 px-2 h-7 rounded-md text-[11px] font-medium shrink-0',
-          'text-ink-muted hover:text-rose-500 hover:bg-rose-500/10',
-          'transition-colors duration-150',
+          'inline-flex items-center justify-center w-8 h-8 rounded-xl shrink-0',
+          'bg-white/[0.08] border border-white/[0.15] text-ink',
+          'hover:bg-rose-500 hover:text-white hover:border-rose-500 hover:shadow-lg hover:shadow-rose-500/30',
+          'transition-all duration-200',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40',
         )}
       >
-        <span className="hidden md:inline">Exit</span>
-        <X className="w-3 h-3" />
+        <X className="w-4 h-4" strokeWidth={2.4} />
       </button>
     </div>
   )
@@ -319,10 +357,10 @@ function DirRadio({ checked, onSelect, icon, label }: DirRadioProps) {
       title={label}
       onClick={onSelect}
       className={cn(
-        'relative inline-flex items-center justify-center w-7 h-6 rounded-md transition-colors duration-150',
+        'relative inline-flex items-center justify-center w-9 h-7 rounded-lg transition-colors duration-150',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
         checked
-          ? 'text-accent-lineage'
+          ? 'text-white'
           : 'text-ink-muted hover:text-ink',
       )}
     >
@@ -330,7 +368,7 @@ function DirRadio({ checked, onSelect, icon, label }: DirRadioProps) {
         <motion.span
           layoutId="trace-dock-direction-active"
           transition={{ type: 'spring', stiffness: 500, damping: 38 }}
-          className="absolute inset-0 rounded-md bg-accent-lineage/20"
+          className="absolute inset-0 rounded-lg bg-accent-lineage shadow-sm shadow-accent-lineage/40"
         />
       )}
       <span className="relative">{icon}</span>

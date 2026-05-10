@@ -58,6 +58,18 @@ export function EntityDrawer({
 
   const isOpen = !!selectedNode
 
+  // Publish the drawer's width to canvas-body so trace dock (and any other
+  // bottom-anchored chrome) can shrink its right edge to avoid overlap.
+  // Mirror of the dock's --trace-dock-height pattern. Drawer is mounted as
+  // a sibling at document level, so we query for canvas-body directly.
+  useEffect(() => {
+    if (!isOpen) return
+    const canvasBody = document.querySelector('[data-canvas-body]') as HTMLElement | null
+    if (!canvasBody) return
+    canvasBody.style.setProperty('--entity-drawer-width', 'clamp(420px, 32vw, 560px)')
+    return () => { canvasBody.style.removeProperty('--entity-drawer-width') }
+  }, [isOpen])
+
   // Local state
   const [viewMode, setViewMode] = useState<ViewMode>('view')
   const [formData, setFormData] = useState<Record<string, any>>({})

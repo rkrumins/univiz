@@ -5,11 +5,11 @@ import { MOTION } from '@/lib/motion'
 import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from '@/types/hierarchy'
 import { TraceDockTitleBar } from './TraceDockTitleBar'
-import { TraceDockNoticeStrip } from './TraceDockNoticeStrip'
-import { TraceDockMetricStrip } from './TraceDockMetricStrip'
+import { TraceDockTabs, type TraceDockTab } from './TraceDockTabs'
+import { TraceDockOverview } from './TraceDockOverview'
 import { TraceDockDrilldownList } from './TraceDockDrilldownList'
-import { TraceDockControls, type GranularityOption } from './TraceDockControls'
-import { TraceDockPerformance } from './TraceDockPerformance'
+import { TraceDockSettings } from './TraceDockSettings'
+import type { GranularityOption } from './TraceDockControls'
 import { useTraceEscStack } from './useTraceEscStack'
 
 export interface TraceBottomDockProps {
@@ -24,9 +24,9 @@ export interface TraceBottomDockProps {
   onJumpToUrn: (urn: string) => void
 }
 
-const COMPACT_HEIGHT = 52
-const MIN_EXPANDED_HEIGHT = 180
-const DEFAULT_EXPANDED_HEIGHT = 260
+const COMPACT_HEIGHT = 56
+const MIN_EXPANDED_HEIGHT = 220
+const DEFAULT_EXPANDED_HEIGHT = 300
 const MAX_VH_FRACTION = 0.6
 
 // Module-level so the user's preferred expanded height persists across
@@ -37,18 +37,17 @@ let lastExpandedHeight = DEFAULT_EXPANDED_HEIGHT
 /**
  * The bottom Trace Dock — a floating shelf at the bottom of canvas-body.
  *
- * Compact mode (52px): just the title bar with focus + counts + direction
+ * Compact mode (56px): just the title bar with focus + counts + direction
  * + Recent + Expand + Exit controls.
  *
- * Expanded mode (~260px default, drag-resize between 180px and 60vh):
- * title bar stays at top, then dense inline content sections beneath —
- * notice (when triggered), metric strip, drilldown list, controls,
- * performance. No tabs; everything visible at once.
+ * Expanded mode (~300px default, drag-resize between 220px and 60vh):
+ * title bar, then a 36px tab strip (Overview · Drilldowns · Settings),
+ * then the active tab body. Tabs cross-fade with a 180ms ease.
  *
- * The dock sits inside canvas-body's relative-positioned container with
- * `left-3 right-3 bottom-3` insets — a 12px floating-shelf gap from each
- * edge. z-index 30 keeps it above EdgeLegend at z-30 (which is lifted
- * above the dock by the parent).
+ * The dock sits inside canvas-body's relative-positioned container.
+ * Right edge follows `--entity-drawer-width` so it never overlaps the
+ * EntityDrawer. z-index 30 keeps it above EdgeLegend at z-30 (which is
+ * lifted above the dock by the parent via `--trace-dock-height`).
  */
 export function TraceBottomDock({
   trace,
@@ -62,13 +61,39 @@ export function TraceBottomDock({
   onJumpToUrn,
 }: TraceBottomDockProps) {
   const [expandedHeight, setExpandedHeight] = useState(lastExpandedHeight)
+  const [tab, setTab] = useState<TraceDockTab>('overview')
   const dockRef = useRef<HTMLDivElement>(null)
+  const hasAutoJumpedRef = useRef(false)
 
-  // ESC closes the expanded dock first, then exits trace via the parent.
   useTraceEscStack(expanded, onToggleExpanded, 50)
 
   // Persist height across the session.
   useEffect(() => () => { lastExpandedHeight = expandedHeight }, [expandedHeight])
+
+  // Auto-jump tab on first expand. Notice takes priority — surface it on
+  // Overview so users see why the trace is constrained. Otherwise, jump
+  // to Drilldowns when there are active drilldowns. Otherwise stay on
+  // Overview. Reset the flag when the dock collapses so the next expand
+  // re-evaluates.
+  const drilldownCount = trace.drilldowns.size
+  const hasNotice = !!(
+    trace.result?.truncated ||
+    (trace.result?.isInherited && trace.result?.inheritedFromUrn)
+  )
+
+  useEffect(() => {
+    if (!expanded) {
+      hasAutoJumpedRef.current = false
+      return
+    }
+    if (hasAutoJumpedRef.current) return
+    if (hasNotice) {
+      setTab('overview')
+    } else if (drilldownCount > 0) {
+      setTab('drilldowns')
+    }
+    hasAutoJumpedRef.current = true
+  }, [expanded, hasNotice, drilldownCount])
 
   // Re-clamp height when the viewport shrinks so the dock never crops the
   // canvas down to nothing.
@@ -81,15 +106,15 @@ export function TraceBottomDock({
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  // Drag-to-resize on the top edge of the dock. The dock extends UPWARD
-  // when grown, so dragging UP increases height (negative deltaY).
+  // Drag-to-resize on the top edge. Dock extends UPWARD when grown, so
+  // dragging UP increases height (negative deltaY).
   const onResizeStart = (e: React.PointerEvent) => {
     e.preventDefault()
     const startY = e.clientY
     const startHeight = expandedHeight
     const maxHeight = Math.floor(window.innerHeight * MAX_VH_FRACTION)
     const onMove = (ev: PointerEvent) => {
-      const delta = startY - ev.clientY  // up = positive growth
+      const delta = startY - ev.clientY
       const next = Math.min(maxHeight, Math.max(MIN_EXPANDED_HEIGHT, startHeight + delta))
       setExpandedHeight(next)
     }
@@ -105,12 +130,10 @@ export function TraceBottomDock({
 
   // Publish dock height as a CSS variable on the parent canvas-body so
   // EdgeLegend (and any other bottom-anchored chrome) can lift above it.
-  // The CSS var is read by the canvas-body root (set by parent) — we just
-  // emit it from here when the dock changes height.
   useEffect(() => {
     const parent = dockRef.current?.closest<HTMLElement>('[data-canvas-body]')
     if (!parent) return
-    parent.style.setProperty('--trace-dock-height', `${dockHeight + 12}px`) // +12px floating-shelf gap
+    parent.style.setProperty('--trace-dock-height', `${dockHeight + 12}px`)
     return () => {
       parent.style.removeProperty('--trace-dock-height')
     }
@@ -137,19 +160,29 @@ export function TraceBottomDock({
       animate={{ opacity: 1, y: 0, height: dockHeight }}
       exit={{ opacity: 0, y: 24 }}
       transition={MOTION.modalSpring}
-      style={{ height: dockHeight }}
+      style={{
+        height: dockHeight,
+        right: 'calc(var(--entity-drawer-width, 0px) + 12px)',
+        transition: 'right 300ms cubic-bezier(0.16, 1, 0.3, 1)',
+      }}
       className={cn(
-        'absolute left-3 right-3 bottom-3 z-30',
+        'absolute left-3 bottom-3 z-30',
         'rounded-2xl overflow-hidden',
-        'bg-canvas-elevated/95 backdrop-blur-2xl',
+        // Premium frosted shell: gradient base + heavy blur + accent-tinted border
+        'bg-gradient-to-b from-canvas-elevated/96 via-canvas-elevated/95 to-canvas-elevated/96',
+        'backdrop-blur-2xl',
         'border border-accent-lineage/25',
-        'shadow-glass-lg',
-        // Subtle accent gradient on the top edge — premium "trace mode" tell
-        'before:absolute before:inset-x-0 before:top-0 before:h-px before:bg-gradient-to-r before:from-transparent before:via-accent-lineage/60 before:to-transparent before:pointer-events-none',
+        'shadow-glass-lg shadow-accent-lineage/10',
+        // Top-edge accent hairline — the "trace mode is live" tell
+        'before:absolute before:inset-x-0 before:top-0 before:h-px before:bg-gradient-to-r before:from-transparent before:via-accent-lineage/70 before:to-transparent before:pointer-events-none',
+        // Soft ambient glow at the top edge — quiet halo that says "alive"
+        'after:absolute after:inset-x-16 after:-top-px after:h-[2px] after:bg-accent-lineage/40 after:blur-md after:pointer-events-none',
       )}
     >
       <div className="relative h-full flex flex-col">
-        {/* Drag-resize handle — only meaningful in expanded mode */}
+        {/* Drag-resize handle — only meaningful in expanded mode. The
+            invisible 8px hit area sits over the top edge with a 4px-on-
+            hover band and a centered 3-dot grip indicator. */}
         {expanded && (
           <div
             role="separator"
@@ -159,12 +192,23 @@ export function TraceBottomDock({
             aria-valuemin={MIN_EXPANDED_HEIGHT}
             aria-valuemax={Math.floor(window.innerHeight * MAX_VH_FRACTION)}
             onPointerDown={onResizeStart}
-            className={cn(
-              'absolute top-0 left-0 right-0 h-1.5 cursor-row-resize group z-10',
-              'hover:bg-accent-lineage/10 transition-colors',
-            )}
+            className="absolute top-0 left-0 right-0 h-2 cursor-row-resize group z-20"
           >
-            <div className="mx-auto mt-0.5 h-0.5 w-3 group-hover:w-8 rounded-full bg-glass-border group-hover:bg-accent-lineage/60 transition-all duration-150" />
+            {/* Hover band — soft gradient glow */}
+            <div className="absolute inset-x-0 top-0 h-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gradient-to-r from-transparent via-accent-lineage/20 to-transparent" />
+            {/* Grip pill — subtle at rest, lights up on hover */}
+            <div
+              className={cn(
+                'absolute top-[3px] left-1/2 -translate-x-1/2',
+                'inline-flex items-center gap-[3px] px-1.5 h-1.5 rounded-full',
+                'bg-white/10 group-hover:bg-accent-lineage/50',
+                'opacity-50 group-hover:opacity-100 transition-all duration-200',
+              )}
+            >
+              <span className="block w-0.5 h-0.5 rounded-full bg-current" />
+              <span className="block w-0.5 h-0.5 rounded-full bg-current" />
+              <span className="block w-0.5 h-0.5 rounded-full bg-current" />
+            </div>
           </div>
         )}
 
@@ -177,7 +221,7 @@ export function TraceBottomDock({
           onExit={onExit}
         />
 
-        {/* Body — only in expanded mode */}
+        {/* Tabs + body — only in expanded mode */}
         <AnimatePresence initial={false}>
           {expanded && (
             <motion.div
@@ -187,37 +231,56 @@ export function TraceBottomDock({
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.18, ease: 'easeOut' }}
-              className="flex-1 min-h-0 flex flex-col overflow-y-auto custom-scrollbar"
+              className="flex-1 min-h-0 flex flex-col"
             >
-              <TraceDockNoticeStrip
-                result={trace.result}
-                displayMap={displayMap}
-                onReduceDepth={handleReduceDepth}
-                onJumpToUrn={onJumpToUrn}
+              <TraceDockTabs
+                active={tab}
+                onChange={setTab}
+                drilldownCount={drilldownCount}
+                hasNotice={hasNotice}
               />
-              <TraceDockMetricStrip
-                result={trace.result}
-                focusNode={focusNode}
-                totalNodes={trace.statistics.totalNodes}
-                totalEdges={trace.statistics.totalEdges}
-                upstreamCount={trace.upstreamCount}
-                downstreamCount={trace.downstreamCount}
-                resolveEdgeColor={resolveEdgeColor}
-              />
-              <TraceDockDrilldownList
-                drilldowns={trace.drilldowns}
-                displayMap={displayMap}
-                onCollapse={trace.collapseDrilldown}
-              />
-              <TraceDockControls
-                config={trace.config}
-                granularityOptions={granularityOptions}
-                availableEdgeTypes={availableEdgeTypes}
-                resolveEdgeColor={resolveEdgeColor}
-                onChangeConfig={trace.setConfig}
-                onApply={() => { trace.retrace() }}
-              />
-              <TraceDockPerformance meta={trace.result?.meta} />
+
+              <AnimatePresence mode="wait" initial={false}>
+                {tab === 'overview' && (
+                  <TraceDockOverview
+                    key="overview"
+                    trace={trace}
+                    displayMap={displayMap}
+                    focusNode={focusNode}
+                    resolveEdgeColor={resolveEdgeColor}
+                    onReduceDepth={handleReduceDepth}
+                    onJumpToUrn={onJumpToUrn}
+                  />
+                )}
+                {tab === 'drilldowns' && (
+                  <motion.div
+                    key="drilldowns"
+                    id="trace-dock-panel-drilldowns"
+                    role="tabpanel"
+                    aria-labelledby="trace-dock-tab-drilldowns"
+                    initial={{ opacity: 0, scale: 0.99 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.99 }}
+                    transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                    className="flex-1 min-h-0 flex flex-col"
+                  >
+                    <TraceDockDrilldownList
+                      drilldowns={trace.drilldowns}
+                      displayMap={displayMap}
+                      onCollapse={trace.collapseDrilldown}
+                    />
+                  </motion.div>
+                )}
+                {tab === 'settings' && (
+                  <TraceDockSettings
+                    key="settings"
+                    trace={trace}
+                    granularityOptions={granularityOptions}
+                    availableEdgeTypes={availableEdgeTypes}
+                    resolveEdgeColor={resolveEdgeColor}
+                  />
+                )}
+              </AnimatePresence>
             </motion.div>
           )}
         </AnimatePresence>

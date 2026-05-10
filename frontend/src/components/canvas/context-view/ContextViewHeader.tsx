@@ -16,13 +16,6 @@ import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { HierarchyNode } from './types'
 
-/** Minimal entity type shape needed for the granularity selector. */
-export interface GranularityOption {
-  id: string
-  name: string
-  level: number
-}
-
 export interface ContextViewHeaderProps {
   // Search
   searchQuery: string
@@ -33,15 +26,17 @@ export interface ContextViewHeaderProps {
   // Lineage flow
   showLineageFlow: boolean
   onToggleLineageFlow: () => void
-  /** Current granularity: entity type ID, or null for no aggregation. */
-  lineageGranularity: string | null
-  onGranularityChange: (g: string | null) => void
-  /** Entity types from the active ontology, used to populate the granularity picker. */
-  granularityOptions: GranularityOption[]
 
   // Edge direction toggle
   showEdgeDirection: boolean
   onToggleEdgeDirection: () => void
+
+  // Trace — global toggle that mirrors the keyboard shortcut. Drawer's
+  // per-node trace buttons remain for granular up/down/full control.
+  traceActive: boolean
+  canTrace: boolean
+  onStartTrace: () => void
+  onExitTrace: () => void
 
   // Add entity
   onAddEntity: () => void
@@ -70,11 +65,12 @@ export function ContextViewHeader({
   onSearchResultClick,
   showLineageFlow,
   onToggleLineageFlow,
-  lineageGranularity,
-  onGranularityChange,
-  granularityOptions,
   showEdgeDirection,
   onToggleEdgeDirection,
+  traceActive,
+  canTrace,
+  onStartTrace,
+  onExitTrace,
   onAddEntity,
   activeWorkspaceId,
   activeContextModelName,
@@ -157,32 +153,6 @@ export function ContextViewHeader({
           )} />
         </button>
 
-        {/* Granularity Selector */}
-        <AnimatePresence>
-          {showLineageFlow && (
-            <motion.div
-              initial={{ opacity: 0, width: 0 }}
-              animate={{ opacity: 1, width: 'auto' }}
-              exit={{ opacity: 0, width: 0 }}
-              className="overflow-hidden"
-            >
-              <select
-                value={lineageGranularity ?? ''}
-                onChange={(e) => onGranularityChange(e.target.value || null)}
-                className="px-3 py-2 rounded-xl text-xs font-medium bg-white/[0.04] border border-white/[0.08] text-ink cursor-pointer hover:bg-white/[0.08] focus:outline-none focus:border-accent-lineage/40 transition-all appearance-none pr-8 bg-no-repeat bg-right"
-                style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%239ca3af'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`, backgroundSize: '16px', backgroundPosition: 'right 8px center' }}
-              >
-                {[...granularityOptions]
-                  .sort((a, b) => a.level - b.level)
-                  .map(opt => (
-                    <option key={opt.id} value={opt.id}>{opt.name} level</option>
-                  ))
-                }
-              </select>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
         {/* Show Direction toggle — controls arrowheads + animated mid-edge chevron */}
         <button
           onClick={onToggleEdgeDirection}
@@ -197,6 +167,37 @@ export function ContextViewHeader({
           <LucideIcons.MoveRight className="w-3.5 h-3.5" />
           <span>{showEdgeDirection ? 'Direction On' : 'Direction Off'}</span>
         </button>
+
+        <div className="w-px h-6 bg-gradient-to-b from-transparent via-white/10 to-transparent" />
+
+        {/* Trace toggle — global affordance mirroring the keyboard shortcut.
+            Drawer's per-node trace buttons remain for granular up/down/full. */}
+        {traceActive ? (
+          <button
+            onClick={onExitTrace}
+            title="Exit trace mode"
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium bg-gradient-to-r from-rose-500/25 to-rose-500/15 text-rose-200 border border-rose-400/40 hover:from-rose-500/35 hover:to-rose-500/25 hover:border-rose-300/60 hover:shadow-lg hover:shadow-rose-500/20 transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
+          >
+            <LucideIcons.X className="w-4 h-4" strokeWidth={2.4} />
+            <span>Exit Trace</span>
+            <span className="w-2 h-2 rounded-full bg-rose-300 shadow-lg shadow-rose-300/60 animate-pulse" />
+          </button>
+        ) : (
+          <button
+            onClick={canTrace ? onStartTrace : undefined}
+            disabled={!canTrace}
+            title={canTrace ? 'Trace lineage of selected entity' : 'Select a single entity to trace its lineage'}
+            className={cn(
+              "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all duration-300",
+              canTrace
+                ? "bg-gradient-to-r from-accent-lineage/25 to-purple-500/15 text-accent-lineage border border-accent-lineage/40 hover:from-accent-lineage/35 hover:to-purple-500/25 hover:border-accent-lineage/60 hover:shadow-lg hover:shadow-accent-lineage/20 hover:scale-[1.02] active:scale-[0.98]"
+                : "bg-white/[0.03] border border-white/[0.06] text-ink-muted/40 cursor-not-allowed"
+            )}
+          >
+            <LucideIcons.Workflow className="w-4 h-4" strokeWidth={2.2} />
+            <span>Trace Lineage</span>
+          </button>
+        )}
 
         <div className="w-px h-6 bg-gradient-to-b from-transparent via-white/10 to-transparent" />
 

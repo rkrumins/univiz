@@ -1225,11 +1225,12 @@ export function ContextViewCanvas({
         }}
         showLineageFlow={showLineageFlow}
         onToggleLineageFlow={() => setShowLineageFlow(!showLineageFlow)}
-        lineageGranularity={lineageGranularity}
-        onGranularityChange={setLineageGranularity}
-        granularityOptions={granularityOptions}
         showEdgeDirection={showEdgeDirection}
         onToggleEdgeDirection={() => setShowEdgeDirection(v => !v)}
+        traceActive={trace.isTracing}
+        canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
+        onStartTrace={() => { if (selectedNodeIds[0]) traceFullLineageWithSmartLevel(selectedNodeIds[0]) }}
+        onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
         onAddEntity={() => { setIsCreatingEntity(true); setCreationParentId(null); setCreationLayerId(null) }}
         activeWorkspaceId={activeWorkspaceId}
         activeContextModelName={activeContextModelName}
