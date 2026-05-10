@@ -1,0 +1,28 @@
+[
+  {
+    "child_count": 1,
+    "description": "",
+    "display_name": "Schema 1",
+    "entity_type": "schema",
+    "last_synced_at": "",
+    "layer_assignment": "",
+    "properties": {},
+    "qualified_name": "",
+    "source_system": "",
+    "tags": [],
+    "urn": "urn:test:schema:s1"
+  },
+  {
+    "child_count": 2,
+    "description": "",
+    "display_name": "Schema 2",
+    "entity_type": "schema",
+    "last_synced_at": "",
+    "layer_assignment": "",
+    "properties": {},
+    "qualified_name": "",
+    "source_system": "",
+    "tags": [],
+    "urn": "urn:test:schema:s2"
+  }
+]

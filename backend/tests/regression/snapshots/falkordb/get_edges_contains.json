@@ -1,0 +1,42 @@
+[
+  {
+    "confidence": null,
+    "edge_type": "CONTAINS",
+    "id": "c1",
+    "properties": {},
+    "source_urn": "urn:test:domain:root",
+    "target_urn": "urn:test:schema:s1"
+  },
+  {
+    "confidence": null,
+    "edge_type": "CONTAINS",
+    "id": "c2",
+    "properties": {},
+    "source_urn": "urn:test:domain:root",
+    "target_urn": "urn:test:schema:s2"
+  },
+  {
+    "confidence": null,
+    "edge_type": "CONTAINS",
+    "id": "c3",
+    "properties": {},
+    "source_urn": "urn:test:schema:s1",
+    "target_urn": "urn:test:dataset:d1"
+  },
+  {
+    "confidence": null,
+    "edge_type": "CONTAINS",
+    "id": "c4",
+    "properties": {},
+    "source_urn": "urn:test:schema:s2",
+    "target_urn": "urn:test:dataset:d2"
+  },
+  {
+    "confidence": null,
+    "edge_type": "CONTAINS",
+    "id": "c5",
+    "properties": {},
+    "source_urn": "urn:test:schema:s2",
+    "target_urn": "urn:test:dataset:d3"
+  }
+]

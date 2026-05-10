@@ -1,0 +1,132 @@
+{
+  "containment_edges": [
+    {
+      "confidence": null,
+      "edge_type": "CONTAINS",
+      "id": "1",
+      "properties": {},
+      "source_urn": "urn:test:schema:s2",
+      "target_urn": "urn:test:dataset:d2"
+    },
+    {
+      "confidence": null,
+      "edge_type": "CONTAINS",
+      "id": "2",
+      "properties": {},
+      "source_urn": "urn:test:schema:s1",
+      "target_urn": "urn:test:dataset:d1"
+    },
+    {
+      "confidence": null,
+      "edge_type": "CONTAINS",
+      "id": "3",
+      "properties": {},
+      "source_urn": "urn:test:domain:root",
+      "target_urn": "urn:test:schema:s2"
+    },
+    {
+      "confidence": null,
+      "edge_type": "CONTAINS",
+      "id": "4",
+      "properties": {},
+      "source_urn": "urn:test:domain:root",
+      "target_urn": "urn:test:schema:s1"
+    }
+  ],
+  "downstream_urns": [
+    "urn:test:dataset:d2"
+  ],
+  "edges": [
+    {
+      "confidence": null,
+      "edge_type": "DERIVES_FROM",
+      "id": "6",
+      "properties": {
+        "sourceEdgeTypes": [
+          "DERIVES_FROM"
+        ],
+        "weight": 1
+      },
+      "source_urn": "urn:test:dataset:d1",
+      "target_urn": "urn:test:dataset:d2"
+    }
+  ],
+  "effective_level": 2,
+  "focus": {
+    "entity_type": "dataset",
+    "level": 2,
+    "urn": "urn:test:dataset:d1"
+  },
+  "inherited_from_urn": null,
+  "is_inherited": false,
+  "nodes": [
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Dataset 1",
+      "entity_type": "dataset",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:dataset:d1"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Dataset 2",
+      "entity_type": "dataset",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:dataset:d2"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Root Domain",
+      "entity_type": "domain",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:domain:root"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Schema 1",
+      "entity_type": "schema",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:schema:s1"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Schema 2",
+      "entity_type": "schema",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:schema:s2"
+    }
+  ],
+  "truncated": false,
+  "truncation_reason": null,
+  "upstream_urns": []
+}

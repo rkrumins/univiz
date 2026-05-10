@@ -29,6 +29,22 @@ class ProviderConfigurationError(RuntimeError):
     pass
 
 
+class ProviderInputError(ValueError):
+    """Raised when a write operation receives input that exceeds a
+    provider-side limit before any I/O happens.
+
+    Example: a single GraphNode property bag whose JSON encoding exceeds
+    Spanner's 10 MiB cell limit. Without this guard, the offending row
+    would fail the entire batched mutation atomically — poisoning every
+    adjacent row in the same upsert. Catching at the boundary lets the
+    API layer translate to HTTP 400 with a clear "row X is too large"
+    message and let the caller retry without that row.
+
+    Consumers: API endpoints should translate to HTTP 400.
+    """
+    pass
+
+
 class GraphDataProvider(ABC):
     """
     Abstract interface for graph data providers.

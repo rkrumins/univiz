@@ -1,0 +1,69 @@
+{
+  "aggregated_edges": null,
+  "downstream_urns": [],
+  "edges": [
+    {
+      "confidence": null,
+      "edge_type": "DERIVES_FROM",
+      "id": "l1",
+      "properties": {},
+      "source_urn": "urn:test:dataset:d1",
+      "target_urn": "urn:test:dataset:d2"
+    },
+    {
+      "confidence": null,
+      "edge_type": "DERIVES_FROM",
+      "id": "l2",
+      "properties": {},
+      "source_urn": "urn:test:dataset:d3",
+      "target_urn": "urn:test:dataset:d2"
+    }
+  ],
+  "has_more": false,
+  "nodes": [
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Dataset 1",
+      "entity_type": "dataset",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:dataset:d1"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Dataset 2",
+      "entity_type": "dataset",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:dataset:d2"
+    },
+    {
+      "child_count": 0,
+      "description": "",
+      "display_name": "Dataset 3",
+      "entity_type": "dataset",
+      "last_synced_at": "",
+      "layer_assignment": "",
+      "properties": {},
+      "qualified_name": "",
+      "source_system": "",
+      "tags": [],
+      "urn": "urn:test:dataset:d3"
+    }
+  ],
+  "total_count": 3,
+  "upstream_urns": [
+    "urn:test:dataset:d1",
+    "urn:test:dataset:d3"
+  ]
+}
