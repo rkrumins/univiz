@@ -694,8 +694,21 @@ class ProviderManager:
             # Spanner uses GCP project/instance/database identifiers rather
             # than host/port. They live on extra_config; credentials carry
             # the service-account JSON.
+            import os as _os
             from backend.graph.adapters.spanner_provider import SpannerProvider
             cfg = dict(extra_config or {})
+            use_emulator = bool(cfg.get("useEmulator", False))
+            # Prevent the cloud-spanner-emulator from ever being selected
+            # outside an explicitly opted-in dev environment. The FE wizard
+            # already hides the toggle in production builds; this is the
+            # corresponding server-side defense so a hand-crafted payload
+            # cannot route a real provider at localhost:9010.
+            if use_emulator and not _os.getenv("SYNODIC_ALLOW_SPANNER_EMULATOR"):
+                raise ValueError(
+                    "Spanner emulator mode (extra_config.useEmulator=true) is "
+                    "disabled by default. Set SYNODIC_ALLOW_SPANNER_EMULATOR=1 "
+                    "in the backend environment to enable it for local development."
+                )
             project_id = cfg.get("projectId") or creds.get("project_id")
             instance_id = cfg.get("instanceId")
             database_id = cfg.get("databaseId") or graph_name
@@ -711,7 +724,7 @@ class ProviderManager:
                 database_id=database_id,
                 graph_name=cfg.get("graphName") or "UniViz",
                 credentials_json=creds.get("service_account_json"),
-                use_emulator=bool(cfg.get("useEmulator", False)),
+                use_emulator=use_emulator,
                 extra_config=cfg,
             )
 

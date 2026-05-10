@@ -29,9 +29,14 @@ from backend.graph.adapters.spanner_provider import (
 # DDL shape
 # ---------------------------------------------------------------------------
 
-def test_node_table_is_keyed_on_urn_string():
+def test_node_table_is_keyed_on_shard_urn_pair():
+    """v2 schema: leading ``shard`` column to break URN-prefix
+    hotspots (audit B8). The unique secondary index on ``urn`` (asserted
+    in test_phase3_spanner_owned_schema.py) preserves single-key-seek
+    semantics for WHERE urn = @u lookups."""
     assert "urn STRING(MAX) NOT NULL" in _DDL_CREATE_GRAPH_NODE
-    assert "PRIMARY KEY (urn)" in _DDL_CREATE_GRAPH_NODE
+    assert "shard INT64 NOT NULL AS (MOD(FARM_FINGERPRINT(urn), 256)) STORED" in _DDL_CREATE_GRAPH_NODE
+    assert "PRIMARY KEY (shard, urn)" in _DDL_CREATE_GRAPH_NODE
 
 
 def test_node_has_stored_generated_columns_for_hot_props():
@@ -43,8 +48,10 @@ def test_node_has_stored_generated_columns_for_hot_props():
 
 
 def test_edge_table_interleaves_into_source_node():
+    """v2 schema: child PK must start with parent PK ``(shard, urn)``
+    for INTERLEAVE to be valid Spanner DDL."""
     assert "INTERLEAVE IN PARENT GraphNode" in _DDL_CREATE_GRAPH_EDGE
-    assert "PRIMARY KEY (urn, dest_urn, edge_id)" in _DDL_CREATE_GRAPH_EDGE
+    assert "PRIMARY KEY (shard, urn, dest_urn, edge_id)" in _DDL_CREATE_GRAPH_EDGE
 
 
 def test_indexes_include_reverse_traversal_index():
@@ -131,10 +138,14 @@ def test_edition_error_is_runtime_error_subclass():
 # Sidecar bookkeeping (Phase I.2)
 # ---------------------------------------------------------------------------
 
-def test_sidecar_table_uses_three_part_primary_key():
+def test_sidecar_table_uses_shard_prefixed_primary_key():
+    """v2 schema: ``source_shard`` leads the PK so contribution rows
+    distribute across splits even when a single source URN namespace
+    dominates ingest. Audit B8."""
     ddl = _DDL_CREATE_GRAPH_EDGE_CONTRIBUTION
     assert "CREATE TABLE GraphEdgeContribution" in ddl
-    assert "PRIMARY KEY (source_urn, target_urn, contributor_id)" in ddl
+    assert "source_shard INT64 NOT NULL AS (MOD(FARM_FINGERPRINT(source_urn), 256)) STORED" in ddl
+    assert "PRIMARY KEY (source_shard, source_urn, target_urn, contributor_id)" in ddl
     # No interleave: contribution rows live independently of GraphNode
     # so a contributor edge being deleted does not cascade-delete the
     # AGGREGATED contribution row out from under the materialiser.

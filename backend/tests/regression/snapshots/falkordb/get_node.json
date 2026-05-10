@@ -1,0 +1,13 @@
+{
+  "child_count": 0,
+  "description": "",
+  "display_name": "Dataset 1",
+  "entity_type": "dataset",
+  "last_synced_at": "",
+  "layer_assignment": "",
+  "properties": {},
+  "qualified_name": "",
+  "source_system": "",
+  "tags": [],
+  "urn": "urn:test:dataset:d1"
+}

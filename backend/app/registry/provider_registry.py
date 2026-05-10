@@ -315,8 +315,19 @@ class ProviderRegistry:
             )
 
         elif ptype == "spanner":
+            import os as _os
             from backend.graph.adapters.spanner_provider import SpannerProvider
             cfg = dict(extra_config or {})
+            use_emulator = bool(cfg.get("useEmulator", False))
+            # Mirror of the manager.py guard: emulator mode requires an
+            # explicit opt-in env var so a crafted payload cannot route a
+            # real provider at localhost:9010 in production.
+            if use_emulator and not _os.getenv("SYNODIC_ALLOW_SPANNER_EMULATOR"):
+                raise ValueError(
+                    "Spanner emulator mode (extra_config.useEmulator=true) is "
+                    "disabled by default. Set SYNODIC_ALLOW_SPANNER_EMULATOR=1 "
+                    "in the backend environment to enable it for local development."
+                )
             project_id = cfg.get("projectId") or credentials.get("project_id")
             instance_id = cfg.get("instanceId")
             database_id = cfg.get("databaseId") or graph_name
@@ -331,7 +342,7 @@ class ProviderRegistry:
                 database_id=database_id,
                 graph_name=cfg.get("graphName") or "UniViz",
                 credentials_json=credentials.get("service_account_json"),
-                use_emulator=bool(cfg.get("useEmulator", False)),
+                use_emulator=use_emulator,
                 extra_config=cfg,
             )
 

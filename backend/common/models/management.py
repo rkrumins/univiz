@@ -2,8 +2,9 @@
 Pydantic models for the management database layer.
 Covers: graph connections, ontology configs, assignment rule sets, saved views.
 """
+import json
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from enum import Enum
 
 
@@ -11,19 +12,32 @@ class ProviderType(str, Enum):
     FALKORDB = "falkordb"
     NEO4J = "neo4j"
     DATAHUB = "datahub"
+    SPANNER = "spanner"
 
 
 # ============================================
 # Connection Models
 # ============================================
 
+# Service-account JSON key shape we require for Spanner registrations
+# (anything less and the google-cloud-spanner client can't construct
+# `service_account.Credentials.from_service_account_info`). Validated
+# at request boundary so a bad paste returns 400 with a clear message
+# instead of a 500 deep in the provider's first probe.
+_SPANNER_SA_REQUIRED_KEYS = {"type", "project_id", "private_key", "client_email"}
+
+
 class ConnectionCredentials(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     token: Optional[str] = None
+    # Spanner-specific. Both are snake_case to match the FE wizard payload.
+    project_id: Optional[str] = None
+    service_account_json: Optional[str] = None
 
     class Config:
         populate_by_name = True
+        extra = "forbid"  # silent drops are how B2 happened — fail loudly instead
 
 
 class ConnectionCreateRequest(BaseModel):
@@ -155,6 +169,44 @@ class ProviderCreateRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+
+    @model_validator(mode="after")
+    def _validate_spanner_credentials(self) -> "ProviderCreateRequest":
+        # Only Spanner has shape requirements on the credentials JSON; for
+        # other provider types, the existing username/password/token fields
+        # are validated by the dispatch (or not — that's a separate audit
+        # item). Emulator mode skips auth entirely so credentials are
+        # optional in that branch.
+        if self.provider_type != ProviderType.SPANNER:
+            return self
+        use_emulator = bool((self.extra_config or {}).get("useEmulator"))
+        if use_emulator:
+            return self
+        sa_json = (self.credentials.service_account_json
+                   if self.credentials else None)
+        if not sa_json:
+            raise ValueError(
+                "Spanner provider requires credentials.service_account_json "
+                "(unless extra_config.useEmulator is true)."
+            )
+        try:
+            parsed = json.loads(sa_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"credentials.service_account_json is not valid JSON: {exc.msg}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "credentials.service_account_json must be a JSON object."
+            )
+        missing = _SPANNER_SA_REQUIRED_KEYS - parsed.keys()
+        if missing:
+            raise ValueError(
+                "credentials.service_account_json is missing required keys: "
+                f"{sorted(missing)}. Expected a Google service-account key "
+                f"with at least {sorted(_SPANNER_SA_REQUIRED_KEYS)}."
+            )
+        return self
 
 
 class ProviderUpdateRequest(BaseModel):

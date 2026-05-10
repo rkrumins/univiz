@@ -128,6 +128,12 @@ const PROVIDER_TYPES: Array<{
   },
 ]
 
+// The cloud-spanner-emulator is a developer-only tool; surfacing the
+// toggle in production builds invites accidental misconfiguration that
+// silently routes a real provider at localhost:9010. Hide the UI in prod
+// AND scrub the value from any submitted payload as defense in depth.
+const IS_PROD_BUILD = Boolean(import.meta.env.PROD)
+
 const DEFAULT_SPANNER_STATE: SpannerFormState = {
   projectId: '',
   instanceId: '',
@@ -223,7 +229,7 @@ function buildExtraConfig(formData: ProviderOnboardingFormData) {
     if (s.instanceId) out.instanceId = s.instanceId
     if (s.databaseId) out.databaseId = s.databaseId
     if (s.graphName) out.graphName = s.graphName
-    if (s.useEmulator) out.useEmulator = true
+    if (!IS_PROD_BUILD && s.useEmulator) out.useEmulator = true
   }
 
   return Object.keys(out).length > 0 ? out : undefined
@@ -834,25 +840,27 @@ export function ProviderOnboardingWizard({
                   />
                 </div>
               </div>
-              <label className="flex items-center justify-between rounded-xl border border-glass-border bg-black/5 px-4 py-3 dark:bg-white/5">
-                <div>
-                  <p className="text-sm font-medium text-ink">Use cloud-spanner-emulator</p>
-                  <p className="text-xs text-ink-muted">
-                    Routes the client to <code>localhost:9010</code>. The emulator does not implement GQL —
-                    schema bootstrap and queries succeed, but property-graph DDL fails.
-                  </p>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={Boolean(formData.spanner?.useEmulator)}
-                  onChange={(event) =>
-                    updateFormData({
-                      spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), useEmulator: event.target.checked },
-                    })
-                  }
-                  className="h-4 w-4 rounded border-glass-border text-indigo-500 focus:ring-indigo-500/50"
-                />
-              </label>
+              {!IS_PROD_BUILD && (
+                <label className="flex items-center justify-between rounded-xl border border-glass-border bg-black/5 px-4 py-3 dark:bg-white/5">
+                  <div>
+                    <p className="text-sm font-medium text-ink">Use cloud-spanner-emulator (development only)</p>
+                    <p className="text-xs text-ink-muted">
+                      Routes the client to <code>localhost:9010</code>. The emulator does not implement GQL —
+                      schema bootstrap and queries succeed, but property-graph DDL fails. Hidden in production builds.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(formData.spanner?.useEmulator)}
+                    onChange={(event) =>
+                      updateFormData({
+                        spanner: { ...(formData.spanner ?? DEFAULT_SPANNER_STATE), useEmulator: event.target.checked },
+                      })
+                    }
+                    className="h-4 w-4 rounded border-glass-border text-indigo-500 focus:ring-indigo-500/50"
+                  />
+                </label>
+              )}
               <div>
                 <label className="mb-1.5 block text-sm font-medium text-ink">
                   Service account JSON
