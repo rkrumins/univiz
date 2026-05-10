@@ -24,9 +24,9 @@ export interface TraceBottomDockProps {
   onJumpToUrn: (urn: string) => void
 }
 
-const COMPACT_HEIGHT = 56
-const MIN_EXPANDED_HEIGHT = 220
-const DEFAULT_EXPANDED_HEIGHT = 300
+const COMPACT_HEIGHT = 64
+const MIN_EXPANDED_HEIGHT = 240
+const DEFAULT_EXPANDED_HEIGHT = 320
 const MAX_VH_FRACTION = 0.6
 
 // Module-level so the user's preferred expanded height persists across
