@@ -11,6 +11,9 @@ from ..models.graph import (
     CreateNodeRequest, CreateNodeResult, ChildrenWithEdgesResult, TopLevelNodesResult,
     TraceRequest, TraceResult, ExpandRequest,
 )
+from backend.common.models.graph import (
+    TraceResultV2, TraceExpandRequest, TraceDelta, TraceMeta, MegaNodeInfo,
+)
 
 from ..providers.base import GraphDataProvider
 from ..config.resilience import FALKORDB_AGGREGATED_READ_TIMEOUT_SECS
@@ -941,6 +944,124 @@ class ContextEngine:
                 include_containment_edges=req.include_containment_edges,
                 include_inherited_lineage=req.include_inherited_lineage,
             )
+
+    # ------------------------------------------------------------------ #
+    # Trace v2 wrappers — skeleton-first contract                          #
+    #                                                                     #
+    # get_trace_v2 / get_trace_delta_v2 are the V2 entry points called    #
+    # by /api/v2/{ws}/graph/trace and /trace/expand. They:                #
+    #   1. Clamp "auto" → 0 (skeleton-first; peer-rollup is opt-in)       #
+    #   2. Call the existing trace / expand_aggregated_edge primitives    #
+    #   3. Populate TraceMeta (regime, timing, truncation, megaNodes)     #
+    #   4. Validate the ancestor-chain invariant (every node has its      #
+    #      containment ancestors present — required by canvas layer       #
+    #      assignment)                                                     #
+    # ------------------------------------------------------------------ #
+
+    async def get_trace_v2(self, req: TraceRequest) -> TraceResultV2:
+        """Skeleton-first trace. Default ``level=0`` returns the top-level
+        Domain skeleton; clients drill down via /trace/expand."""
+        # Skeleton-first: "auto" is treated as 0 in V2 (top-level rollup).
+        # Callers wanting peer-level rollup must pass an explicit int.
+        if req.level == "auto":
+            req = req.model_copy(update={"level": 0})
+
+        start_ms = time.monotonic()
+        result = await self.trace(req)
+        cypher_ms = int((time.monotonic() - start_ms) * 1000)
+
+        self._validate_ancestor_chain(result, regime="skeleton")
+        meta = self._build_trace_meta(result, regime="skeleton", cypher_ms=cypher_ms)
+        return TraceResultV2(**result.model_dump(by_alias=True), meta=meta)
+
+    async def get_trace_delta_v2(self, req: TraceExpandRequest) -> TraceDelta:
+        """Skeleton-first drill-down. Stateless: the (source_urn, target_urn,
+        next_level) triple is sufficient — no server session lookup."""
+        start_ms = time.monotonic()
+        # TraceExpandRequest extends ExpandRequest; pass through directly.
+        result = await self.expand_aggregated_edge(req)
+        cypher_ms = int((time.monotonic() - start_ms) * 1000)
+
+        self._validate_ancestor_chain(result, regime="expand")
+        meta = self._build_trace_meta(
+            result, regime="expand", cypher_ms=cypher_ms,
+            trace_session_id=req.trace_session_id,
+        )
+        return TraceDelta(**result.model_dump(by_alias=True), meta=meta)
+
+    def _build_trace_meta(
+        self,
+        result: TraceResult,
+        *,
+        regime: str,
+        cypher_ms: int,
+        trace_session_id: Optional[str] = None,
+    ) -> TraceMeta:
+        """Project provider response into TraceMeta. Reads optional
+        provider-stamped fields (mega_nodes, fallback_level) off the result
+        if the provider exposed them; otherwise empty/None."""
+        # Provider may stamp these as private attributes (set via
+        # model_copy / property override). Read defensively.
+        mega_nodes_raw = getattr(result, "_mega_nodes", None) or []
+        fallback_level = getattr(result, "_fallback_level", None)
+
+        mega_nodes = [
+            mn if isinstance(mn, MegaNodeInfo) else MegaNodeInfo(**mn)
+            for mn in mega_nodes_raw
+        ]
+        return TraceMeta(
+            regime=regime,
+            effectiveLevel=result.effective_level,
+            truncationReason=result.truncation_reason,
+            cypherMs=cypher_ms,
+            nodeCount=len(result.nodes),
+            edgeCount=len(result.edges) + len(result.containment_edges),
+            fallbackLevel=fallback_level,
+            megaNodes=mega_nodes,
+            traceSessionId=trace_session_id,
+        )
+
+    def _validate_ancestor_chain(self, result: TraceResult, *, regime: str) -> None:
+        """Enforce the ancestor-chain invariant.
+
+        Every node N in result.nodes must have every containment ancestor
+        of N (up to a level-0 root) also present. Required by
+        ``useLayerAssignment`` in ContextViewCanvas — children inherit
+        their parent's layer, so an orphan deep node has no layer.
+
+        In dev (``TRACE_INVARIANT_STRICT=1``) this raises; in prod it logs
+        a warning. The auto-hydration repair path is intentionally not
+        implemented here — if the provider is dropping ancestors, that's
+        a provider bug, not something to paper over silently."""
+        import os
+        if not getattr(self, "_invariant_strict", None):
+            self._invariant_strict = os.getenv("TRACE_INVARIANT_STRICT", "0") == "1"
+
+        urns_present = {n.urn for n in result.nodes}
+        # Containment edges define parent (source) → child (target). For every
+        # node, walk up via containment edges and assert each parent is present.
+        parent_of: Dict[str, str] = {}
+        for ce in result.containment_edges:
+            parent_of[ce.target_urn] = ce.source_urn
+
+        missing: List[str] = []
+        for urn in list(urns_present):
+            cur = urn
+            while cur in parent_of:
+                parent = parent_of[cur]
+                if parent not in urns_present:
+                    missing.append(parent)
+                    break
+                cur = parent
+
+        if missing:
+            msg = (
+                "trace_invariant_violation regime=%s focus=%s missing_ancestors=%d sample=%s"
+                % (regime, result.focus.urn, len(missing), missing[:5])
+            )
+            if self._invariant_strict:
+                raise AssertionError(msg)
+            logger.warning(msg)
 
     async def expand_aggregated_edge(self, req: ExpandRequest) -> TraceResult:
         resolved = await self._resolve_ontology()

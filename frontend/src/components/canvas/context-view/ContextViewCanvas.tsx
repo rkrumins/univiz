@@ -124,65 +124,96 @@ export function ContextViewCanvas({
       if (result.lineageResult) {
         const lr = result.lineageResult
 
+        // Discriminate lineage participants from containment ancestors.
+        //
+        // The backend response packs the focus's containment ancestor
+        // chain alongside the lineage participants (added by the server
+        // invariant so free-flow canvases can position deep nodes). In
+        // ContextViewCanvas that's actively harmful: the view's
+        // effectiveAssignments already place every legitimate node into
+        // its correct layer, and adding an ancestor like Snowflake
+        // (Data Platform parent of REPORTING, GOLD, …) triggers
+        // useLayerAssignment's HARD RULE — children inherit parent's
+        // layer — which collapses every descendant into Snowflake's
+        // layer (Raw, since the view didn't assign Snowflake) and
+        // destroys the original layer placement.
+        //
+        // Solution: merge only lineage participants (focus + upstream +
+        // downstream URNs). Skip nodes in result.ancestorUrns. Drop
+        // containment edges that link to skipped nodes — they'd dangle.
+        const ancestorUrns: Set<string> = result.ancestorUrns ?? new Set<string>()
+        const isLineageParticipant = (urn: string): boolean => !ancestorUrns.has(urn)
+
         // Convert GraphNode[] → LineageNode[] and add to canvas
-        const newCanvasNodes = lr.nodes.map(gn => ({
-          id: gn.urn,
-          type: 'default' as const,
-          position: { x: 0, y: 0 },
-          data: {
-            label: gn.displayName,
-            urn: gn.urn,
-            type: gn.entityType,
-            classifications: gn.tags ?? [],
-            metadata: {
-              ...gn.properties,
-              childCount: gn.childCount,
-              sourceSystem: gn.sourceSystem,
+        const newCanvasNodes = lr.nodes
+          .filter(gn => isLineageParticipant(gn.urn))
+          .map(gn => ({
+            id: gn.urn,
+            type: 'default' as const,
+            position: { x: 0, y: 0 },
+            data: {
+              label: gn.displayName,
+              urn: gn.urn,
+              type: gn.entityType,
+              classifications: gn.tags ?? [],
+              metadata: {
+                ...gn.properties,
+                childCount: gn.childCount,
+                sourceSystem: gn.sourceSystem,
+              },
             },
-          },
-        }))
+          }))
         if (newCanvasNodes.length > 0) {
           addNodes(newCanvasNodes as any[])
         }
 
-        // Convert GraphEdge[] → LineageEdge[] and add to canvas
-        const newCanvasEdges = lr.edges.map(ge => ({
-          id: ge.id,
-          source: ge.sourceUrn,
-          target: ge.targetUrn,
-          data: {
-            edgeType: ge.edgeType,
-            relationship: ge.edgeType,
-            confidence: ge.confidence,
-          },
-        }))
+        // Convert GraphEdge[] → LineageEdge[] and add to canvas. Drop
+        // edges whose endpoints are filtered ancestors (would dangle).
+        const newCanvasEdges = lr.edges
+          .filter(ge => isLineageParticipant(ge.sourceUrn) && isLineageParticipant(ge.targetUrn))
+          .map(ge => ({
+            id: ge.id,
+            source: ge.sourceUrn,
+            target: ge.targetUrn,
+            data: {
+              edgeType: ge.edgeType,
+              relationship: ge.edgeType,
+              confidence: ge.confidence,
+            },
+          }))
         if (newCanvasEdges.length > 0) {
           addEdges(newCanvasEdges as any[])
         }
 
-        // Containment edges hydrated by /trace/v2 — these are the parent→child
-        // edges that link returned trace nodes (and their ancestors) into the
-        // canvas hierarchy. Without them deep lineage URNs (e.g. column-level
-        // schemaFields whose Datasets aren't loaded) render as orphans.
-        const newContainmentEdges = (result.containmentEdges ?? []).map(ge => ({
-          id: ge.id,
-          source: ge.sourceUrn,
-          target: ge.targetUrn,
-          data: {
-            edgeType: ge.edgeType,
-            relationship: ge.edgeType,
-            confidence: ge.confidence,
-          },
-        }))
+        // Containment edges from /trace/v2: keep only those whose
+        // endpoints we actually merged. In practice this drops every
+        // edge that points at the ancestor chain — the view's existing
+        // canvas edges already wire each container into its layer-root
+        // parent (via the view's own containment hierarchy), so we
+        // don't need the backend's ancestor edges to position trace
+        // results.
+        const newContainmentEdges = (result.containmentEdges ?? [])
+          .filter(ge => isLineageParticipant(ge.sourceUrn) && isLineageParticipant(ge.targetUrn))
+          .map(ge => ({
+            id: ge.id,
+            source: ge.sourceUrn,
+            target: ge.targetUrn,
+            data: {
+              edgeType: ge.edgeType,
+              relationship: ge.edgeType,
+              confidence: ge.confidence,
+            },
+          }))
         if (newContainmentEdges.length > 0) {
           addEdges(newContainmentEdges as any[])
         }
 
-        // Auto-expand ancestors of traced nodes
+        // Auto-expand ancestors of traced nodes — but only walk
+        // parents that are themselves lineage participants. Don't
+        // expand a filtered-out ancestor (it isn't on the canvas, and
+        // expanding it would do nothing useful while leaking the
+        // ancestor URN back into expanded state).
         const nodesToExpand = new Set(expandedNodes)
-
-        // Build parent map from ALL edges (including newly added — both
-        // lineage edges and the freshly-hydrated containment edges).
         const allCurrentEdges = [...edges, ...newCanvasEdges, ...newContainmentEdges]
         const traceParentMap = new Map<string, string>()
         allCurrentEdges.forEach(e => {
@@ -191,10 +222,10 @@ export function ContextViewCanvas({
           }
         })
 
-        // For each traced node, expand its ancestors
         result.traceNodes.forEach(id => {
           let curr = traceParentMap.get(id)
           while (curr) {
+            if (ancestorUrns.has(curr)) break  // stop at filtered ancestor
             nodesToExpand.add(curr)
             curr = traceParentMap.get(curr)
           }
@@ -756,8 +787,14 @@ export function ContextViewCanvas({
   // Optimized Effect: Fetch aggregated edges only when the visible set actually changes
   // Uses expandedNodes (user-driven) as the primary trigger, not nodes array reference.
   // A 500ms debounce coalesces rapid expand/collapse actions.
+  //
+  // GATED ON !trace.isTracing: skeleton-first /trace v2 returns AGGREGATED
+  // edges at the trace's effective level, so the parallel /aggregated-lineage
+  // fetch is redundant + racy when a trace is active. In browse mode the
+  // hook fires as before.
   useEffect(() => {
     if (!showLineageFlow || nodes.length === 0) return
+    if (trace.isTracing) return
 
     const fetchDebounced = setTimeout(() => {
       const currentVisibleList = getVisibleContainerUrns()
@@ -786,7 +823,7 @@ export function ContextViewCanvas({
     }, 500) // 500ms debounce — coalesces rapid expand/collapse
 
     return () => clearTimeout(fetchDebounced)
-  }, [showLineageFlow, getVisibleContainerUrns, fetchAggregated, nodes.length, expandedNodes])
+  }, [showLineageFlow, getVisibleContainerUrns, fetchAggregated, nodes.length, expandedNodes, trace.isTracing])
 
   // === Extracted Hooks ===
 

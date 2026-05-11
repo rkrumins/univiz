@@ -92,6 +92,37 @@ def _trace_error(
 # Endpoints                                                            #
 # ------------------------------------------------------------------ #
 
+def _check_skeleton_truncation(result) -> Optional[JSONResponse]:
+    """Translate truncation reasons that should be HTTP-level signals
+    (503 for backfill-required) into structured error responses. Other
+    truncations (degree_cap, max_nodes, timeout, orphan) are non-fatal
+    and ride along inside the 200 response so the client can still render
+    a partial skeleton + a banner."""
+    meta = getattr(result, "meta", None)
+    if meta is None:
+        return None
+    if meta.truncation_reason == "levels_not_backfilled":
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "30"},
+            content={
+                "error": {
+                    "code": "levels_not_backfilled",
+                    "message": (
+                        "AGGREGATED edges are missing sourceLevel/targetLevel. "
+                        "Run backfill_aggregated_levels.py; retrying after 30s."
+                    ),
+                    "details": {},
+                },
+                "meta": {
+                    "ontologyDigest": meta.ontology_digest or "",
+                    "traceSessionId": meta.trace_session_id,
+                },
+            },
+        )
+    return None
+
+
 @router.post(
     "/trace",
     response_model=TraceResultV2,
@@ -99,15 +130,23 @@ def _trace_error(
 )
 async def post_trace(
     request: Request,
-    body: TraceRequest = Body(..., description="See plan §1.1 for the full contract."),
+    body: TraceRequest = Body(..., description="Skeleton-first trace request. Default level=0 returns the top-level Domain skeleton."),
     engine: ContextEngine = Depends(get_context_engine),
 ):
-    """Initial lineage trace projected to the resolved target level.
+    """Initial lineage trace — skeleton-first.
 
-    Server-authoritative top-level by default: a request body of just
-    ``{"urn":"urn:..."}`` resolves to ``targetLevel=0`` (topmost rollup) and
-    returns the focus + the set of top-level entities that lineage flows
-    through. Drill-down via /trace/expand.
+    Default behavior (body of just ``{"urn":"urn:..."}``) returns the
+    top-level Domain skeleton: the set of level-0 entities lineage flows
+    through, plus the focus's containment ancestor chain. The response
+    is server-authoritative; clients do not need to know the ontology
+    depth.
+
+    Drill-down via POST /trace/expand. Truncations:
+      * ``degree_cap``    — mega-node summary; meta.megaNodes populated
+      * ``max_nodes``     — node budget exceeded
+      * ``timeout``       — wall-clock exceeded
+      * ``orphan``        — no level-0 ancestor; meta.fallbackLevel set
+      * ``levels_not_backfilled`` — 503 + Retry-After (separate envelope)
     """
     try:
         result = await engine.get_trace_v2(body)
@@ -123,6 +162,10 @@ async def post_trace(
             message=str(exc),
             status_code=400,
         )
+    # Cold-start: backfill required — return 503 + Retry-After.
+    err = _check_skeleton_truncation(result)
+    if err is not None:
+        return err
     return result
 
 
@@ -133,20 +176,26 @@ async def post_trace(
 )
 async def post_trace_expand(
     request: Request,
-    body: TraceExpandRequest = Body(..., description="Drill-down delta request."),
+    body: TraceExpandRequest = Body(..., description="Drill-down delta request. Stateless: (sourceUrn, targetUrn, nextLevel) is sufficient."),
     engine: ContextEngine = Depends(get_context_engine),
 ):
-    """Drill-down delta. Decreases granularity for the expanded subtree by one
-    ontology level (or by ``newTargetLevel`` if explicit). The session-stored
-    request body provides the trace context — clients send only the URN to
-    drill into."""
+    """Drill-down delta. Stateless — the (sourceUrn, targetUrn, nextLevel)
+    triple uniquely identifies the aggregated edge being expanded. No
+    server-side session lookup; ``traceSessionId`` is informational only
+    in Phase 1.
+
+    Response invariant: every returned node's parent is either already
+    visible (from the originating /trace) or present in this response.
+    Layer assignment in the canvas depends on this — do not break it."""
     try:
         delta = await engine.get_trace_delta_v2(body)
     except KeyError:
+        # KeyError here is "source or target URN does not exist".
+        # No session expiration semantics in Phase 1 (stateless).
         return _trace_error(
-            code="trace_session_expired",
-            message="Trace session has expired; re-trace required.",
-            status_code=410,
+            code="trace_expand_not_found",
+            message="One or both expand anchors not found in the graph.",
+            status_code=404,
             trace_session_id=body.trace_session_id,
         )
     except ValueError as exc:
@@ -156,4 +205,7 @@ async def post_trace_expand(
             status_code=400,
             trace_session_id=body.trace_session_id,
         )
+    err = _check_skeleton_truncation(delta)
+    if err is not None:
+        return err
     return delta
