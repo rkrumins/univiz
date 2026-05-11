@@ -1,4 +1,4 @@
-import { Zap, Clock, Layers, Activity, AlertTriangle } from 'lucide-react'
+import { Zap, Database, Clock, Layers, Activity } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TraceMeta } from '@/services/traceApi'
 
@@ -17,8 +17,15 @@ const NEUTRAL: Tone = {
 }
 
 const REGIME_TONE: Record<string, Tone> = {
-  skeleton: { iconBg: 'bg-emerald-500', iconBorder: 'border-emerald-500' },
-  expand: { iconBg: 'bg-blue-500', iconBorder: 'border-blue-500' },
+  materialized: { iconBg: 'bg-emerald-500', iconBorder: 'border-emerald-500' },
+  runtime: { iconBg: 'bg-blue-500', iconBorder: 'border-blue-500' },
+  demoted: { iconBg: 'bg-amber-500', iconBorder: 'border-amber-500' },
+}
+
+const CACHE_TONE: Record<string, Tone> = {
+  hit: { iconBg: 'bg-emerald-500', iconBorder: 'border-emerald-500' },
+  miss: { iconBg: 'bg-amber-500', iconBorder: 'border-amber-500' },
+  bypass: NEUTRAL,
 }
 
 const LATENCY_TONE: Tone = {
@@ -26,15 +33,11 @@ const LATENCY_TONE: Tone = {
   iconBorder: 'border-accent-lineage',
 }
 
-const WARN_TONE: Tone = {
-  iconBg: 'bg-amber-500',
-  iconBorder: 'border-amber-500',
-}
-
 /**
- * Performance telemetry — neutral-glass cells with a solid accent icon on
- * the left and bright `text-ink` values on the right. Fields mirror the
- * backend `TraceMeta` model so every value is real.
+ * Performance telemetry — five neutral-glass cells, each with a solid
+ * accent icon container on the left and bright `text-ink` values on the
+ * right. High contrast in both light and dark mode; no tinted-text-on-
+ * tinted-bg fade.
  */
 export function TraceDockPerformance({ meta }: TraceDockPerformanceProps) {
   if (!meta) {
@@ -52,13 +55,19 @@ export function TraceDockPerformance({ meta }: TraceDockPerformanceProps) {
     )
   }
 
+  const hitPct = Math.round((meta.materializedHitRate ?? 0) * 100)
+  const cacheTone = CACHE_TONE[meta.cacheStatus] ?? NEUTRAL
   const regimeTone = REGIME_TONE[meta.regime] ?? NEUTRAL
-  const showFallback = meta.fallbackLevel != null && meta.fallbackLevel !== meta.effectiveLevel
-  const megaCount = meta.megaNodes?.length ?? 0
-  const truncated = meta.truncationReason != null
+  const materialisedTone: Tone = hitPct >= 80 ? REGIME_TONE.materialized : NEUTRAL
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+      <PerfCell
+        icon={<Database className="w-4 h-4" strokeWidth={2.4} />}
+        label="Cache"
+        value={meta.cacheStatus}
+        tone={cacheTone}
+      />
       <PerfCell
         icon={<Zap className="w-4 h-4" strokeWidth={2.4} />}
         label="Regime"
@@ -68,33 +77,21 @@ export function TraceDockPerformance({ meta }: TraceDockPerformanceProps) {
       <PerfCell
         icon={<Clock className="w-4 h-4" strokeWidth={2.4} />}
         label="Latency"
-        value={`${meta.cypherMs.toLocaleString()}ms`}
+        value={`${meta.queryMs.toLocaleString()}ms`}
         tone={LATENCY_TONE}
       />
       <PerfCell
         icon={<Layers className="w-4 h-4" strokeWidth={2.4} />}
-        label="Level"
-        value={`L${meta.effectiveLevel}`}
-        tone={NEUTRAL}
-        sublabel={showFallback ? `fallback from L${meta.effectiveLevel}` : undefined}
+        label="Materialised"
+        value={`${hitPct}%`}
+        tone={materialisedTone}
       />
       <PerfCell
-        icon={<Activity className="w-4 h-4" strokeWidth={2.4} />}
-        label="Nodes"
-        value={`${meta.nodeCount.toLocaleString()} · ${meta.edgeCount.toLocaleString()}e`}
+        icon={<Layers className="w-4 h-4" strokeWidth={2.4} />}
+        label="Target Level"
+        value={`L${meta.targetLevel}`}
         tone={NEUTRAL}
-      />
-      <PerfCell
-        icon={<AlertTriangle className="w-4 h-4" strokeWidth={2.4} />}
-        label={truncated || megaCount > 0 ? 'Truncated' : 'OK'}
-        value={
-          truncated
-            ? (meta.truncationReason ?? 'truncated')
-            : megaCount > 0
-              ? `${megaCount} mega-node${megaCount === 1 ? '' : 's'}`
-              : 'no caps hit'
-        }
-        tone={truncated || megaCount > 0 ? WARN_TONE : NEUTRAL}
+        sublabel={meta.targetLevelSource}
       />
     </div>
   )

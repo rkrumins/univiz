@@ -126,36 +126,17 @@ class TraceFocus(BaseModel):
 
 
 class TraceRequest(BaseModel):
-    """Skeleton-first trace request.
-
-    Default behavior (body of just ``{"urn": "urn:..."}``) returns the
-    top-level (Domain) skeleton — the set of level-0 entities that lineage
-    flows through, plus the focus's containment ancestor chain. Drill-down
-    is served by POST /trace/expand on a per-edge basis.
-
-    Defaults were tuned for the skeleton: ``level=0`` (top), unbounded
-    depth (the level-0 ontology is tiny, ~10s of nodes), and containment
-    edges on so the canvas can place every node within its hierarchy.
-    """
     urn: str
     direction: str = "both"  # upstream | downstream | both
-    upstream_depth: int = Field(99, alias="upstreamDepth", ge=0)
-    downstream_depth: int = Field(99, alias="downstreamDepth", ge=0)
-    # 0      = top-level Domain skeleton (DEFAULT — skeleton-first)
+    upstream_depth: int = Field(3, alias="upstreamDepth", ge=0)
+    downstream_depth: int = Field(3, alias="downstreamDepth", ge=0)
+    # "auto" = peer rollup (source's own hierarchy.level)
     # int    = literal level
     # str    = entity-type-id ("dataset"); resolved to that type's level
-    # "auto" = legacy peer-rollup; the engine clamps to 0 in get_trace_v2
-    level: Union[str, int] = 0
+    level: Union[str, int] = "auto"
     lineage_edge_types: Optional[List[str]] = Field(None, alias="lineageEdgeTypes")
-    # Default True: the canvas layer-assignment HARD RULE (children inherit
-    # parent's layer) needs the containment chain in the response, or deep
-    # nodes orphan. See memory/feedback_trace_v2_safety_nets.md.
-    include_containment_edges: bool = Field(True, alias="includeContainmentEdges")
+    include_containment_edges: bool = Field(False, alias="includeContainmentEdges")
     include_inherited_lineage: bool = Field(True, alias="includeInheritedLineage")
-    # Server-side invariant flag. When True (default), every returned node N
-    # has every containment ancestor of N (up to a level-0 root) present in
-    # the response. Reserved for future opt-out by non-canvas tooling.
-    include_ancestor_chain: bool = Field(True, alias="includeAncestorChain")
 
     class Config:
         populate_by_name = True
@@ -166,85 +147,13 @@ class ExpandRequest(BaseModel):
     target_urn: str = Field(alias="targetUrn")
     next_level: Union[str, int] = Field(alias="nextLevel")
     lineage_edge_types: Optional[List[str]] = Field(None, alias="lineageEdgeTypes")
-    include_containment_edges: bool = Field(True, alias="includeContainmentEdges")
-
-    class Config:
-        populate_by_name = True
-
-
-# V2 alias — distinguishes the skeleton-first expand contract from the
-# legacy ExpandRequest. Same shape today; kept as a distinct symbol so the
-# API and engine signatures advertise V2 semantics.
-class TraceExpandRequest(ExpandRequest):
-    """V2 expand: stateless drill-down. The (source_urn, target_urn, next_level)
-    triple uniquely identifies the aggregated edge being expanded. No
-    server-side session is required — the response invariant guarantees
-    that every returned node's parent is either already-visible (from the
-    originating /trace) or present in this response."""
-    # Optional informational session ID — surfaced in error envelopes for
-    # client correlation. NOT used to look up server state (no session
-    # exists in Phase 1). Reserved for Phase 2 (Team B).
-    trace_session_id: Optional[str] = Field(None, alias="traceSessionId")
-
-
-class MegaNodeInfo(BaseModel):
-    """A node whose AGGREGATED out-degree exceeded TRACE_DEGREE_CAP.
-
-    Frontend uses ``total - shown`` to render a "+N more" chip; clicking
-    the chip re-issues /trace/expand with a higher topN for that node only.
-    """
-    urn: str
-    shown: int
-    total: int
-    direction: str = "downstream"  # upstream | downstream
-
-    class Config:
-        populate_by_name = True
-
-
-class TraceMeta(BaseModel):
-    """Per-trace metadata. Surfaces what the server did, why, and any
-    truncation the client should reflect in UI."""
-    regime: str = "skeleton"  # "skeleton" | "expand"
-    effective_level: int = Field(0, alias="effectiveLevel")
-    truncation_reason: Optional[str] = Field(None, alias="truncationReason")
-    # Reasons (kept inline for grep):
-    #   "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan"
-    # Cold-start (AGGREGATED edges not level-stamped) is NOT a truncation:
-    # the trace falls back to a label-scan path and returns correct (slower)
-    # results. See `_check_levels_backfilled` in falkordb_provider.py.
-    cypher_ms: int = Field(0, alias="cypherMs")
-    node_count: int = Field(0, alias="nodeCount")
-    edge_count: int = Field(0, alias="edgeCount")
-    # When orphan-fallback fires, the highest level actually reached.
-    fallback_level: Optional[int] = Field(None, alias="fallbackLevel")
-    # One entry per node that hit TRACE_DEGREE_CAP.
-    mega_nodes: List[MegaNodeInfo] = Field(default_factory=list, alias="megaNodes")
-    # Trace session ID — opaque correlation ID, not used to look up state
-    # in Phase 1. Surfaced for telemetry and frontend correlation.
-    trace_session_id: Optional[str] = Field(None, alias="traceSessionId")
-    ontology_digest: Optional[str] = Field(None, alias="ontologyDigest")
-    # True when some AGGREGATED edges carry a stale or missing levelDigest
-    # (ontology drifted since they were stamped, or backfill hasn't run).
-    # Results are still correct — the trace falls back to the label-scan
-    # path for those edges. UI can show a "stamps refreshing…" hint and
-    # the next run of backfill_aggregated_levels.py will clear the flag.
-    stale_levels: bool = Field(False, alias="staleLevels")
+    include_containment_edges: bool = Field(False, alias="includeContainmentEdges")
 
     class Config:
         populate_by_name = True
 
 
 class TraceResult(BaseModel):
-    """Legacy trace result. New code should use TraceResultV2 which adds
-    ``meta``. The ``truncation_reason`` field on this model is preserved
-    for backward compatibility — V2 callers should read ``meta.truncationReason``.
-
-    INVARIANT (enforced by engine.get_trace_v2):
-      For every node N in ``nodes``, every containment ancestor of N up to
-      a top-level (level-0) entity is also present in ``nodes``. Required
-      by ``useLayerAssignment`` in ContextViewCanvas — do not remove.
-    """
     nodes: List[GraphNode]
     edges: List[GraphEdge]
     containment_edges: List[GraphEdge] = Field(default_factory=list, alias="containmentEdges")
@@ -255,26 +164,11 @@ class TraceResult(BaseModel):
     is_inherited: bool = Field(False, alias="isInherited")
     inherited_from_urn: Optional[str] = Field(None, alias="inheritedFromUrn")
     truncated: bool = False
-    # "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan" | None
+    # "max_nodes" | "timeout" | None
     truncation_reason: Optional[str] = Field(None, alias="truncationReason")
 
     class Config:
         populate_by_name = True
-
-
-class TraceResultV2(TraceResult):
-    """Skeleton-first trace result. Adds ``meta`` for regime/timing/truncation.
-
-    Same invariant as TraceResult: every node's containment ancestors are
-    present in ``nodes`` up to a level-0 root.
-    """
-    meta: TraceMeta = Field(default_factory=TraceMeta)
-
-
-class TraceDelta(TraceResultV2):
-    """Response to POST /trace/expand. Same shape as TraceResultV2 with
-    ``meta.regime == "expand"``. Reserved for Phase 2 (Team B) to switch
-    to a structural delta (addNodes/addEdges/removeNodes/removeEdges)."""
 
 
 class ContainmentResult(BaseModel):

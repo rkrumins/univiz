@@ -58,6 +58,18 @@ export function EntityDrawer({
 
   const isOpen = !!selectedNode
 
+  // Publish the drawer's width to canvas-body so trace dock (and any other
+  // bottom-anchored chrome) can shrink its right edge to avoid overlap.
+  // Mirror of the dock's --trace-dock-height pattern. Drawer is mounted as
+  // a sibling at document level, so we query for canvas-body directly.
+  useEffect(() => {
+    if (!isOpen) return
+    const canvasBody = document.querySelector('[data-canvas-body]') as HTMLElement | null
+    if (!canvasBody) return
+    canvasBody.style.setProperty('--entity-drawer-width', 'clamp(420px, 32vw, 560px)')
+    return () => { canvasBody.style.removeProperty('--entity-drawer-width') }
+  }, [isOpen])
+
   // Local state
   const [viewMode, setViewMode] = useState<ViewMode>('view')
   const [formData, setFormData] = useState<Record<string, any>>({})
@@ -227,17 +239,17 @@ export function EntityDrawer({
       <motion.aside
         ref={drawerRef}
         data-panel="entity-drawer"
-        initial={{ width: 0, opacity: 0 }}
-        animate={{ width: 'clamp(420px, 32vw, 560px)', opacity: 1 }}
-        exit={{ width: 0, opacity: 0 }}
+        initial={{ x: '100%', opacity: 0 }}
+        animate={{ x: 0, opacity: 1 }}
+        exit={{ x: '100%', opacity: 0 }}
         transition={{ type: 'spring', stiffness: 400, damping: 35 }}
         className={cn(
-          "relative h-full flex-shrink-0 overflow-hidden",
+          "fixed right-0 top-0 bottom-0 w-[clamp(420px,32vw,560px)] z-50",
           "bg-canvas-elevated/98 backdrop-blur-2xl",
-          "border-l border-glass-border shadow-lg shadow-black/20"
+          "border-l border-glass-border shadow-lg shadow-black/20",
+          "flex flex-col overflow-hidden"
         )}
       >
-        <div className="w-[clamp(420px,32vw,560px)] h-full flex flex-col overflow-hidden">
         {/* Header */}
         <div
           className="flex-shrink-0 p-5 border-b border-glass-border/50"
@@ -478,7 +490,6 @@ export function EntityDrawer({
               </button>
             </div>
           )}
-        </div>
         </div>
       </motion.aside>
     </AnimatePresence>

@@ -1,15 +1,11 @@
 """Graph endpoints — API v2.
 
-Smart top-level lineage trace + drill-down delta endpoints. The full
-contract lives in:
-  - ``TraceRequest`` / ``TraceResultV2`` / ``TraceMeta`` in
-    ``backend/common/models/graph.py``
-  - ``ContextEngine.get_trace_v2`` / ``get_trace_delta_v2`` in
-    ``backend/app/services/context_engine.py``
+Smart top-level lineage trace + drill-down delta endpoints. See plan
+i-want-you-to-effervescent-glacier.md §1.1 for the full contract.
 
 Two endpoints:
   POST /api/v2/{ws_id}/graph/trace         — initial trace, projected to target level
-  POST /api/v2/{ws_id}/graph/trace/expand  — drill-down delta (stateless)
+  POST /api/v2/{ws_id}/graph/trace/expand  — drill-down delta from a session
 
 Default behavior matches the user requirement: a trace from any node returns
 top-level (level 0) rollup by default; drill-down uses /trace/expand to descend
@@ -66,7 +62,7 @@ async def get_context_engine(
 
 
 # ------------------------------------------------------------------ #
-# Error envelope helper                                                #
+# Error envelope helper (plan §1.1)                                   #
 # ------------------------------------------------------------------ #
 
 def _trace_error(
@@ -96,7 +92,6 @@ def _trace_error(
 # Endpoints                                                            #
 # ------------------------------------------------------------------ #
 
-
 @router.post(
     "/trace",
     response_model=TraceResultV2,
@@ -104,28 +99,15 @@ def _trace_error(
 )
 async def post_trace(
     request: Request,
-    body: TraceRequest = Body(..., description="Skeleton-first trace request. Default level=0 returns the top-level Domain skeleton."),
+    body: TraceRequest = Body(..., description="See plan §1.1 for the full contract."),
     engine: ContextEngine = Depends(get_context_engine),
 ):
-    """Initial lineage trace — skeleton-first.
+    """Initial lineage trace projected to the resolved target level.
 
-    Default behavior (body of just ``{"urn":"urn:..."}``) returns the
-    top-level Domain skeleton: the set of level-0 entities lineage flows
-    through, plus the focus's containment ancestor chain. The response
-    is server-authoritative; clients do not need to know the ontology
-    depth.
-
-    Drill-down via POST /trace/expand. Truncations (all non-fatal — they
-    ride along inside the 200 response so the client can render a partial
-    skeleton + a banner):
-      * ``degree_cap``    — mega-node summary; meta.megaNodes populated
-      * ``max_nodes``     — node budget exceeded
-      * ``timeout``       — wall-clock exceeded
-      * ``orphan``        — no level-0 ancestor; meta.fallbackLevel set
-
-    Cold-start (AGGREGATED edges not level-stamped): trace still returns 200
-    with correct results via a legacy label-scan fallback. Run
-    ``backfill_aggregated_levels.py`` to restore the fast path.
+    Server-authoritative top-level by default: a request body of just
+    ``{"urn":"urn:..."}`` resolves to ``targetLevel=0`` (topmost rollup) and
+    returns the focus + the set of top-level entities that lineage flows
+    through. Drill-down via /trace/expand.
     """
     try:
         result = await engine.get_trace_v2(body)
@@ -151,26 +133,20 @@ async def post_trace(
 )
 async def post_trace_expand(
     request: Request,
-    body: TraceExpandRequest = Body(..., description="Drill-down delta request. Stateless: (sourceUrn, targetUrn, nextLevel) is sufficient."),
+    body: TraceExpandRequest = Body(..., description="Drill-down delta request."),
     engine: ContextEngine = Depends(get_context_engine),
 ):
-    """Drill-down delta. Stateless — the (sourceUrn, targetUrn, nextLevel)
-    triple uniquely identifies the aggregated edge being expanded. No
-    server-side session lookup; ``traceSessionId`` is informational only
-    in Phase 1.
-
-    Response invariant: every returned node's parent is either already
-    visible (from the originating /trace) or present in this response.
-    Layer assignment in the canvas depends on this — do not break it."""
+    """Drill-down delta. Decreases granularity for the expanded subtree by one
+    ontology level (or by ``newTargetLevel`` if explicit). The session-stored
+    request body provides the trace context — clients send only the URN to
+    drill into."""
     try:
         delta = await engine.get_trace_delta_v2(body)
     except KeyError:
-        # KeyError here is "source or target URN does not exist".
-        # No session expiration semantics in Phase 1 (stateless).
         return _trace_error(
-            code="trace_expand_not_found",
-            message="One or both expand anchors not found in the graph.",
-            status_code=404,
+            code="trace_session_expired",
+            message="Trace session has expired; re-trace required.",
+            status_code=410,
             trace_session_id=body.trace_session_id,
         )
     except ValueError as exc:

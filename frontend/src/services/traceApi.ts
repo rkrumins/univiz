@@ -4,21 +4,21 @@
  * Wire format is camelCase end-to-end (the backend uses
  * `populate_by_name=True` + Field aliases to emit camelCase to clients).
  * These types match the Pydantic models in
- * `backend/common/models/graph.py` — TraceRequest, TraceResultV2,
- * TraceMeta, TraceExpandRequest, TraceDelta — at the field level.
+ * `backend/common/models/graph.py` (TraceRequest, TraceResultV2, TraceData,
+ * TraceMeta, TraceEdge, TraceExpandRequest, TraceDelta, TraceDeltaData,
+ * TraceErrorBody) verified at the field level.
  *
  * Endpoints:
  *   POST /api/v2/{ws_id}/graph/trace        — initial trace
  *   POST /api/v2/{ws_id}/graph/trace/expand — drill-down delta
  *
- * Both return a flat TraceResultV2 / TraceDelta shape (TraceResult fields
- * inline + a `meta` sidecar). On 4xx/5xx the body is `{error: {code,
- * message, details}, meta: {...}}` and is translated into a TraceApiError
- * so callers can branch on `code`.
+ * Both return a `{data, meta}` envelope on success and `{error: {code,
+ * message, details}, meta}` on 4xx/5xx. Non-2xx responses are translated
+ * into a `TraceApiError` so callers can branch on `code`.
  */
 
 import { fetchWithTimeout } from './fetchWithTimeout'
-import type { GraphNode, GraphEdge } from '@/providers/GraphDataProvider'
+import type { GraphNode } from '@/providers/GraphDataProvider'
 
 // ============================================
 // Wire types — camelCase, matching backend aliases
@@ -26,191 +26,47 @@ import type { GraphNode, GraphEdge } from '@/providers/GraphDataProvider'
 
 export type TraceDirection = 'upstream' | 'downstream' | 'both'
 
-/**
- * Server-side trace regime. "skeleton" is the initial /trace call;
- * "expand" is the response to /trace/expand drill-down.
- *
- * The remaining members ("materialized"/"runtime"/"demoted") describe a
- * Phase 1.5 regime that was never emitted by the backend; kept in the
- * union so the dead `useLineageTrace` test compiles.
- */
-export type TraceRegime =
-  | 'skeleton'
-  | 'expand'
-  /** @deprecated Never emitted by backend. */
-  | 'materialized'
-  /** @deprecated Never emitted by backend. */
-  | 'runtime'
-  /** @deprecated Never emitted by backend. */
-  | 'demoted'
+export type TargetLevelMode =
+  | 'top'
+  | 'top_minus_1'
+  | 'top_minus_2'
+  | 'focus_level'
+  | 'focus_minus_1'
+  | 'focus_plus_1'
+
+export type TraceRegime = 'materialized' | 'runtime' | 'demoted'
+
+export type TargetLevelSource = 'request' | 'request_mode' | 'workspace' | 'ontology_default'
 
 /**
  * Initial trace request body. The only required field is `urn`; all other
  * fields fall back to server / workspace / ontology defaults via the
- * resolution chain in the backend `ContextEngine.get_trace_v2`.
- *
- * `level` accepts:
- *   - 0 (DEFAULT) — top-level Domain skeleton
- *   - integer N — literal ontology level
- *   - entity-type-id string — resolved to that type's level server-side
- *   - "auto" — clamped to 0 in V2
+ * priority chain documented in plan §1.5.
  */
 export interface TraceRequest {
   urn: string
   direction?: TraceDirection
   upstreamDepth?: number
   downstreamDepth?: number
-  level?: number | string
+  /** Absolute ontology level. Mutually exclusive with `targetLevelMode`. */
+  targetLevel?: number | null
+  /** Semantic shortcut. Mutually exclusive with `targetLevel`. */
+  targetLevelMode?: TargetLevelMode | null
+  /** Whitelist of lineage edge types to include. `null` / omitted = all ontology lineage types. */
   lineageEdgeTypes?: string[] | null
-  includeContainmentEdges?: boolean
-  includeInheritedLineage?: boolean
-  includeAncestorChain?: boolean
-}
-
-/** Focus of a trace — the URN the user clicked, with its resolved level
- *  and entity type. */
-export interface TraceFocus {
-  urn: string
-  level: number
-  entityType: string
-}
-
-/** A node whose AGGREGATED out-degree exceeded TRACE_DEGREE_CAP. The
- *  frontend uses `total - shown` to render a "+N more" chip. */
-export interface MegaNodeInfo {
-  urn: string
-  shown: number
-  total: number
-  direction: 'upstream' | 'downstream'
+  /** Whitelist of containment edge types. `null` / omitted = ontology default. UI passes null. */
+  containmentEdgeTypes?: string[] | null
+  includeContainment?: boolean
+  limit?: number
+  cursor?: string | null
+  fields?: 'default' | 'full'
 }
 
 /**
- * Sidecar metadata. Mirrors backend `TraceMeta` field-for-field.
- *
- * The block at the bottom (`cacheStatus`, `targetLevel`, etc.) describes a
- * Phase 1.5 envelope the backend never shipped — kept as optional/deprecated
- * so the dead `useLineageTrace.ts` module still compiles. They are
- * `undefined` at runtime.
+ * Edge in a trace response. Extends GraphEdge with embedded aggregation
+ * metadata (no separate edgeMeta map). Containment edges are emitted
+ * inline and distinguished by `isContainment=true`.
  */
-export interface TraceMeta {
-  regime: TraceRegime
-  effectiveLevel: number
-  /** "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan" | null */
-  truncationReason?: string | null
-  cypherMs: number
-  nodeCount: number
-  edgeCount: number
-  /** Set when orphan-fallback fires — the highest level actually reached. */
-  fallbackLevel?: number | null
-  megaNodes: MegaNodeInfo[]
-  /** Informational correlation ID; not used to look up server state. */
-  traceSessionId?: string | null
-  ontologyDigest?: string | null
-
-  // === Legacy (Phase 1.5 envelope; never set by backend) ===
-  /** @deprecated Never set by backend; reads as undefined. */
-  cacheStatus?: string
-  /** @deprecated Never set by backend. Use `effectiveLevel`. */
-  targetLevel?: number
-  /** @deprecated Never set by backend. */
-  targetLevelSource?: TargetLevelSource
-  /** @deprecated Never set by backend. Use `cypherMs`. */
-  queryMs?: number
-  /** @deprecated Never set by backend. */
-  materializedHitRate?: number
-  /** @deprecated Never set by backend. */
-  warnings?: string[]
-  /** @deprecated Never set by backend. */
-  notices?: string[]
-}
-
-/**
- * Canonical envelope returned by POST /trace. FLAT shape — TraceResult
- * fields inline + a `meta` sidecar. Matches backend `TraceResultV2`.
- *
- * The optional `data` field is a Phase 1.5 wrapper that was never delivered
- * by the backend; it's typed only so `useLineageTrace.ts` (dead code)
- * compiles.
- */
-export interface TraceResultV2 {
-  nodes: GraphNode[]
-  edges: GraphEdge[]
-  containmentEdges: GraphEdge[]
-  upstreamUrns: string[]
-  downstreamUrns: string[]
-  focus: TraceFocus
-  effectiveLevel: number
-  isInherited: boolean
-  inheritedFromUrn?: string | null
-  truncated: boolean
-  /** "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan" | null */
-  truncationReason?: string | null
-  meta: TraceMeta
-
-  /**
-   * @deprecated Phase 1.5 envelope; never populated at runtime. Typed as
-   * required so the dead `useLineageTrace.ts` module can dereference it
-   * without strict-null-check errors. At runtime this field is undefined.
-   */
-  data: TraceData
-}
-
-/**
- * Request body for POST /trace/expand. Stateless — `traceSessionId` is
- * informational only. The `expandUrn`/`depthDelta`/`newTargetLevel` fields
- * describe a Phase 1.5 surface that was never wired; retained as optional
- * so dead `useLineageTrace.ts` keeps compiling.
- */
-export interface TraceExpandRequest {
-  sourceUrn?: string
-  targetUrn?: string
-  nextLevel?: number | string
-  lineageEdgeTypes?: string[] | null
-  includeContainmentEdges?: boolean
-  traceSessionId?: string | null
-
-  /** @deprecated Phase 1.5; never honored. */
-  expandUrn?: string
-  /** @deprecated Phase 1.5; never honored. */
-  depthDelta?: number
-  /** @deprecated Phase 1.5; never honored. */
-  newTargetLevel?: number
-}
-
-/**
- * Response to POST /trace/expand. Same shape as TraceResultV2 with
- * `meta.regime == "expand"`. Additionally carries an optional `data`
- * (Phase 1.5; not used) for the dead-code module.
- */
-export interface TraceDelta extends Omit<TraceResultV2, 'data'> {
-  /**
-   * @deprecated Phase 1.5 delta wrapper; never populated at runtime. Typed
-   * as required (with both TraceData and TraceDeltaData fields) so the
-   * dead `useLineageTrace.ts` module's `applyDelta` compiles.
-   */
-  data: TraceData & TraceDeltaData
-}
-
-export interface TraceErrorBody {
-  code: string
-  message: string
-  details?: Record<string, unknown>
-}
-
-/** Envelope returned for any 4xx/5xx response from trace endpoints. */
-export interface TraceErrorEnvelope {
-  error: TraceErrorBody
-  meta?: Record<string, unknown>
-}
-
-// ============================================
-// Legacy types — Phase 1.5 envelope that never shipped.
-// Retained ONLY so `useLineageTrace.ts` (dead code, zero production
-// consumers) keeps compiling. Do not use in new code. Slated for
-// deletion together with `useLineageTrace.ts`.
-// ============================================
-
-/** @deprecated Phase 1.5 envelope; the wire shape is flat. Use TraceResultV2. */
 export interface TraceEdge {
   id: string
   sourceUrn: string
@@ -227,7 +83,7 @@ export interface TraceEdge {
   isContainment: boolean
 }
 
-/** @deprecated Phase 1.5 envelope; the wire shape is flat. */
+/** Top-level data block of a TraceResultV2 envelope. */
 export interface TraceData {
   focusUrn: string
   focusLevel: number
@@ -237,13 +93,42 @@ export interface TraceData {
   upstreamUrns: string[]
   downstreamUrns: string[]
   expandableUrns: string[]
+  /** urn -> child count at next-deeper ontology level; drives the +N badge. */
   aggregatedChildCount: Record<string, number>
+  /** Ancestors whose lineage was inherited (ordered nearest-first). Empty when not inherited. */
   inheritedFrom: string[]
   hasMore: boolean
   nextCursor: string | null
 }
 
-/** @deprecated Phase 1.5 envelope; the wire shape is flat. */
+/** Sidecar metadata for trace responses. */
+export interface TraceMeta {
+  regime: TraceRegime
+  /** 'hit' | 'miss' | 'bypass' */
+  cacheStatus: string
+  ontologyDigest: string
+  traceSessionId: string | null
+  targetLevel: number
+  targetLevelSource: TargetLevelSource
+  queryMs: number
+  materializedHitRate: number
+  warnings: string[]
+  notices: string[]
+}
+
+/** Canonical envelope returned by POST /trace. */
+export interface TraceResultV2 {
+  data: TraceData
+  meta: TraceMeta
+}
+
+export interface TraceExpandRequest {
+  traceSessionId: string
+  expandUrn: string
+  depthDelta?: number
+  newTargetLevel?: number
+}
+
 export interface TraceDeltaData {
   addedNodes: GraphNode[]
   removedEdges: string[]
@@ -252,17 +137,22 @@ export interface TraceDeltaData {
   aggregatedChildCount: Record<string, number>
 }
 
-/** @deprecated Never delivered by the backend. */
-export type TargetLevelMode =
-  | 'top'
-  | 'top_minus_1'
-  | 'top_minus_2'
-  | 'focus_level'
-  | 'focus_minus_1'
-  | 'focus_plus_1'
+export interface TraceDelta {
+  data: TraceDeltaData
+  meta: TraceMeta
+}
 
-/** @deprecated Never delivered by the backend. */
-export type TargetLevelSource = 'request' | 'request_mode' | 'workspace' | 'ontology_default'
+export interface TraceErrorBody {
+  code: string
+  message: string
+  details?: Record<string, unknown>
+}
+
+/** Envelope returned for any 4xx/5xx response from trace endpoints. */
+export interface TraceErrorEnvelope {
+  error: TraceErrorBody
+  meta?: Record<string, unknown>
+}
 
 // ============================================
 // Error type
