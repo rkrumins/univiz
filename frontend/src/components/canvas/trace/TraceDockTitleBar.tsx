@@ -114,23 +114,29 @@ export function TraceDockTitleBar({
       onFocus={onContainerFocus}
       data-canvas-interactive
       className={cn(
-        'relative flex items-center gap-3.5 px-5 h-16 shrink-0',
+        'relative flex items-center gap-3 px-5 h-14 shrink-0',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40 focus-visible:ring-inset',
       )}
     >
       <span className="sr-only" aria-live="polite" aria-atomic="true">{liveMsg}</span>
 
+      {/* Subtle ambient gradient overlay — same idiom as ContextViewHeader */}
+      <div
+        className="absolute inset-0 bg-gradient-to-r from-accent-lineage/[0.04] via-transparent to-purple-500/[0.03] pointer-events-none"
+        aria-hidden
+      />
+
       {/* Section identity — solid accent badge for high-contrast readability */}
       <div className="relative flex items-center gap-2.5 shrink-0">
         <div
           className={cn(
-            'relative w-10 h-10 rounded-xl flex items-center justify-center shrink-0',
+            'relative w-9 h-9 rounded-xl flex items-center justify-center shrink-0',
             'bg-gradient-to-br from-accent-lineage to-purple-600',
             'border border-accent-lineage/60',
             'shadow-lg shadow-accent-lineage/30',
           )}
         >
-          <Workflow className="w-5 h-5 text-white drop-shadow-[0_0_4px_rgba(168,85,247,0.6)]" strokeWidth={2.4} aria-hidden />
+          <Workflow className="w-4 h-4 text-white drop-shadow-[0_0_4px_rgba(168,85,247,0.6)]" strokeWidth={2.4} aria-hidden />
           {/* Pulsing live indicator — anchored to the badge bottom-right */}
           <span
             className="absolute -bottom-0.5 -right-0.5 inline-flex w-2.5 h-2.5"
@@ -152,14 +158,14 @@ export function TraceDockTitleBar({
 
       {/* Vertical hairline divider — matches ContextViewHeader idiom */}
       <span
-        className="w-px h-8 bg-gradient-to-b from-transparent via-white/15 to-transparent shrink-0"
+        className="w-px h-7 bg-gradient-to-b from-transparent via-white/10 to-transparent shrink-0"
         aria-hidden
       />
 
       {/* Focus chip — neutral glass with bright name + accent micro-pills */}
       <div
         className={cn(
-          'flex items-center gap-2 px-3 h-9 rounded-xl min-w-0 shrink',
+          'flex items-center gap-2 px-2.5 h-8 rounded-xl min-w-0 shrink',
           'bg-white/[0.06] border border-white/[0.12]',
         )}
         title={focusName}
@@ -180,31 +186,31 @@ export function TraceDockTitleBar({
       </div>
 
       {/* Counts — neutral glass pills with accent icon + bright value */}
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-1.5 shrink-0">
         <span
           className={cn(
-            'inline-flex items-center gap-1.5 px-2.5 h-9 rounded-xl',
+            'inline-flex items-center gap-1.5 px-2 h-7 rounded-lg',
             'bg-white/[0.06] border border-blue-400/40',
           )}
           aria-label={`${trace.upstreamCount} upstream nodes`}
         >
-          <ArrowUp className="w-4 h-4 text-blue-600 dark:text-blue-400" strokeWidth={2.4} aria-hidden />
-          <span className="text-sm font-bold tabular-nums text-ink">{upDisplay.toLocaleString()}</span>
+          <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" strokeWidth={2.4} aria-hidden />
+          <span className="text-xs font-bold tabular-nums text-ink">{upDisplay.toLocaleString()}</span>
         </span>
         <span
           className={cn(
-            'inline-flex items-center gap-1.5 px-2.5 h-9 rounded-xl',
+            'inline-flex items-center gap-1.5 px-2 h-7 rounded-lg',
             'bg-white/[0.06] border border-emerald-400/40',
           )}
           aria-label={`${trace.downstreamCount} downstream nodes`}
         >
-          <ArrowDown className="w-4 h-4 text-emerald-600 dark:text-emerald-400" strokeWidth={2.4} aria-hidden />
-          <span className="text-sm font-bold tabular-nums text-ink">{downDisplay.toLocaleString()}</span>
+          <ArrowDown className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" strokeWidth={2.4} aria-hidden />
+          <span className="text-xs font-bold tabular-nums text-ink">{downDisplay.toLocaleString()}</span>
         </span>
       </div>
 
       <span
-        className="w-px h-8 bg-gradient-to-b from-transparent via-white/15 to-transparent shrink-0"
+        className="w-px h-7 bg-gradient-to-b from-transparent via-white/10 to-transparent shrink-0"
         aria-hidden
       />
 
@@ -214,7 +220,7 @@ export function TraceDockTitleBar({
           role="radiogroup"
           aria-label="Trace direction visibility"
           className={cn(
-            'inline-flex items-center rounded-xl p-1 gap-0.5 shrink-0 h-9',
+            'inline-flex items-center rounded-xl p-1 gap-0.5 shrink-0',
             'bg-white/[0.06] border border-white/[0.12]',
           )}
         >
@@ -253,7 +259,7 @@ export function TraceDockTitleBar({
             aria-label={`Recent trace history, ${recentCount} ${recentCount === 1 ? 'entry' : 'entries'}`}
             onClick={() => setRecentOpen(v => !v)}
             className={cn(
-              'inline-flex items-center gap-2 px-3.5 h-9 rounded-xl text-sm font-semibold',
+              'inline-flex items-center gap-1.5 px-3 h-8 rounded-xl text-xs font-semibold',
               'transition-all duration-200',
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
               recentOpen
@@ -298,7 +304,7 @@ export function TraceDockTitleBar({
         aria-keyshortcuts="Control+I Meta+I"
         onClick={onToggleExpanded}
         className={cn(
-          'inline-flex items-center gap-2 px-3.5 h-9 rounded-xl text-sm font-semibold shrink-0',
+          'inline-flex items-center gap-1.5 px-3 h-8 rounded-xl text-xs font-semibold shrink-0',
           'transition-all duration-200',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
           expanded
@@ -320,7 +326,7 @@ export function TraceDockTitleBar({
         aria-label="Exit trace"
         onClick={onExit}
         className={cn(
-          'inline-flex items-center justify-center w-9 h-9 rounded-xl shrink-0',
+          'inline-flex items-center justify-center w-8 h-8 rounded-xl shrink-0',
           'bg-white/[0.08] border border-white/[0.15] text-ink',
           'hover:bg-rose-500 hover:text-white hover:border-rose-500 hover:shadow-lg hover:shadow-rose-500/30',
           'transition-all duration-200',
@@ -351,7 +357,7 @@ function DirRadio({ checked, onSelect, icon, label }: DirRadioProps) {
       title={label}
       onClick={onSelect}
       className={cn(
-        'relative inline-flex items-center justify-center w-10 h-full rounded-lg transition-colors duration-150',
+        'relative inline-flex items-center justify-center w-9 h-7 rounded-lg transition-colors duration-150',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-lineage/40',
         checked
           ? 'text-white'

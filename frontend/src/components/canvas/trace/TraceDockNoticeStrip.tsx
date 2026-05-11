@@ -10,31 +10,6 @@ export interface TraceDockNoticeStripProps {
   onJumpToUrn: (urn: string) => void
 }
 
-// Smallest node count we consider a "meaningfully truncated" trace. Below
-// this, the backend's `truncated=true` is almost certainly a false alarm
-// (premature timeout firing on a tiny result the user can see in full), so
-// we silently suppress the notice rather than nagging the user. Pegged well
-// below the 2000-node default cap so legitimate size-cap truncations still
-// surface via the "max_nodes" branch even if their final count varies.
-export const TRUNCATION_MIN_NODES = 200
-
-/**
- * True when the result was meaningfully cut short and the user should see
- * the warning. Size-cap (`max_nodes`) truncations always surface because
- * they're definitionally large; timeout truncations only surface when the
- * returned node count is substantial, which keeps false positives off the
- * UI for tiny traces.
- */
-export function shouldShowTruncationNotice(result: TraceResult | null): boolean {
-  if (!result?.truncated) return false
-  if (result.truncationReason === 'max_nodes') return true
-  if (result.truncationReason === 'timeout') {
-    return result.traceNodes.size >= TRUNCATION_MIN_NODES
-  }
-  // Unknown reason — be conservative and only show for substantial results.
-  return result.traceNodes.size >= TRUNCATION_MIN_NODES
-}
-
 /**
  * Inline notice — only renders when something is worth saying. Premium
  * gradient pill-card with a glowing icon container and a gradient action
@@ -67,7 +42,7 @@ export function TraceDockNoticeStrip({
     )
   }
 
-  if (shouldShowTruncationNotice(result)) {
+  if (result.truncated) {
     const total = result.traceNodes.size
     const reason = result.truncationReason === 'timeout'
       ? 'the trace timed out'

@@ -175,12 +175,12 @@ const TRACE_HISTORY_LIMIT = 5
 // ============================================
 
 const DEFAULT_CONFIG: TraceConfig = {
-    // Skeleton-first defaults. At level=0 (top-level Domain rollup), the
-    // ontology bounds the result set to ~10s of nodes — depth=99 is "as
-    // deep as the rollup extends", not "walk 99 hops of raw lineage".
-    // Backend hard caps via TRACE_MAX_NODES + TRACE_TIMEOUT_MS.
-    upstreamDepth: 99,
-    downstreamDepth: 99,
+    // Default hop depth — set high enough that a typical end-to-end pipeline
+    // (raw → staging → refined → consumption → reporting) plus a couple of
+    // intermediate transforms doesn't get truncated. Backend caps further
+    // if needed.
+    upstreamDepth: 25,
+    downstreamDepth: 25,
     includeColumnLineage: true,
     excludeContainmentEdges: true,
     includeInheritedLineage: true,
@@ -188,15 +188,12 @@ const DEFAULT_CONFIG: TraceConfig = {
     pathOnly: false,
     autoSyncToStore: true,
     lineageEdgeTypes: [],  // Empty = use all ontology-classified lineage types
-    // level=0 returns the top-level Domain skeleton — server-authoritative.
-    // Drill-down via /trace/expand on a per-aggregated-edge basis. Use
-    // explicit ints (1, 2, …) to skip the skeleton and trace at a deeper
-    // rollup; 'auto' is treated as 0 by the V2 server.
-    level: 0,
+    level: 'auto',         // v2: peer rollup at source's own hierarchy.level
     // ContextView positions every node by walking containment from a layer
-    // root to its descendants. The skeleton response always carries the
-    // focus's ancestor chain — required by useLayerAssignment's HARD RULE
-    // (containment children inherit parent's layer). Do not flip to false.
+    // root to its descendants. /trace/v2 returning lineage participants but
+    // NOT their containment chains makes deep participants (e.g. schemaField
+    // upstream of focus) orphans — invisible in the canvas. Default to true
+    // so trace results are always positionable in the hierarchy.
     includeContainmentEdges: true,
     granularity: 'column', // legacy /trace path only — superseded by `level` for v2
 }

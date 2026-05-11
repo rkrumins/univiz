@@ -92,7 +92,7 @@ export function CanvasRouter({ className, layoutType: layoutTypeProp }: CanvasRo
         <ProviderUnavailableOverlay message={hydrationError} />
       )}
 
-      {activeView && layoutType !== 'graph' && layoutType !== 'reference' && (
+      {activeView && layoutType !== 'graph' && (
         <div className="absolute top-4 left-4 z-10 pointer-events-none">
           <ViewBadge
             name={activeView.name}

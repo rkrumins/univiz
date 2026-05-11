@@ -214,45 +214,12 @@ class TraceOrchestrator:
         truncation_reason: Optional[str] = None
 
         # 4. Per-hop parallel expansion.
-        start_monotonic = deadline - (timeout_ms / 1000.0)
         for hop in range(max(upstream_depth, downstream_depth)):
             if time.monotonic() > deadline:
                 truncation_reason = "timeout"
-                logger.warning(
-                    "trace_at_level truncated",
-                    extra={
-                        "reason": "timeout",
-                        "focus_urn": urn,
-                        "level": level,
-                        "hop": hop,
-                        "nodes_collected": len(nodes_by_urn),
-                        "edges_collected": len(edges_by_id),
-                        "elapsed_ms": int((time.monotonic() - start_monotonic) * 1000),
-                        "max_nodes": max_nodes,
-                        "timeout_ms": timeout_ms,
-                        "upstream_depth": upstream_depth,
-                        "downstream_depth": downstream_depth,
-                    },
-                )
                 break
             if len(nodes_by_urn) >= max_nodes:
                 truncation_reason = "max_nodes"
-                logger.warning(
-                    "trace_at_level truncated",
-                    extra={
-                        "reason": "max_nodes",
-                        "focus_urn": urn,
-                        "level": level,
-                        "hop": hop,
-                        "nodes_collected": len(nodes_by_urn),
-                        "edges_collected": len(edges_by_id),
-                        "elapsed_ms": int((time.monotonic() - start_monotonic) * 1000),
-                        "max_nodes": max_nodes,
-                        "timeout_ms": timeout_ms,
-                        "upstream_depth": upstream_depth,
-                        "downstream_depth": downstream_depth,
-                    },
-                )
                 break
             budget = max_nodes - len(nodes_by_urn)
 
