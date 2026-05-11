@@ -1086,6 +1086,11 @@ export function ContextViewCanvas({
   // Idempotent: `trace.expandAggregatedEdge` caches results by
   // `${s}->${t}@${nextLevel}`, so re-expanding a previously-drilled node
   // is a no-op against the network.
+  //
+  // Concurrency cap (AUTO_DRILL_CONCURRENCY): a hub node may have dozens of
+  // incident AGGREGATED edges. Firing them all in parallel hammers the
+  // backend; serializing all of them makes the wait visible. 6 keeps the
+  // network busy without overwhelming the trace endpoint.
   const autoDrillOnExpand = useCallback(async (nodeId: string) => {
     if (!trace.isTracing) return
     const node = nodes.find(n => n.id === nodeId)
@@ -1106,13 +1111,19 @@ export function ContextViewCanvas({
     })
     if (incidentEdges.length === 0) return
 
-    // Drill all incident edges in parallel; merge each result.
-    const results = await Promise.all(incidentEdges.map(edge => {
-      const s = (edge as any).source ?? (edge as any).sourceUrn
-      const t = (edge as any).target ?? (edge as any).targetUrn
-      return trace.expandAggregatedEdge(s, t, currentLevel)
-    }))
-    results.forEach(r => { if (r) mergeDrilldownIntoCanvas(r) })
+    const AUTO_DRILL_CONCURRENCY = 6
+    let cursor = 0
+    const drillOne = async () => {
+      while (cursor < incidentEdges.length) {
+        const edge = incidentEdges[cursor++]
+        const s = (edge as any).source ?? (edge as any).sourceUrn
+        const t = (edge as any).target ?? (edge as any).targetUrn
+        const r = await trace.expandAggregatedEdge(s, t, currentLevel)
+        if (r) mergeDrilldownIntoCanvas(r)
+      }
+    }
+    const workerCount = Math.min(AUTO_DRILL_CONCURRENCY, incidentEdges.length)
+    await Promise.all(Array.from({ length: workerCount }, drillOne))
   }, [trace, nodes, edges, entityTypeLevels, mergeDrilldownIntoCanvas])
 
   const toggleNode = useCallback(async (nodeId: string) => {

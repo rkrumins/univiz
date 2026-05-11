@@ -483,14 +483,26 @@ class FalkorDBProvider(GraphDataProvider):
             except Exception:
                 pass  # Older FalkorDB or already exists — ignore
 
-        # Cold-start check: are AGGREGATED edges level-stamped? Without this
-        # the level-pair fast path falls back to the legacy label-scan
-        # codepath which is the timeout source on fresh workspaces. We
-        # cache the answer per-provider; the cold-start endpoint
-        # (`/trace`) refuses with 503 + `truncationReason=levels_not_backfilled`
-        # when this is False. Run async without blocking init.
+        # AGGREGATED edge level-stamping state.
+        #
+        # The probe runs lazily — it needs the level map (and its digest)
+        # before it can ask "are stamps fresh?". `set_entity_type_levels`
+        # triggers the probe whenever the digest changes. Until then,
+        # ``_levels_backfilled`` stays None and the trace fast path uses
+        # the label-scan fallback (correct, slower).
+        #
+        # ``_level_digest`` is the SHA-256 of the entity_type→level map
+        # currently injected onto this provider. AGGREGATED edges carry
+        # ``r.levelDigest`` set to whatever digest was current when they
+        # were stamped; a mismatch means the ontology drifted and stamps
+        # need a re-run of backfill_aggregated_levels.py.
+        #
+        # ``_levels_warning_for_digest`` throttles the "edges not stamped"
+        # warning to at most one log line per (provider lifetime, digest)
+        # pair, so per-request probes don't spam.
         self._levels_backfilled: Optional[bool] = None
-        asyncio.create_task(self._check_levels_backfilled())
+        self._level_digest: Optional[str] = None
+        self._levels_warning_for_digest: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -527,8 +539,30 @@ class FalkorDBProvider(GraphDataProvider):
         (populates ``n.level`` on upsert for the level index) and at read
         time (resolves levels via ``labels(n)[0]`` so trace queries work
         even when ``n.level`` hasn't been backfilled on existing nodes).
+
+        Also computes a ``levelDigest`` over the map. AGGREGATED edges
+        stamp this digest at materialization time; the cold-start probe
+        compares stamped digests to the current one to decide whether
+        backfill is needed. When the digest changes (ontology edited),
+        we re-trigger the probe so the staleness state refreshes without
+        a process restart.
         """
+        from backend.app.services.ontology_levels import compute_level_digest
+
         self._entity_type_levels: Dict[str, int] = dict(mapping)
+        new_digest = compute_level_digest(self._entity_type_levels)
+
+        if new_digest != self._level_digest:
+            self._level_digest = new_digest
+            # New digest → re-probe in the background. Don't block here;
+            # the probe runs against the graph and we don't want
+            # ontology resolution to wait for it.
+            try:
+                asyncio.create_task(self._check_levels_backfilled())
+            except RuntimeError:
+                # No running loop (rare — usually only in synchronous
+                # test paths). The probe will run on first trace.
+                pass
 
     def _get_node_level(self, entity_type: Any) -> Optional[int]:
         """Resolve a node's hierarchy level from the cached mapping. Returns
@@ -548,33 +582,53 @@ class FalkorDBProvider(GraphDataProvider):
     TRACE_DEGREE_CAP: int = int(os.getenv("TRACE_DEGREE_CAP", "5000"))
 
     async def _check_levels_backfilled(self) -> None:
-        """Cold-start probe: are :AGGREGATED edges level-stamped?
+        """Probe: are :AGGREGATED edges stamped with the CURRENT level digest?
 
-        Sets ``self._levels_backfilled`` to ``True | False``. The trace
-        hot path refuses with ``truncationReason=levels_not_backfilled``
-        when False; the API surfaces this as 503 + ``Retry-After``.
+        Sets ``self._levels_backfilled`` to ``True | False``:
+          - True  → all edges carry ``r.levelDigest == self._level_digest``
+                    → the level-pair fast path can be trusted.
+          - False → some edges are missing the digest or carry a stale one
+                    (ontology drifted) → the trace path falls back to the
+                    label-scan codepath for those edges (correct, slower).
 
-        Best-effort: if the probe itself fails (FalkorDB not ready), we
-        leave the flag as None so the first /trace call performs a
-        runtime check.
+        Logs at most once per (provider lifetime, digest) pair via
+        ``_levels_warning_for_digest`` — re-runs with the same digest stay
+        quiet. A new digest (ontology edit) re-arms the warning.
+
+        Traces are never refused — the legacy label-scan codepath returns
+        correct results during backfill windows. Refusing would break every
+        trace whenever the ontology changes.
+
+        Best-effort: if the level map hasn't been injected yet, or the
+        probe itself fails (FalkorDB not ready), we leave the flag as None
+        and a later call will re-probe.
         """
+        digest = self._level_digest
+        if not digest:
+            # No level map yet — backfilled status is undefined.
+            return
+
         try:
             result = await asyncio.wait_for(
                 self._graph.query(
                     "MATCH ()-[r:AGGREGATED]->() "
-                    "WHERE r.sourceLevel IS NULL "
-                    "RETURN count(r) AS missing LIMIT 1"
+                    "WHERE r.levelDigest IS NULL OR r.levelDigest <> $digest "
+                    "RETURN count(r) AS stale LIMIT 1",
+                    params={"digest": digest},
                 ),
                 timeout=3.0,
             )
             rows = getattr(result, "result_set", None) or []
-            missing = int(rows[0][0]) if rows and rows[0] else 0
-            self._levels_backfilled = (missing == 0)
-            if not self._levels_backfilled:
+            stale = int(rows[0][0]) if rows and rows[0] else 0
+            self._levels_backfilled = (stale == 0)
+            if stale > 0 and self._levels_warning_for_digest != digest:
                 logger.warning(
-                    "trace: %d AGGREGATED edges missing sourceLevel — "
-                    "run backfill_aggregated_levels.py", missing,
+                    "trace: %d AGGREGATED edges have stale or missing "
+                    "levelDigest (current=%s) — run "
+                    "backfill_aggregated_levels.py to refresh stamps",
+                    stale, digest[:12],
                 )
+                self._levels_warning_for_digest = digest
         except Exception as exc:
             logger.warning("trace: levels_backfilled check failed: %s", exc)
             # Leave None — probed again on demand if needed
@@ -2019,14 +2073,26 @@ class FalkorDBProvider(GraphDataProvider):
                         "on_lineage_edge_written: level lookup failed: %s", exc,
                     )
 
+        # UNKNOWN_LEVEL sentinel for endpoints whose label has no declared
+        # level. Stamping -1 (instead of leaving sourceLevel NULL) keeps
+        # the backfill convergent: the digest WHERE filter sees the edge
+        # as "stamped" and skips it on re-runs.
+        from backend.app.services.ontology_levels import UNKNOWN_LEVEL
+
         merge_batch = []
         for i, ((s_urn, t_urn), _) in enumerate(new_pairs):
             weight = scard_results[i] if scard_results[i] else 1
             merge_batch.append({
                 "s": s_urn, "t": t_urn, "w": int(weight),
-                "sl": url_levels.get(s_urn),
-                "tl": url_levels.get(t_urn),
+                "sl": url_levels.get(s_urn, UNKNOWN_LEVEL),
+                "tl": url_levels.get(t_urn, UNKNOWN_LEVEL),
             })
+
+        # Stamp the current levelDigest so the cold-start probe doesn't
+        # flag freshly-created edges as needing backfill. When the
+        # ontology drifts later, these edges go stale alongside the
+        # pre-existing ones and the next backfill run re-stamps them.
+        digest = self._level_digest or ""
 
         # Do NOT catch exceptions here — the previous ``except: return 0``
         # silently swallowed MERGE failures (including the "Batched
@@ -2042,15 +2108,16 @@ class FalkorDBProvider(GraphDataProvider):
             "MERGE (t {urn: item.t}) "
             "MERGE (s)-[r:AGGREGATED]->(t) "
             "SET r.weight = item.w, "
-            "r.sourceLevel = coalesce(item.sl, r.sourceLevel), "
-            "r.targetLevel = coalesce(item.tl, r.targetLevel), "
+            "r.sourceLevel = item.sl, "
+            "r.targetLevel = item.tl, "
+            "r.levelDigest = $digest, "
             "r.sourceEdgeTypes = CASE "
             "  WHEN r.sourceEdgeTypes IS NULL THEN [$edgeType] "
             "  WHEN NOT $edgeType IN r.sourceEdgeTypes "
             "    THEN r.sourceEdgeTypes + $edgeType "
             "  ELSE r.sourceEdgeTypes END, "
             "r.latestUpdate = timestamp()",
-            params={"batch": merge_batch, "edgeType": edge_type},
+            params={"batch": merge_batch, "edgeType": edge_type, "digest": digest},
         )
         return len(merge_batch)
 
@@ -2925,18 +2992,16 @@ class FalkorDBProvider(GraphDataProvider):
         focus_level = self._get_node_level(focus_node.entity_type) if focus_node else level
         focus_entity_type = str(focus_node.entity_type) if focus_node else "unknown"
 
-        # Cold-start observability: the probe at _check_levels_backfilled
-        # set this when it found AGGREGATED edges with missing sourceLevel.
-        # We log but DO NOT refuse the trace — the legacy label-scan fallback
-        # in _expand_aggregated_set still works correctly for unstamped edges;
-        # it's just slower. Refusing here breaks every trace on any graph
-        # with partial backfill state.
-        if self._levels_backfilled is False:
-            logger.warning(
-                "trace: AGGREGATED edges have missing sourceLevel — using "
-                "legacy label-scan fallback (slower). Run "
-                "backfill_aggregated_levels.py to restore the fast path."
-            )
+        # Cold-start / drift observability: the probe at
+        # _check_levels_backfilled logs once per digest when stamps are
+        # missing or stale. We do NOT re-log here per trace — the probe's
+        # one-time log is enough and per-request logging spams when many
+        # traces run against the same provider.
+        #
+        # The trace path itself stays correct in either state: stamped
+        # edges take the level-pair fast path; unstamped (or -1-stamped)
+        # edges fall back to the label-scan path inside
+        # _expand_aggregated_set.
 
         # 1. Resolve anchor at the requested level (climb containment if needed).
         #

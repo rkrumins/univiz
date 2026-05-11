@@ -1,28 +1,36 @@
 """
-Backfill script: writes ``r.sourceLevel`` and ``r.targetLevel`` on every
-existing ``:AGGREGATED`` edge that doesn't have them yet.
+Backfill script: stamps ``r.sourceLevel``, ``r.targetLevel``, and
+``r.levelDigest`` on every ``:AGGREGATED`` edge whose stamp is missing or
+stale relative to the current ontology.
 
-These two relationship properties power the trace fast-path's level-pair
-filter. Pre-this-script, AGGREGATED edges materialised before the
-provider began stamping levels lack the metadata; the level-pair index
-can't help them. After this runs, the entire AGGREGATED edge set is
-queryable via:
+These properties power the trace fast-path's level-pair filter:
 
     MATCH (s)-[r:AGGREGATED]->(t)
     WHERE r.sourceLevel = $focusLevel AND r.targetLevel = $targetLevel
 
-instead of the legacy:
+instead of the legacy per-row label scan:
 
     MATCH (s)-[r:AGGREGATED]->(t)
-    WHERE labels(s)[0] IN $sTypes AND labels(t)[0] IN $tTypes  -- per-row scan
+    WHERE labels(s)[0] IN $sTypes AND labels(t)[0] IN $tTypes
 
-Idempotent: ``WHERE r.sourceLevel IS NULL`` ensures re-runs only touch
-edges that haven't been backfilled. Cursor-resumable through the LIMIT
-chunks. Safe to run multiple times.
+**Convergence:** every chunk's WHERE filters on ``r.levelDigest IS NULL
+OR r.levelDigest <> $digest``. The SET assigns the current digest, so a
+processed edge no longer matches the WHERE on the next chunk. The drain
+condition is ``updated == 0``. This works for any ontology and any graph
+state (including edges whose endpoint labels have no declared level —
+those get sentinel ``-1`` and are not re-processed).
 
-Companion to ``backfill_node_levels.py`` — that script writes
-``n.level`` on nodes; this one writes ``r.sourceLevel`` /
-``r.targetLevel`` on AGGREGATED edges.
+**Drift handling:** running this after an ontology edit re-stamps every
+edge whose digest no longer matches. Same script, no flags needed.
+
+**Unstampable edges:** if either endpoint's label is not in the current
+level map, both ``sourceLevel`` and ``targetLevel`` are written as ``-1``
+(``UNKNOWN_LEVEL`` in ``ontology_levels``). The trace fast path treats
+``-1`` as "unknown level" and falls back to the label-scan path for
+those edges only — the rest of the graph keeps its fast path.
+
+Companion to ``backfill_node_levels.py`` — that script writes ``n.level``
+on nodes; this one writes the edge stamps.
 
 Usage:
     python -m backend.scripts.backfill_aggregated_levels --workspace-id <id>
@@ -32,7 +40,7 @@ Usage:
 
 Run order after a fresh ingest / ontology change:
     1. backfill_node_levels.py           (writes n.level)
-    2. backfill_aggregated_levels.py     (writes r.sourceLevel / r.targetLevel)
+    2. backfill_aggregated_levels.py     (writes r.sourceLevel / r.targetLevel / r.levelDigest)
 """
 
 import argparse
@@ -40,7 +48,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 
 # Ensure project root is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -49,84 +57,12 @@ from backend.app.db.engine import get_async_session
 from backend.app.db.repositories import workspace_repo
 from backend.app.providers.manager import provider_manager
 from backend.app.services.context_engine import ContextEngine
+from backend.app.services.ontology_levels import (
+    UNKNOWN_LEVEL,
+    compute_level_digest,
+    derive_level_map,
+)
 
-
-def _derive_levels_from_ontology(ontology) -> Dict[str, int]:
-    """Derive entity-type levels from the ontology's ``can_contain`` /
-    ``can_be_contained_by`` declarations.
-
-    Used when ``hierarchy.level`` isn't explicitly set on any entity type
-    in the ontology (e.g. Solidatus, BAS). The ontology still declares
-    parent/child relationships between types — we just need to project
-    those onto an integer level dimension. The ontology is the source of
-    truth; we never query the graph for this.
-
-    Algorithm:
-      1. Collect every entity type and its declared parents (from
-         ``can_be_contained_by``) and children (from ``can_contain``).
-         Both are merged into a single parent map for robustness — some
-         ontologies only populate one direction.
-      2. Types with no incoming containment in the ontology = level 0
-         (roots).
-      3. Each remaining type's level = max(parent_levels) + 1, iterated
-         to a fixed point.
-
-    Returns ``{entity_type_id: level}`` or an empty dict if the ontology
-    has no containment declarations.
-    """
-    defs = getattr(ontology, "entity_type_definitions", None) or {}
-    if not defs:
-        return {}
-
-    all_types: Set[str] = set(defs.keys())
-    parents: Dict[str, Set[str]] = {}
-
-    # Pass 1: harvest declared parent/child relationships from both
-    # directions so we don't lose data when only one is populated.
-    for et_id, et_def in defs.items():
-        hierarchy = getattr(et_def, "hierarchy", None)
-        if hierarchy is None:
-            continue
-        can_contain = list(getattr(hierarchy, "can_contain", None) or [])
-        can_be_contained_by = list(getattr(hierarchy, "can_be_contained_by", None) or [])
-
-        # This type's parents are explicitly declared in can_be_contained_by.
-        for parent in can_be_contained_by:
-            if parent and parent != et_id and parent in all_types:
-                parents.setdefault(et_id, set()).add(parent)
-
-        # This type's children list also implies the reverse — every child
-        # listed here has THIS type as a potential parent.
-        for child in can_contain:
-            if child and child != et_id and child in all_types:
-                parents.setdefault(child, set()).add(et_id)
-
-    if not parents:
-        return {}
-
-    # Roots: types with no declared parents are level 0
-    levels: Dict[str, int] = {t: 0 for t in all_types if t not in parents}
-
-    # Iterate to fixed point. Cycle-safe via iteration cap = len(all_types)+1.
-    # A non-cyclic containment DAG converges in at most len(longest chain) steps.
-    max_iterations = len(all_types) + 1
-    for _ in range(max_iterations):
-        changed = False
-        for t in all_types:
-            ps = parents.get(t)
-            if not ps:
-                continue
-            parent_levels = [levels[p] for p in ps if p in levels]
-            if not parent_levels:
-                continue
-            new_level = max(parent_levels) + 1
-            if levels.get(t) != new_level:
-                levels[t] = new_level
-                changed = True
-        if not changed:
-            break
-
-    return levels
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,15 +71,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def _backfill_chunk(provider, level_map: Dict[str, int], chunk_size: int) -> int:
-    """Backfill one chunk of AGGREGATED edges. Returns affected count.
+async def _backfill_chunk(
+    provider,
+    level_map: Dict[str, int],
+    digest: str,
+    chunk_size: int,
+) -> int:
+    """Stamp one chunk of AGGREGATED edges. Returns the number of edges
+    stamped in this chunk.
+
+    Selection: edges whose ``r.levelDigest`` is NULL (never stamped) or
+    differs from the current ``$digest`` (ontology drifted since last
+    stamping). After SET, every selected edge carries the current digest
+    and no longer matches the WHERE, so re-runs converge.
+
+    Stamping: ``$levelMap[labels(...)]`` lookup returns ``NULL`` when an
+    endpoint's label is not in the current map. ``COALESCE(... , -1)``
+    converts that NULL to the ``UNKNOWN_LEVEL`` sentinel, which (a)
+    distinguishes "label has no declared level" from "edge never
+    stamped" and (b) lets the WHERE filter NOT re-pick the edge on the
+    next chunk (it now has a non-null digest).
 
     The query operates against the projection graph because that's where
     AGGREGATED lives in both projection modes. Falls back to the source
-    graph when the provider lacks the projection write helper (older
-    providers / dedicated mode misconfig). ``$levelMap[labels(...)]``
-    resolves the entity-type-label to a hierarchy level in a single
-    pass.
+    graph when the provider lacks the projection write helper.
     """
     write = getattr(provider, "_proj_query", None) or getattr(provider, "_query", None)
     if write is None:
@@ -154,13 +105,22 @@ async def _backfill_chunk(provider, level_map: Dict[str, int], chunk_size: int) 
 
     cypher = (
         "MATCH (s)-[r:AGGREGATED]->(t) "
-        "WHERE r.sourceLevel IS NULL OR r.targetLevel IS NULL "
+        "WHERE r.levelDigest IS NULL OR r.levelDigest <> $digest "
         "WITH s, t, r LIMIT $limit "
-        "SET r.sourceLevel = $levelMap[labels(s)[0]], "
-        "    r.targetLevel = $levelMap[labels(t)[0]] "
+        "SET r.sourceLevel = COALESCE($levelMap[labels(s)[0]], $unknown), "
+        "    r.targetLevel = COALESCE($levelMap[labels(t)[0]], $unknown), "
+        "    r.levelDigest = $digest "
         "RETURN count(r) AS updated"
     )
-    result = await write(cypher, params={"levelMap": level_map, "limit": int(chunk_size)})
+    result = await write(
+        cypher,
+        params={
+            "levelMap": level_map,
+            "digest": digest,
+            "unknown": UNKNOWN_LEVEL,
+            "limit": int(chunk_size),
+        },
+    )
 
     rs = getattr(result, "result_set", None)
     if rs is not None:
@@ -171,6 +131,33 @@ async def _backfill_chunk(provider, level_map: Dict[str, int], chunk_size: int) 
             return int(row.get("updated", 0))
         return int(row[0])
     return 0
+
+
+async def _count_unstampable_labels(provider, level_map: Dict[str, int]) -> Dict[str, int]:
+    """Report which endpoint labels appear on AGGREGATED edges but are NOT
+    in the current level map. Pure observability — drives a one-time log
+    line so operators know the ontology is incomplete instead of guessing
+    why some edges got stamped with -1.
+    """
+    write = getattr(provider, "_proj_query", None) or getattr(provider, "_query", None)
+    if write is None:
+        return {}
+
+    cypher = (
+        "MATCH (s)-[r:AGGREGATED]->(t) "
+        "WITH labels(s)[0] AS sLbl, labels(t)[0] AS tLbl "
+        "WITH collect(sLbl) + collect(tLbl) AS labels_list "
+        "UNWIND labels_list AS lbl "
+        "WITH lbl WHERE NOT lbl IN $known "
+        "RETURN lbl, count(*) AS count"
+    )
+    try:
+        result = await write(cypher, params={"known": list(level_map.keys())})
+    except Exception:
+        return {}
+
+    rs = getattr(result, "result_set", None) or []
+    return {row[0]: int(row[1]) for row in rs if row}
 
 
 async def backfill(
@@ -191,89 +178,91 @@ async def backfill(
             workspace_id, provider_manager, session, data_source_id=data_source_id
         )
 
-        # Resolve ontology and build the entity_type → level map. We need the
-        # RESOLVED ontology (carries entity_type_definitions with hierarchy
-        # data), not the flat OntologyMetadata projection. Resolving has the
-        # side effect of injecting the level map onto the provider when the
-        # ontology declares hierarchy.level, so the trace fast path picks
-        # it up immediately.
+        # Resolve the ontology and build the level map. We use the same
+        # shared function as the runtime (`derive_level_map`), so the digest
+        # the script computes matches the digest the provider stamps on
+        # newly-materialized edges. Resolving has the side effect of
+        # injecting the level map onto the provider via ContextEngine.
         resolve = getattr(engine, "_resolve_ontology", None)
         if callable(resolve):
             ontology = await resolve()
         else:
             ontology = await engine.get_ontology_metadata()
 
-        level_map: Dict[str, int] = {}
-        for et_id, et_def in (getattr(ontology, "entity_type_definitions", {}) or {}).items():
-            hierarchy = getattr(et_def, "hierarchy", None)
-            level = getattr(hierarchy, "level", None) if hierarchy else None
-            if isinstance(level, int):
-                level_map[et_id] = level
-
-        derived = False
+        level_map = derive_level_map(ontology)
         if not level_map:
-            # Ontology declares no hierarchy.level — derive from the same
-            # ontology's can_contain / can_be_contained_by declarations. This
-            # is still ontology-driven (no graph queries); it just projects
-            # the declared parent/child structure onto integer levels.
-            logger.info(
-                "No hierarchy.level declared in ontology — deriving levels "
-                "from ontology can_contain / can_be_contained_by relations"
+            logger.warning(
+                "Ontology declares no hierarchy.level and has no "
+                "can_contain / can_be_contained_by relations either — "
+                "cannot derive a level map. Every edge will be stamped "
+                "with %d (unknown). Either add hierarchy.level on entity "
+                "types or declare containment relations.", UNKNOWN_LEVEL,
             )
-            level_map = _derive_levels_from_ontology(ontology)
-            derived = bool(level_map)
-            if not level_map:
-                logger.warning(
-                    "Ontology has no containment relations declared either — "
-                    "cannot derive level map. Backfill cannot proceed; either "
-                    "add hierarchy.level on entity types or declare can_contain / "
-                    "can_be_contained_by in the ontology."
-                )
-                return
 
-        # Inject the level map onto the provider so traces running in this
-        # process (or future processes that re-resolve the ontology with
-        # this script's side effects) benefit immediately. For derived maps
-        # the ontology resolver wouldn't have set this, so we do it here.
-        if derived and hasattr(engine.provider, "set_entity_type_levels"):
+        digest = compute_level_digest(level_map)
+
+        # Make sure the provider has the same map+digest as we do, so the
+        # cold-start probe checks against the digest we're about to stamp
+        # and the on-ingest hook stamps the same digest going forward.
+        if hasattr(engine.provider, "set_entity_type_levels"):
             engine.provider.set_entity_type_levels(level_map)
-            logger.info(
-                "Injected derived level map onto provider (%d types)",
-                len(level_map),
-            )
 
         logger.info(
-            "Backfilling AGGREGATED.sourceLevel/targetLevel using %s level map "
-            "of %d types: %s",
-            "DERIVED" if derived else "declared",
+            "Backfilling AGGREGATED stamps. levelDigest=%s, level_map "
+            "(%d types): %s",
+            digest[:12],
             len(level_map),
             sorted(level_map.items(), key=lambda kv: kv[1]),
         )
+
+        # Observability: report which entity-type labels appear on edges
+        # but aren't in the level map. Those edges will be stamped with
+        # UNKNOWN_LEVEL and take the label-scan path at trace time.
+        unstampable = await _count_unstampable_labels(engine.provider, level_map)
+        if unstampable:
+            logger.warning(
+                "Endpoint labels not in level map (will be stamped %d): "
+                "%s. Add these to the ontology to enable the level-pair "
+                "fast path for the affected edges.",
+                UNKNOWN_LEVEL,
+                sorted(unstampable.items(), key=lambda kv: -kv[1]),
+            )
 
         total_updated = 0
         chunk_index = 0
         while True:
             chunk_index += 1
             try:
-                updated = await _backfill_chunk(engine.provider, level_map, batch_size)
+                updated = await _backfill_chunk(
+                    engine.provider, level_map, digest, batch_size,
+                )
             except Exception as exc:
                 logger.error("Chunk %d failed: %s", chunk_index, exc)
                 raise
 
             total_updated += updated
-            logger.info("  chunk %d: %d edges updated (running total: %d)",
+            logger.info("  chunk %d: %d edges stamped (running total: %d)",
                         chunk_index, updated, total_updated)
 
-            # Drain condition: a chunk that updated fewer edges than the
-            # batch size has reached the end of the unprocessed set. Note
-            # this is robust to concurrent materialisation — new edges are
-            # written with the level metadata already in place by the
-            # materialiser (see _materialize_edges_batched + on_lineage_
-            # edge_written), so re-runs converge to a stable empty set.
-            if updated < batch_size:
+            # Drain: every selected edge gets the current digest, so it
+            # falls out of the WHERE on the next iteration. An empty
+            # chunk means we're done. This converges for any ontology
+            # and any graph state — including the unstampable-label
+            # case (those edges get -1 + current digest and exit the
+            # selection too).
+            if updated == 0:
                 break
 
-        logger.info("Backfill complete: %d AGGREGATED edges updated total", total_updated)
+        logger.info(
+            "Backfill complete: %d AGGREGATED edges stamped with "
+            "levelDigest=%s", total_updated, digest[:12],
+        )
+
+        # Re-probe so the in-process provider's `_levels_backfilled`
+        # flag flips to True without waiting for the next traffic.
+        probe = getattr(engine.provider, "_check_levels_backfilled", None)
+        if callable(probe):
+            await probe()
 
 
 if __name__ == "__main__":

@@ -287,15 +287,15 @@ class ContextEngine:
                             resolved.lineage_edge_types,
                         )
                     if hasattr(self.provider, 'set_entity_type_levels'):
-                        # Build entity-type → hierarchy.level mapping. Used by the
-                        # provider to write n.level at upsert time, enabling
-                        # level-indexed trace queries without a per-query ontology join.
-                        levels: Dict[str, int] = {}
-                        for et_id, et_def in (resolved.entity_type_definitions or {}).items():
-                            hierarchy = getattr(et_def, "hierarchy", None)
-                            level = getattr(hierarchy, "level", None) if hierarchy else None
-                            if isinstance(level, int):
-                                levels[et_id] = level
+                        # Build entity-type → hierarchy.level mapping. Single
+                        # source of truth shared with the backfill script via
+                        # ``derive_level_map``: declared ``hierarchy.level``
+                        # takes precedence, with ``can_contain`` /
+                        # ``can_be_contained_by`` as fallback. Runtime and
+                        # backfill must agree on this map or the digest stamps
+                        # will look stale to each other.
+                        from .ontology_levels import derive_level_map
+                        levels = derive_level_map(resolved)
                         self.provider.set_entity_type_levels(levels)
                     # Ensure indices exist for all ontology-defined entity types.
                     if hasattr(self.provider, 'ensure_indices') and resolved.entity_type_definitions:
@@ -1009,6 +1009,13 @@ class ContextEngine:
             mn if isinstance(mn, MegaNodeInfo) else MegaNodeInfo(**mn)
             for mn in mega_nodes_raw
         ]
+        # Read the provider's cached level-stamp staleness. False (the
+        # default) covers providers that don't track it. When True, some
+        # AGGREGATED edges have a missing/stale levelDigest — results are
+        # still correct (label-scan fallback) but slower; UI can show a
+        # hint that backfill is needed.
+        stale_levels = getattr(self.provider, "_levels_backfilled", None) is False
+
         return TraceMeta(
             regime=regime,
             effectiveLevel=result.effective_level,
@@ -1019,6 +1026,7 @@ class ContextEngine:
             fallbackLevel=fallback_level,
             megaNodes=mega_nodes,
             traceSessionId=trace_session_id,
+            staleLevels=stale_levels,
         )
 
     def _validate_ancestor_chain(self, result: TraceResult, *, regime: str) -> None:

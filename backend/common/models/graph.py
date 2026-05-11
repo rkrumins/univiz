@@ -209,8 +209,10 @@ class TraceMeta(BaseModel):
     effective_level: int = Field(0, alias="effectiveLevel")
     truncation_reason: Optional[str] = Field(None, alias="truncationReason")
     # Reasons (kept inline for grep):
-    #   "max_nodes" | "timeout" | "degree_cap" | "cycle_detected"
-    #   | "levels_not_backfilled" | "orphan"
+    #   "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan"
+    # Cold-start (AGGREGATED edges not level-stamped) is NOT a truncation:
+    # the trace falls back to a label-scan path and returns correct (slower)
+    # results. See `_check_levels_backfilled` in falkordb_provider.py.
     cypher_ms: int = Field(0, alias="cypherMs")
     node_count: int = Field(0, alias="nodeCount")
     edge_count: int = Field(0, alias="edgeCount")
@@ -222,6 +224,12 @@ class TraceMeta(BaseModel):
     # in Phase 1. Surfaced for telemetry and frontend correlation.
     trace_session_id: Optional[str] = Field(None, alias="traceSessionId")
     ontology_digest: Optional[str] = Field(None, alias="ontologyDigest")
+    # True when some AGGREGATED edges carry a stale or missing levelDigest
+    # (ontology drifted since they were stamped, or backfill hasn't run).
+    # Results are still correct — the trace falls back to the label-scan
+    # path for those edges. UI can show a "stamps refreshing…" hint and
+    # the next run of backfill_aggregated_levels.py will clear the flag.
+    stale_levels: bool = Field(False, alias="staleLevels")
 
     class Config:
         populate_by_name = True
@@ -247,8 +255,7 @@ class TraceResult(BaseModel):
     is_inherited: bool = Field(False, alias="isInherited")
     inherited_from_urn: Optional[str] = Field(None, alias="inheritedFromUrn")
     truncated: bool = False
-    # "max_nodes" | "timeout" | "degree_cap" | "cycle_detected"
-    # | "levels_not_backfilled" | "orphan" | None
+    # "max_nodes" | "timeout" | "degree_cap" | "cycle_detected" | "orphan" | None
     truncation_reason: Optional[str] = Field(None, alias="truncationReason")
 
     class Config:

@@ -1,11 +1,15 @@
 """Graph endpoints — API v2.
 
-Smart top-level lineage trace + drill-down delta endpoints. See plan
-i-want-you-to-effervescent-glacier.md §1.1 for the full contract.
+Smart top-level lineage trace + drill-down delta endpoints. The full
+contract lives in:
+  - ``TraceRequest`` / ``TraceResultV2`` / ``TraceMeta`` in
+    ``backend/common/models/graph.py``
+  - ``ContextEngine.get_trace_v2`` / ``get_trace_delta_v2`` in
+    ``backend/app/services/context_engine.py``
 
 Two endpoints:
   POST /api/v2/{ws_id}/graph/trace         — initial trace, projected to target level
-  POST /api/v2/{ws_id}/graph/trace/expand  — drill-down delta from a session
+  POST /api/v2/{ws_id}/graph/trace/expand  — drill-down delta (stateless)
 
 Default behavior matches the user requirement: a trace from any node returns
 top-level (level 0) rollup by default; drill-down uses /trace/expand to descend
@@ -62,7 +66,7 @@ async def get_context_engine(
 
 
 # ------------------------------------------------------------------ #
-# Error envelope helper (plan §1.1)                                   #
+# Error envelope helper                                                #
 # ------------------------------------------------------------------ #
 
 def _trace_error(
@@ -92,36 +96,6 @@ def _trace_error(
 # Endpoints                                                            #
 # ------------------------------------------------------------------ #
 
-def _check_skeleton_truncation(result) -> Optional[JSONResponse]:
-    """Translate truncation reasons that should be HTTP-level signals
-    (503 for backfill-required) into structured error responses. Other
-    truncations (degree_cap, max_nodes, timeout, orphan) are non-fatal
-    and ride along inside the 200 response so the client can still render
-    a partial skeleton + a banner."""
-    meta = getattr(result, "meta", None)
-    if meta is None:
-        return None
-    if meta.truncation_reason == "levels_not_backfilled":
-        return JSONResponse(
-            status_code=503,
-            headers={"Retry-After": "30"},
-            content={
-                "error": {
-                    "code": "levels_not_backfilled",
-                    "message": (
-                        "AGGREGATED edges are missing sourceLevel/targetLevel. "
-                        "Run backfill_aggregated_levels.py; retrying after 30s."
-                    ),
-                    "details": {},
-                },
-                "meta": {
-                    "ontologyDigest": meta.ontology_digest or "",
-                    "traceSessionId": meta.trace_session_id,
-                },
-            },
-        )
-    return None
-
 
 @router.post(
     "/trace",
@@ -141,12 +115,17 @@ async def post_trace(
     is server-authoritative; clients do not need to know the ontology
     depth.
 
-    Drill-down via POST /trace/expand. Truncations:
+    Drill-down via POST /trace/expand. Truncations (all non-fatal — they
+    ride along inside the 200 response so the client can render a partial
+    skeleton + a banner):
       * ``degree_cap``    — mega-node summary; meta.megaNodes populated
       * ``max_nodes``     — node budget exceeded
       * ``timeout``       — wall-clock exceeded
       * ``orphan``        — no level-0 ancestor; meta.fallbackLevel set
-      * ``levels_not_backfilled`` — 503 + Retry-After (separate envelope)
+
+    Cold-start (AGGREGATED edges not level-stamped): trace still returns 200
+    with correct results via a legacy label-scan fallback. Run
+    ``backfill_aggregated_levels.py`` to restore the fast path.
     """
     try:
         result = await engine.get_trace_v2(body)
@@ -162,10 +141,6 @@ async def post_trace(
             message=str(exc),
             status_code=400,
         )
-    # Cold-start: backfill required — return 503 + Retry-After.
-    err = _check_skeleton_truncation(result)
-    if err is not None:
-        return err
     return result
 
 
@@ -205,7 +180,4 @@ async def post_trace_expand(
             status_code=400,
             trace_session_id=body.trace_session_id,
         )
-    err = _check_skeleton_truncation(delta)
-    if err is not None:
-        return err
     return delta
