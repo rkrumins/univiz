@@ -457,6 +457,26 @@ class FalkorDBProvider(GraphDataProvider):
                 except Exception:
                     pass
 
+        # Edge-property indices on :AGGREGATED powering the level-pair
+        # fast path used by ``_expand_aggregated_set``. With these in
+        # place, ``WHERE r.sourceLevel = $L AND r.targetLevel = $L``
+        # becomes a composite index seek instead of a per-edge property
+        # read after the rel-typed MATCH. Idempotent CREATE INDEX, best-
+        # effort: older FalkorDB releases may not support edge-property
+        # indices, in which case the trace continues to work via the
+        # legacy neighbour-label scan fallback.
+        aggregated_edge_indices = [
+            "CREATE INDEX FOR ()-[r:AGGREGATED]-() ON (r.sourceLevel)",
+            "CREATE INDEX FOR ()-[r:AGGREGATED]-() ON (r.targetLevel)",
+        ]
+        for index_cypher in aggregated_edge_indices:
+            try:
+                await asyncio.wait_for(
+                    self._graph.query(index_cypher), timeout=_init_timeout,
+                )
+            except Exception:
+                pass  # Older FalkorDB or already exists — ignore
+
     @property
     def name(self) -> str:
         return "FalkorDBProvider"
@@ -1487,17 +1507,25 @@ class FalkorDBProvider(GraphDataProvider):
         return ancestors
 
     async def _compute_ancestor_chain(self, urn: str) -> List[str]:
-        """Single Cypher query to walk containment edges upward (1 query instead of N)."""
+        """Single Cypher query to walk containment edges upward (1 query instead of N).
+
+        Variable-length depth bound is the number of entity-type levels
+        in the resolved ontology (clamped to a 10 floor for safety on
+        cold caches). This is tighter and more correct than the legacy
+        hardcoded ``*1..10`` for shallow ontologies, and extends to
+        deeper ones without code edits.
+        """
         containment = list(self._get_containment_edge_types())
         if not containment:
             # No containment types — flat graph, no ancestors
             return []
         containment_cypher = "|".join(_sanitize_label(t) for t in containment)
+        max_depth = max(len(getattr(self, "_entity_type_levels", {}) or {}), 10)
 
         # Variable-length path: returns ordered list of ancestor URNs
         # nodes(path) gives [child, parent, grandparent, ...] — skip index 0 (self)
         result = await self._ro_query(
-            f"MATCH path = (child)<-[:{containment_cypher}*1..10]-(ancestor) "
+            f"MATCH path = (child)<-[:{containment_cypher}*1..{max_depth}]-(ancestor) "
             f"WHERE child.urn = $urn "
             f"WITH path ORDER BY length(path) DESC LIMIT 1 "
             f"RETURN [n IN nodes(path)[1..] | n.urn] AS chain",
@@ -1664,12 +1692,50 @@ class FalkorDBProvider(GraphDataProvider):
             if (s, t) in new_pair_keys:
                 pair_edge_types.setdefault((s, t), set()).add(etype)
 
+        # Resolve s/t levels for the level-pair fast path. Pre-fetches
+        # labels for every URN in the batch from the Redis URN→label cache
+        # (populated as a side effect of node upserts / get_node calls),
+        # then maps label → hierarchy.level via the in-process entity-type
+        # level map injected by the ContextEngine. URNs without a resolved
+        # level are left as None and the Cypher uses ``coalesce`` so a
+        # missing level never clobbers an existing one written by the
+        # backfill script.
+        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
+        url_levels: Dict[str, Optional[int]] = {}
+        if entity_levels:
+            all_urns = sorted({s for (s, _), _ in ordered_pairs}
+                              | {t for (_, t), _ in ordered_pairs})
+            if all_urns:
+                try:
+                    label_key = self._urn_label_key()
+                    label_pipe = self._redis.pipeline(transaction=False)
+                    for u in all_urns:
+                        label_pipe.hget(label_key, u)
+                    label_rows = await label_pipe.execute()
+                    for u, raw in zip(all_urns, label_rows):
+                        if not raw:
+                            continue
+                        lbl = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                        lvl = entity_levels.get(lbl)
+                        if lvl is not None:
+                            url_levels[u] = lvl
+                except Exception as exc:
+                    # Best-effort: if Redis is down we skip the level
+                    # annotation. Backfill_aggregated_levels.py covers
+                    # any edges materialised without props.
+                    logger.warning(
+                        "materialize: level lookup pipeline failed (%d urns): %s",
+                        len(all_urns), exc,
+                    )
+
         merge_batch: list[dict[str, Any]] = []
         for i, ((s, t), _) in enumerate(ordered_pairs):
             weight = scard_results[i] if scard_results[i] else 1
             etypes = list(pair_edge_types.get((s, t), set()))
             merge_batch.append({
                 "s": s, "t": t, "w": int(weight), "et": etypes,
+                "sl": url_levels.get(s),
+                "tl": url_levels.get(t),
             })
 
         # Execute ONE Cypher UNWIND+MERGE per sub-batch.  The Cypher
@@ -1701,6 +1767,12 @@ class FalkorDBProvider(GraphDataProvider):
                 "MERGE (s)-[r:AGGREGATED]->(t) "
                 "SET r.weight = item.w, "
                 "    r.latestUpdate = timestamp(), "
+                # Level-pair fast-path props. ``coalesce`` keeps a previously
+                # backfilled value when the new resolution couldn't find a
+                # label (cold cache / unknown entity type) — never regresses
+                # known level metadata to NULL.
+                "    r.sourceLevel = coalesce(item.sl, r.sourceLevel), "
+                "    r.targetLevel = coalesce(item.tl, r.targetLevel), "
                 "    r.sourceEdgeTypes = REDUCE(acc = "
                 "      CASE WHEN r.sourceEdgeTypes IS NULL THEN [] "
                 "           ELSE r.sourceEdgeTypes END, "
@@ -1814,11 +1886,43 @@ class FalkorDBProvider(GraphDataProvider):
             pipe.execute_command("SCARD", member_key)
         scard_results = await pipe.execute()
 
-        # Phase 3: Single UNWIND+MERGE for all new pairs
+        # Phase 3: resolve s/t levels for the level-pair fast path (best-
+        # effort via the URN→label cache + entity-type level map), then
+        # single UNWIND+MERGE for all new pairs. Same rationale as the
+        # batched materializer: coalesce in the Cypher SET preserves
+        # backfilled level values when a fresh resolution misses.
+        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
+        url_levels: Dict[str, Optional[int]] = {}
+        if entity_levels:
+            urn_set = {p[0] for p, _ in new_pairs} | {p[1] for p, _ in new_pairs}
+            if urn_set:
+                try:
+                    label_key = self._urn_label_key()
+                    label_pipe = self._redis.pipeline(transaction=False)
+                    ordered = list(urn_set)
+                    for u in ordered:
+                        label_pipe.hget(label_key, u)
+                    rows = await label_pipe.execute()
+                    for u, raw in zip(ordered, rows):
+                        if not raw:
+                            continue
+                        lbl = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                        lvl = entity_levels.get(lbl)
+                        if lvl is not None:
+                            url_levels[u] = lvl
+                except Exception as exc:
+                    logger.warning(
+                        "on_lineage_edge_written: level lookup failed: %s", exc,
+                    )
+
         merge_batch = []
         for i, ((s_urn, t_urn), _) in enumerate(new_pairs):
             weight = scard_results[i] if scard_results[i] else 1
-            merge_batch.append({"s": s_urn, "t": t_urn, "w": int(weight)})
+            merge_batch.append({
+                "s": s_urn, "t": t_urn, "w": int(weight),
+                "sl": url_levels.get(s_urn),
+                "tl": url_levels.get(t_urn),
+            })
 
         # Do NOT catch exceptions here — the previous ``except: return 0``
         # silently swallowed MERGE failures (including the "Batched
@@ -1834,6 +1938,8 @@ class FalkorDBProvider(GraphDataProvider):
             "MERGE (t {urn: item.t}) "
             "MERGE (s)-[r:AGGREGATED]->(t) "
             "SET r.weight = item.w, "
+            "r.sourceLevel = coalesce(item.sl, r.sourceLevel), "
+            "r.targetLevel = coalesce(item.tl, r.targetLevel), "
             "r.sourceEdgeTypes = CASE "
             "  WHEN r.sourceEdgeTypes IS NULL THEN [$edgeType] "
             "  WHEN NOT $edgeType IN r.sourceEdgeTypes "
@@ -2744,7 +2850,8 @@ class FalkorDBProvider(GraphDataProvider):
         # 4. Per-hop set-based expansion
         max_depth = max(upstream_depth, downstream_depth)
         for hop in range(max_depth):
-            if time.monotonic() > deadline:
+            remaining_secs = deadline - time.monotonic()
+            if remaining_secs <= 0:
                 truncation_reason = "timeout"
                 break
             if len(nodes_by_urn) >= max_nodes:
@@ -2752,14 +2859,35 @@ class FalkorDBProvider(GraphDataProvider):
                 break
             budget = max_nodes - len(nodes_by_urn)
 
+            # Build frontier→label maps from already-fetched nodes. New
+            # frontier members were hydrated by the previous hop's
+            # `rec.get("node")` payload, so their entity_type is known
+            # without an extra round-trip.
+            up_labels = {
+                u: _sanitize_label(str(nodes_by_urn[u].entity_type))
+                for u in up_frontier if u in nodes_by_urn
+            }
+            down_labels = {
+                u: _sanitize_label(str(nodes_by_urn[u].entity_type))
+                for u in down_frontier if u in nodes_by_urn
+            }
+
+            # Per-hop wall-clock budget. Up to two directions run in
+            # parallel, each issuing 1-2 sub-queries — splitting the
+            # remaining budget across them lets a slow hop fail fast
+            # rather than starving subsequent hops.
+            hop_timeout_secs = max(0.6, min(1.5, remaining_secs / 2))
+
             tasks = []
             if hop < upstream_depth and up_frontier:
                 tasks.append(("up", self._expand_aggregated_set(
-                    list(up_frontier), "incoming", level, ltypes, budget,
+                    list(up_frontier), up_labels, "incoming",
+                    level, ltypes, budget, hop_timeout_secs,
                 )))
             if hop < downstream_depth and down_frontier:
                 tasks.append(("down", self._expand_aggregated_set(
-                    list(down_frontier), "outgoing", level, ltypes, budget,
+                    list(down_frontier), down_labels, "outgoing",
+                    level, ltypes, budget, hop_timeout_secs,
                 )))
             if not tasks:
                 break
@@ -2977,21 +3105,81 @@ class FalkorDBProvider(GraphDataProvider):
         entity type sits at ``level``. Returns ``urn`` itself when it's already
         at the target level or no qualifying ancestor exists.
 
-        Filters by ``labels(anc)[0] IN $types`` rather than ``anc.level``: labels
-        are written at every upsert, so this works on every existing graph
-        without requiring backfill_node_levels.py to have run.
+        Cache-first: reads the ancestor chain from the Redis cache populated
+        by aggregation (:func:`_get_ancestor_chain`) and resolves each
+        ancestor's level via the in-process entity-type → level map. The
+        URN → label cache (:func:`_get_cached_label`) typically already
+        holds labels for chain URNs as a side effect of materialization /
+        prior :func:`get_node` calls; any gaps are filled with a single
+        batch ``WHERE n.urn IN $urns RETURN n.urn, labels(n)[0]`` round-
+        trip (no variable-length walk, no path sort).
+
+        Falls back to the legacy variable-length Cypher only when the
+        cache produces no chain AND the focus is not already at the
+        requested level — preserves correctness on cold graphs while the
+        common case becomes a Redis HGET + a small Python loop.
         """
         if not ctypes:
             return urn
+        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
+
+        # Step 1: is the focus itself at the target level?
+        focus_label = await self._get_cached_label(urn)
+        if focus_label and entity_levels.get(focus_label) == level:
+            return urn
+
+        # Step 2: walk the cached ancestor chain.
+        try:
+            chain = await self._get_ancestor_chain(urn)
+        except Exception:
+            chain = []
+
+        if chain and entity_levels:
+            # Resolve labels for chain URNs (cache + one batch top-up).
+            labels: Dict[str, Optional[str]] = {}
+            missing: List[str] = []
+            for u in chain:
+                cached = await self._get_cached_label(u)
+                labels[u] = cached
+                if not cached:
+                    missing.append(u)
+            if missing:
+                try:
+                    res = await self._ro_query(
+                        "MATCH (n) WHERE n.urn IN $urns "
+                        "RETURN n.urn AS urn, labels(n)[0] AS label",
+                        params={"urns": missing}, timeout=1.5,
+                    )
+                    bulk: Dict[str, str] = {}
+                    for row in (res.result_set or []):
+                        if row and row[0] and row[1]:
+                            labels[row[0]] = row[1]
+                            bulk[row[0]] = row[1]
+                    if bulk:
+                        await self._cache_urn_labels_bulk(bulk)
+                except Exception as exc:
+                    logger.warning(
+                        "trace_at_level: anchor label batch fetch failed: %s", exc,
+                    )
+
+            for ancestor_urn in chain:
+                lbl = labels.get(ancestor_urn)
+                if lbl and entity_levels.get(lbl) == level:
+                    return ancestor_urn
+            # Chain authoritatively walked to root without a match.
+            return urn
+
+        # Step 3: cold-cache fallback. Bound the variable-length walk by
+        # max-known hierarchy depth (or 10 when the level map is empty)
+        # and cap the Cypher with a tight ``:timeout`` so a slow planner
+        # cannot consume the trace deadline here.
         types = self._types_at_level(level)
         if not types:
-            # Ontology hasn't been injected, or no types at this level.
-            # Without a label filter we'd unconditionally walk up containment;
-            # safer to return the focus as-is and let the BFS try its luck.
             return urn
+        max_depth = max(len(entity_levels), 10) if entity_levels else 10
         cypher = (
             "MATCH (focus {urn: $urn}) "
-            "OPTIONAL MATCH path = (focus)<-[c*0..10]-(anc) "
+            f"OPTIONAL MATCH path = (focus)<-[c*0..{max_depth}]-(anc) "
             "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
             "  AND labels(anc)[0] IN $types "
             "RETURN coalesce(anc.urn, focus.urn) AS anchorUrn "
@@ -3000,12 +3188,13 @@ class FalkorDBProvider(GraphDataProvider):
         try:
             result = await self._ro_query(
                 cypher, params={"urn": urn, "ctypes": ctypes, "types": types},
+                timeout=1.5,
             )
             rows = result.result_set or []
             if rows and rows[0]:
                 return rows[0][0] or urn
         except Exception as exc:
-            logger.warning("trace_at_level: anchor resolution failed for %s: %s", urn, exc)
+            logger.warning("trace_at_level: anchor resolution fallback failed for %s: %s", urn, exc)
         return urn
 
     async def _has_aggregated_at_level(
@@ -3043,7 +3232,12 @@ class FalkorDBProvider(GraphDataProvider):
         if ltypes:
             params["ltypes"] = ltypes
         try:
-            result = await self._proj_ro_query(cypher, params=params)
+            # Tight ``:timeout`` — this is an existence check on the
+            # trace hot path; if FalkorDB can't decide in ~1s the
+            # planner is doing something wrong and we'd rather
+            # fail-open (skip the inherited-lineage fallback) than
+            # block the whole trace.
+            result = await self._proj_ro_query(cypher, params=params, timeout=1.0)
             return bool(result.result_set)
         except Exception as exc:
             logger.warning("trace_at_level: has-lineage check failed for %s: %s", anchor_urn, exc)
@@ -3053,144 +3247,251 @@ class FalkorDBProvider(GraphDataProvider):
         self, anchor_urn: str, level: int, ctypes: List[str],
         ltypes: Optional[List[str]] = None,
     ) -> Optional[str]:
+        """Find the nearest ancestor of ``anchor_urn`` that (a) is at the
+        target ``level`` and (b) has at least one lineage edge there.
+
+        Folds the previous "fetch 5 candidates + 1-5 ``_has_aggregated_at_level``
+        round-trips" pattern into a single Cypher: the inner pattern
+        predicate ``(parent)-[:AGGREGATED|...]-()`` filters candidates by
+        edge existence directly in the planner, returning only the
+        nearest ancestor that qualifies.
+
+        The pattern predicate doesn't constrain the peer's level — a node
+        that has AGGREGATED edges is overwhelmingly to peers at the same
+        level (the materialiser pairs ancestors level-for-level), and a
+        false positive just means the subsequent BFS finds an empty set
+        for that anchor, which is cheaper than 5 extra existence
+        checks per trace.
+        """
         if not ctypes:
             return None
         types = self._types_at_level(level)
         if not types:
             return None
-        cypher_ancestors = (
-            "MATCH (a {urn: $anchor})<-[c*1..10]-(parent) "
+
+        # Relationship-type alternation: AGGREGATED rollup plus any raw
+        # lineage types the caller declared. Sanitized to keep the
+        # dynamic pattern injection-safe.
+        rel_parts: List[str] = ["AGGREGATED"]
+        if ltypes:
+            rel_parts.extend(_sanitize_label(t) for t in ltypes)
+        rel_alt = "|".join(rel_parts)
+
+        max_depth = max(len(getattr(self, "_entity_type_levels", {}) or {}), 10)
+
+        cypher = (
+            "MATCH (a {urn: $anchor})"
+            f"<-[c*1..{max_depth}]-(parent) "
             "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
             "  AND labels(parent)[0] IN $types "
-            "RETURN parent.urn AS urn, length(c) AS depth "
-            "ORDER BY length(c) ASC LIMIT 5"
+            "WITH parent, length(c) AS depth "
+            "ORDER BY depth ASC LIMIT 5 "
+            f"WITH parent, depth WHERE (parent)-[:{rel_alt}]-() "
+            "RETURN parent.urn AS urn "
+            "ORDER BY depth ASC LIMIT 1"
         )
+        params = {"anchor": anchor_urn, "ctypes": ctypes, "types": types}
         try:
-            result = await self._ro_query(
-                cypher_ancestors, params={"anchor": anchor_urn, "ctypes": ctypes, "types": types},
-            )
-            for row in (result.result_set or []):
-                candidate = row[0]
-                if candidate and await self._has_aggregated_at_level(candidate, level, ltypes):
-                    return candidate
+            result = await self._ro_query(cypher, params=params, timeout=1.5)
+            rows = result.result_set or []
+            if rows and rows[0] and rows[0][0]:
+                return rows[0][0]
         except Exception as exc:
-            logger.warning("trace_at_level: find-ancestor-with-lineage failed for %s: %s", anchor_urn, exc)
+            logger.warning(
+                "trace_at_level: find-ancestor-with-lineage failed for %s: %s",
+                anchor_urn, exc,
+            )
         return None
 
     async def _expand_aggregated_set(
-        self, frontier: List[str], direction: str, level: int,
-        ltypes: Optional[List[str]], limit: int,
+        self,
+        frontier: List[str],
+        frontier_labels: Dict[str, str],
+        direction: str,
+        level: int,
+        ltypes: Optional[List[str]],
+        limit: int,
+        timeout_secs: float,
     ) -> List[Dict[str, Any]]:
         """Per-hop expansion. Direction: 'incoming' (BFS upstream) or 'outgoing'
         (BFS downstream). Returns a list of dicts shaped for the BFS loop:
         {sourceUrn, targetUrn, edgeId, edgeType, edgeTypes, weight, node}.
 
-        Walks ANY lineage edge type listed in ``ltypes`` — not just the
-        materialized AGGREGATED rollup. Critical for fine-grained levels
-        (column / schemaField) where lineage is expressed as raw TRANSFORMS,
-        FLOWS_TO, or other ontology-classified edges that are never aggregated.
+        ``frontier_labels`` maps each URN to its entity-type label so each
+        per-label sub-query can use the per-label ``(:Label).urn`` index for
+        an index-seek instead of a full-graph property scan. URNs without a
+        known label fall back to a label-less pattern (still correct, just
+        slower).
 
-        For AGGREGATED relationships we keep the original ``r.sourceEdgeTypes``
-        intersection check (so the user's edge-type filter still narrows the
-        rollup). For raw lineage relationships we just check ``type(r)`` is in
-        ``ltypes`` — the relationship type itself IS the edge classification.
+        Sub-queries per label bucket per direction:
 
-        Filters by ``labels(other)[0] IN $types`` rather than ``other.level``
-        so the trace works on every existing graph (labels are written at every
-        upsert; ``n.level`` only after backfill_node_levels.py runs). When the
-        ontology has no entity types at the requested level, the level filter
-        is dropped entirely.
+        * AGGREGATED rollup — rel-typed pattern ``[r:AGGREGATED]`` filtered
+          by ``r.sourceLevel`` / ``r.targetLevel`` (the level-pair fast
+          path stamped by the materialiser + backfilled by
+          ``backfill_aggregated_levels.py``). When the level map is
+          missing or the AGGREGATED edge-property index hasn't been
+          created, falls back to ``labels(other)[0] IN $types`` — the
+          legacy neighbour-label scan.
+        * Raw lineage — rel-type alternation ``[r:LTYPE1|LTYPE2|...]`` when
+          ``ltypes`` is set, so fine-grained traces (schemaField /
+          column) still walk TRANSFORMS / FLOWS_TO etc. Raw edges are
+          not level-stamped, so this branch keeps the label filter.
+
+        Each sub-query carries a Cypher ``:timeout`` capped at
+        ``timeout_secs`` so a single bad sub-query cannot consume the
+        whole BFS budget — FalkorDB cancels it server-side and the BFS
+        loop logs and moves on with what it already has.
         """
         if not frontier or limit <= 0:
             return []
 
         types = self._types_at_level(level)
-        # Two switches: direction (incoming/outgoing) and type-filter presence.
-        type_filter = ""
-        if types:
-            other = "s" if direction == "incoming" else "t"
-            type_filter = f"AND labels({other})[0] IN $types "
+        # When the entity-type level map is available, prefer the
+        # level-pair filter on AGGREGATED edges. The materialiser stamps
+        # ``r.sourceLevel``/``r.targetLevel`` on new edges; legacy edges
+        # are covered by ``backfill_aggregated_levels.py``.
+        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
+        use_level_filter = bool(entity_levels) and level >= 0
 
-        # Edge-type filter:
-        # - If ltypes provided, walk relationships whose type matches AGGREGATED
-        #   (with the sub-type intersection on r.sourceEdgeTypes) OR whose type
-        #   is one of the raw lineage types in ltypes.
-        # - If ltypes is empty, walk only AGGREGATED (legacy behavior).
-        if ltypes:
-            ltype_filter = (
-                "AND ("
-                "  (type(r) = 'AGGREGATED' AND r.sourceEdgeTypes IS NOT NULL "
-                "     AND any(et IN r.sourceEdgeTypes WHERE et IN $ltypes)) "
-                "  OR (type(r) IN $ltypes) "
-                ") "
-            )
-            rel_pattern = ""  # match any relationship type
-        else:
-            ltype_filter = ""
-            rel_pattern = ":AGGREGATED"  # legacy fallback
+        # Group frontier URNs by their entity-type label so each sub-query
+        # uses the per-label ``urn`` index. URNs without a known label go
+        # into the "" bucket and use a label-less fallback pattern.
+        by_label: Dict[str, List[str]] = {}
+        for urn in frontier:
+            lbl = frontier_labels.get(urn) or ""
+            by_label.setdefault(lbl, []).append(urn)
 
+        # Direction shapes: ``f`` is the frontier-side variable, ``other`` is
+        # the neighbour we're expanding into. Edge orientation in the returned
+        # record is always (sourceUrn -> targetUrn).
         if direction == "incoming":
-            # Find sources flowing INTO frontier targets
-            cypher = (
-                "UNWIND $frontier AS srcUrn "
-                f"MATCH (s)-[r{rel_pattern}]->(t) "
-                "WHERE t.urn = srcUrn "
-                + type_filter
-                + ltype_filter
-                + "RETURN s.urn AS sourceUrn, t.urn AS targetUrn, "
-                "id(r) AS edgeId, type(r) AS edgeType, "
-                "COALESCE(r.sourceEdgeTypes, [type(r)]) AS edgeTypes, "
-                "COALESCE(r.weight, 1) AS weight, s AS otherNode "
-                "LIMIT $limit"
-            )
+            arrow_template = "<-[r{rel}]-"
+            source_var, target_var = "other", "f"
         else:
-            cypher = (
-                "UNWIND $frontier AS srcUrn "
-                f"MATCH (s)-[r{rel_pattern}]->(t) "
-                "WHERE s.urn = srcUrn "
-                + type_filter
-                + ltype_filter
-                + "RETURN s.urn AS sourceUrn, t.urn AS targetUrn, "
+            arrow_template = "-[r{rel}]->"
+            source_var, target_var = "f", "other"
+
+        def _build(rel_clause: str, *, where_parts: List[str]) -> str:
+            where = ("WHERE " + " AND ".join(where_parts) + " ") if where_parts else ""
+            return (
+                "UNWIND $frontier AS u "
+                f"MATCH (f{{F_LABEL}} {{urn: u}}){arrow_template.format(rel=rel_clause)}(other) "
+                + where
+                + f"RETURN {source_var}.urn AS sourceUrn, {target_var}.urn AS targetUrn, "
                 "id(r) AS edgeId, type(r) AS edgeType, "
                 "COALESCE(r.sourceEdgeTypes, [type(r)]) AS edgeTypes, "
-                "COALESCE(r.weight, 1) AS weight, t AS otherNode "
+                "COALESCE(r.weight, 1) AS weight, other AS otherNode "
                 "LIMIT $limit"
             )
 
-        params: Dict[str, Any] = {"frontier": frontier, "limit": limit}
-        if types:
-            params["types"] = types
-        if ltypes:
-            params["ltypes"] = ltypes
+        # Per-query timeout. The wrapper subtracts 500ms for the DB-side
+        # cancel; clamp the floor at 0.6s so a tight remaining-budget still
+        # gives FalkorDB a useful slice (~100ms).
+        per_query_timeout = max(0.6, min(1.5, timeout_secs))
 
-        try:
-            result = await self._proj_ro_query(cypher, params=params)
-        except Exception as exc:
-            logger.warning("trace_at_level: expand (%s) failed: %s", direction, exc)
+        queries: List[tuple[str, Dict[str, Any]]] = []
+        for f_label, urns in by_label.items():
+            label_clause = f":{_sanitize_label(f_label)}" if f_label else ""
+
+            # AGGREGATED branch. The level-pair fast path is the primary
+            # filter when available; otherwise we keep the legacy label
+            # scan. Both are bounded by LIMIT and the rel-typed pattern.
+            agg_where: List[str] = []
+            if use_level_filter:
+                agg_where.append("r.sourceLevel = $level AND r.targetLevel = $level")
+            elif types:
+                agg_where.append("labels(other)[0] IN $types")
+            if ltypes:
+                agg_where.append(
+                    "(r.sourceEdgeTypes IS NULL "
+                    "OR any(et IN r.sourceEdgeTypes WHERE et IN $ltypes))"
+                )
+            agg_cypher = _build(":AGGREGATED", where_parts=agg_where).replace(
+                "{F_LABEL}", label_clause,
+            )
+            agg_params: Dict[str, Any] = {"frontier": urns, "limit": limit}
+            if use_level_filter:
+                agg_params["level"] = level
+            elif types:
+                agg_params["types"] = types
+            if ltypes:
+                agg_params["ltypes"] = ltypes
+            queries.append((agg_cypher, agg_params))
+
+            # Raw-lineage branch (only when ltypes provided; otherwise we
+            # match AGGREGATED-only — the legacy behaviour for coarse
+            # levels where lineage is already rolled up). Raw edges don't
+            # carry level props, so this branch always uses the label
+            # filter on the neighbour.
+            if ltypes:
+                rel_alt = "|".join(_sanitize_label(t) for t in ltypes)
+                raw_where: List[str] = []
+                if types:
+                    raw_where.append("labels(other)[0] IN $types")
+                raw_cypher = _build(f":{rel_alt}", where_parts=raw_where).replace(
+                    "{F_LABEL}", label_clause,
+                )
+                raw_params: Dict[str, Any] = {"frontier": urns, "limit": limit}
+                if types:
+                    raw_params["types"] = types
+                queries.append((raw_cypher, raw_params))
+
+        if not queries:
             return []
 
-        out: List[Dict[str, Any]] = []
-        for row in (result.result_set or []):
+        async def _run(c: str, p: Dict[str, Any]):
             try:
-                edge_type = str(row[3]) if row[3] is not None else "AGGREGATED"
-                rec = {
-                    "sourceUrn": row[0],
-                    "targetUrn": row[1],
-                    "edgeId": str(row[2]) if row[2] is not None else f"{edge_type.lower()}-{row[0]}-{row[1]}",
-                    "edgeType": edge_type,
-                    "edgeTypes": row[4] if isinstance(row[4], list) else ([row[4]] if row[4] else [edge_type]),
-                    "weight": int(row[5]) if row[5] is not None else 1,
-                    "node": self._extract_node_from_result([row[6]]) if row[6] is not None else None,
-                }
-                out.append(rec)
-            except Exception:
+                return await self._proj_ro_query(
+                    c, params=p, timeout=per_query_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "trace_at_level: expand sub-query (%s) failed: %s",
+                    direction, exc,
+                )
+                return None
+
+        results = await asyncio.gather(*(_run(c, p) for c, p in queries))
+
+        out: List[Dict[str, Any]] = []
+        seen_edge_ids: Set[str] = set()
+        for result in results:
+            if result is None:
                 continue
+            for row in (result.result_set or []):
+                try:
+                    edge_type = str(row[3]) if row[3] is not None else "AGGREGATED"
+                    eid = str(row[2]) if row[2] is not None else (
+                        f"{edge_type.lower()}-{row[0]}-{row[1]}"
+                    )
+                    # Dedupe across the AGGREGATED + raw-lineage sub-queries:
+                    # a raw lineage edge might also appear in the AGGREGATED
+                    # rollup (sourceEdgeTypes contains its type). Keep first.
+                    if eid in seen_edge_ids:
+                        continue
+                    seen_edge_ids.add(eid)
+                    rec = {
+                        "sourceUrn": row[0],
+                        "targetUrn": row[1],
+                        "edgeId": eid,
+                        "edgeType": edge_type,
+                        "edgeTypes": row[4] if isinstance(row[4], list) else (
+                            [row[4]] if row[4] else [edge_type]
+                        ),
+                        "weight": int(row[5]) if row[5] is not None else 1,
+                        "node": self._extract_node_from_result([row[6]]) if row[6] is not None else None,
+                    }
+                    out.append(rec)
+                    if len(out) >= limit:
+                        return out
+                except Exception:
+                    continue
         return out
 
     async def _collect_ancestor_urns(
         self, urns: List[str], ctypes: List[str],
     ) -> List[str]:
-        """Collect ALL containment ancestors of the given URNs in one query.
+        """Collect ALL containment ancestors of the given URNs.
 
         Foundational for trace responses: a trace returns lineage URNs at
         whatever level the user picked (e.g. column-level schemaFields), but
@@ -3199,39 +3500,41 @@ class FalkorDBProvider(GraphDataProvider):
         this, the trace nodes render as orphans or get filtered out by layer
         assignment.
 
-        Set-based, deduped, capped at depth 10. Returns URNs only; caller
-        fetches the node payloads via ``get_nodes_batch``.
+        Reads from the Redis ancestor-chain cache populated by aggregation
+        (:func:`_get_ancestor_chain` / :func:`_compute_and_store_ancestors_bulk`).
+        On cache miss the bulk helper falls back to a per-URN typed Cypher
+        with concurrency 4, then back-fills the cache for future trace
+        requests. This replaces the previous single ``UNWIND $urns ...
+        <-[c*1..10]-(ancestor)`` query that re-walked containment on every
+        trace and was the second-biggest CPU consumer after the BFS itself.
+
+        Raises on hard failure (Redis + Cypher both unavailable) so the
+        caller can surface ``truncationReason="ancestors_failed"`` instead
+        of silently dropping the containment chain (which produces canvas
+        orphans).
         """
         if not urns or not ctypes:
             return []
-        # NOTE: an earlier rewrite combined the per-URN UNWIND into a
-        # single MATCH with `n.urn IN $urns`, but that triggers the same
-        # FalkorDB "Type mismatch: expected List or Null but was Edge"
-        # planner bug A1 hit on the descendants side, on graphs where
-        # ``$urns`` exceeds ~few hundred entries. The variable-length
-        # alias ``c`` is misclassified as Edge under that plan shape.
-        # Reverted to UNWIND-per-URN until we have a query form that's
-        # both fast AND survives the planner bug.
-        cypher = (
-            "UNWIND $urns AS u "
-            "MATCH (n {urn: u})<-[c*1..10]-(ancestor) "
-            "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
-            "RETURN DISTINCT ancestor.urn AS ancestorUrn"
-        )
         try:
-            result = await self._ro_query(cypher, params={"urns": urns, "ctypes": ctypes})
-            out: List[str] = []
-            for row in (result.result_set or []):
-                if row and row[0]:
-                    out.append(row[0])
-            return out
+            chains = await self._compute_and_store_ancestors_bulk(list(urns))
         except Exception as exc:
-            # Re-raise so callers can preserve already-fetched lineage and
-            # surface ``truncationReason="ancestors_failed"`` instead of
-            # silently dropping the containment chain (which produces
-            # canvas orphans).
-            logger.warning("trace_at_level: ancestor collection failed for %d urns: %s", len(urns), exc)
+            logger.warning(
+                "trace_at_level: ancestor collection failed for %d urns: %s",
+                len(urns), exc,
+            )
             raise
+
+        # ``_compute_and_store_ancestors_bulk`` returns a {urn: chain} map.
+        # Flatten + dedupe while preserving first-seen order so any caller
+        # that depends on parent-before-grandparent ordering still gets it.
+        seen: Set[str] = set()
+        out: List[str] = []
+        for chain in chains.values():
+            for ancestor in chain or []:
+                if ancestor and ancestor not in seen:
+                    seen.add(ancestor)
+                    out.append(ancestor)
+        return out
 
     async def _collect_descendants_pair_at_level(
         self,
@@ -3274,15 +3577,20 @@ class FalkorDBProvider(GraphDataProvider):
             # the per-side `$limit` applies before ``collect()`` and the
             # path-alias never enters a slice context. One round-trip
             # instead of the prior two.
+            #
+            # Variable-length bound = max ontology depth (floor 10) so
+            # very deep ontologies aren't truncated and shallow ones
+            # don't pay for unused depth.
+            max_depth = max(len(getattr(self, "_entity_type_levels", {}) or {}), 10)
             cypher = (
-                "MATCH (a {urn: $source})-[c*0..10]->(child) "
+                f"MATCH (a {{urn: $source}})-[c*0..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
                 "LIMIT $limit "
                 "RETURN 's' AS side, collect(urn) AS urns "
                 "UNION "
-                "MATCH (b {urn: $target})-[c*0..10]->(child) "
+                f"MATCH (b {{urn: $target}})-[c*0..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
@@ -3294,7 +3602,7 @@ class FalkorDBProvider(GraphDataProvider):
                 "ctypes": ctypes, "types": types, "limit": limit,
             }
         try:
-            result = await self._ro_query(cypher, params=params)
+            result = await self._ro_query(cypher, params=params, timeout=2.0)
         except Exception as exc:
             logger.warning(
                 "trace_at_level: descendant pair collection failed for (%s, %s): %s",
@@ -3388,21 +3696,82 @@ class FalkorDBProvider(GraphDataProvider):
     async def _fetch_containment_edges(
         self, urns: List[str], ctypes: List[str],
     ) -> List[GraphEdge]:
-        """One Cypher: containment edges where both endpoints are in ``urns``."""
+        """Containment edges where both endpoints are in ``urns``.
+
+        Pair-list driven: builds the parent→child pairs we expect to exist
+        from the cached ancestor chains (already populated by aggregation
+        + the earlier :func:`_collect_ancestor_urns` call in
+        :func:`trace_at_level`). Then issues ONE rel-typed Cypher to
+        resolve the real edge type + id per pair.
+
+        Replaces the previous ``UNWIND $urns ... MATCH (s)-[r]->(t)
+        WHERE t.urn IN $urns AND type(r) IN $ctypes`` which scanned every
+        outgoing edge from every URN before filtering — quadratic on
+        wide trace results and a major contributor to the 8s timeout on
+        100k-node graphs.
+
+        Cold-cache fallback uses the same rel-typed alternation pattern
+        so it's still faster than the legacy form.
+        """
         if not urns or not ctypes:
             return []
-        cypher = (
-            "UNWIND $urns AS u "
-            "MATCH (s {urn: u})-[r]->(t) "
-            "WHERE t.urn IN $urns AND type(r) IN $ctypes "
-            "RETURN s.urn AS sUrn, t.urn AS tUrn, type(r) AS edgeType, "
-            "id(r) AS edgeId"
-        )
+
+        rel_alt = "|".join(_sanitize_label(c) for c in ctypes)
+        urn_set = set(urns)
+
+        # Build (parent, child) pair candidates from cached chains.
         try:
-            result = await self._ro_query(cypher, params={"urns": urns, "ctypes": ctypes})
-        except Exception as exc:
-            logger.warning("trace_at_level: containment edge fetch failed: %s", exc)
-            return []
+            chains = await self._compute_and_store_ancestors_bulk(list(urns))
+        except Exception:
+            chains = {}
+
+        pairs: Set[tuple] = set()
+        for child_urn, chain in (chains or {}).items():
+            prev = child_urn
+            for ancestor in chain or []:
+                if ancestor in urn_set and prev in urn_set:
+                    pairs.add((ancestor, prev))
+                prev = ancestor
+
+        if pairs:
+            pair_list = [{"s": s, "t": t} for s, t in pairs]
+            cypher = (
+                "UNWIND $pairs AS p "
+                f"MATCH (s {{urn: p.s}})-[r:{rel_alt}]->(t {{urn: p.t}}) "
+                "RETURN p.s AS sUrn, p.t AS tUrn, "
+                "type(r) AS edgeType, id(r) AS edgeId"
+            )
+            try:
+                result = await self._ro_query(
+                    cypher, params={"pairs": pair_list}, timeout=2.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "trace_at_level: containment edge pair-fetch failed (%d pairs): %s",
+                    len(pair_list), exc,
+                )
+                return []
+        else:
+            # Cold-cache fallback. Still rel-typed (avoids the OR-on-type
+            # full edge scan of the legacy query).
+            cypher = (
+                "UNWIND $urns AS u "
+                f"MATCH (s {{urn: u}})-[r:{rel_alt}]->(t) "
+                "WHERE t.urn IN $urns "
+                "RETURN s.urn AS sUrn, t.urn AS tUrn, "
+                "type(r) AS edgeType, id(r) AS edgeId"
+            )
+            try:
+                result = await self._ro_query(
+                    cypher, params={"urns": list(urns)}, timeout=2.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "trace_at_level: containment edge fallback fetch failed: %s",
+                    exc,
+                )
+                return []
+
         out: List[GraphEdge] = []
         for row in (result.result_set or []):
             try:
