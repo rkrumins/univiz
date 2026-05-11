@@ -9,6 +9,7 @@ import { TraceDockTabs, type TraceDockTab } from './TraceDockTabs'
 import { TraceDockOverview } from './TraceDockOverview'
 import { TraceDockDrilldownList } from './TraceDockDrilldownList'
 import { TraceDockSettings } from './TraceDockSettings'
+import { shouldShowTruncationNotice } from './TraceDockNoticeStrip'
 import type { GranularityOption } from './TraceDockControls'
 import { useTraceEscStack } from './useTraceEscStack'
 
@@ -24,9 +25,9 @@ export interface TraceBottomDockProps {
   onJumpToUrn: (urn: string) => void
 }
 
-const COMPACT_HEIGHT = 56
-const MIN_EXPANDED_HEIGHT = 220
-const DEFAULT_EXPANDED_HEIGHT = 300
+const COMPACT_HEIGHT = 64
+const MIN_EXPANDED_HEIGHT = 240
+const DEFAULT_EXPANDED_HEIGHT = 320
 const MAX_VH_FRACTION = 0.6
 
 // Module-level so the user's preferred expanded height persists across
@@ -44,10 +45,12 @@ let lastExpandedHeight = DEFAULT_EXPANDED_HEIGHT
  * title bar, then a 36px tab strip (Overview · Drilldowns · Settings),
  * then the active tab body. Tabs cross-fade with a 180ms ease.
  *
- * The dock sits inside canvas-body's relative-positioned container.
- * Right edge follows `--entity-drawer-width` so it never overlaps the
- * EntityDrawer. z-index 30 keeps it above EdgeLegend at z-30 (which is
- * lifted above the dock by the parent via `--trace-dock-height`).
+ * The dock sits inside canvas-body's relative-positioned container and
+ * spans its full width (`left-3 right-3`). canvas-body itself shrinks
+ * when the EntityDrawer (a flex sibling of the canvas column) opens, so
+ * the dock follows along for free — no manual offset needed. z-index 30
+ * keeps it above EdgeLegend; the parent lifts EdgeLegend via the
+ * `--trace-dock-height` CSS variable the dock publishes.
  */
 export function TraceBottomDock({
   trace,
@@ -76,8 +79,12 @@ export function TraceBottomDock({
   // Overview. Reset the flag when the dock collapses so the next expand
   // re-evaluates.
   const drilldownCount = trace.drilldowns.size
+  // Mirror the notice-strip's own gating logic so the title-bar/tab amber
+  // alert dot is only lit when the strip will actually render. Truncation
+  // is filtered through `shouldShowTruncationNotice` to suppress false
+  // alarms on tiny results.
   const hasNotice = !!(
-    trace.result?.truncated ||
+    shouldShowTruncationNotice(trace.result) ||
     (trace.result?.isInherited && trace.result?.inheritedFromUrn)
   )
 
@@ -160,13 +167,9 @@ export function TraceBottomDock({
       animate={{ opacity: 1, y: 0, height: dockHeight }}
       exit={{ opacity: 0, y: 24 }}
       transition={MOTION.modalSpring}
-      style={{
-        height: dockHeight,
-        right: 'calc(var(--entity-drawer-width, 0px) + 12px)',
-        transition: 'right 300ms cubic-bezier(0.16, 1, 0.3, 1)',
-      }}
+      style={{ height: dockHeight }}
       className={cn(
-        'absolute left-3 bottom-3 z-30',
+        'absolute left-3 right-3 bottom-3 z-30',
         'rounded-2xl overflow-hidden',
         // Premium frosted shell: gradient base + heavy blur + accent-tinted border
         'bg-gradient-to-b from-canvas-elevated/96 via-canvas-elevated/95 to-canvas-elevated/96',

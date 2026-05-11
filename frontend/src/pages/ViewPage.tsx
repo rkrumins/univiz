@@ -59,18 +59,6 @@ export function ViewPage() {
   // ─── Ready state — render canvas in a view-scoped execution context ──
   return (
     <div className="absolute inset-0">
-      {/* View name badge */}
-      {view && status === 'ready' && (
-        <div className="absolute top-2 left-2 z-20 glass-panel-subtle rounded-lg px-3 py-1.5 flex items-center gap-2 pointer-events-none">
-          <span className="text-xs font-medium text-ink-primary">{view.name}</span>
-          {view.isPublic && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-500/20 text-green-400">
-              shared
-            </span>
-          )}
-        </div>
-      )}
-
       {/* Health warning overlay for broken views */}
       {status === 'ready' && healthWarning && (
         <div className="absolute inset-0 flex items-center justify-center bg-canvas/80 backdrop-blur-sm z-30">

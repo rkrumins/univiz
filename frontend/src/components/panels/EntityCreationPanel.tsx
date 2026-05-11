@@ -328,11 +328,12 @@ export function EntityCreationPanel({
     return (
         <AnimatePresence>
             <motion.div
-                initial={{ opacity: 0, x: 400 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 400 }}
-                className="fixed right-0 top-0 bottom-0 w-[400px] z-50 glass-panel border-l border-glass-border shadow-lg flex flex-col"
+                initial={{ opacity: 0, width: 0 }}
+                animate={{ opacity: 1, width: 400 }}
+                exit={{ opacity: 0, width: 0 }}
+                className="relative h-full flex-shrink-0 overflow-hidden glass-panel border-l border-glass-border shadow-lg"
             >
+                <div className="w-[400px] h-full flex flex-col">
                 {/* Header */}
                 <div className="flex-shrink-0 px-5 py-4 border-b border-glass-border bg-canvas-elevated/95">
                     <div className="flex items-center justify-between">
@@ -582,6 +583,7 @@ export function EntityCreationPanel({
                             )}
                         </button>
                     </div>
+                </div>
                 </div>
             </motion.div>
         </AnimatePresence>

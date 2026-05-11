@@ -249,17 +249,18 @@ export function EdgeDetailPanel({
         <motion.div
             ref={panelRef}
             data-panel="edge-detail-panel"
-            initial={{ x: 300, opacity: 0 }}
-            animate={{ x: 0, opacity: 1 }}
-            exit={{ x: 300, opacity: 0 }}
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: 'clamp(400px, 28vw, 520px)', opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
             transition={{ type: 'spring', damping: 25, stiffness: 300 }}
             className={cn(
-                "absolute right-0 top-0 bottom-0 w-[clamp(400px,28vw,520px)] z-20",
+                "relative h-full flex-shrink-0 overflow-hidden",
                 "bg-canvas-elevated/95 backdrop-blur-lg border-l border-glass-border",
-                "flex flex-col shadow-lg",
+                "shadow-lg",
                 className
             )}
         >
+            <div className="w-[clamp(400px,28vw,520px)] h-full flex flex-col">
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-glass-border">
                 <div className="flex items-center gap-2">
@@ -601,6 +602,7 @@ export function EdgeDetailPanel({
                 {activeTab === 'highlighted' && highlightedEdges.length === 0 && (
                     <EmptyState message="Click the highlight icon on edges to add them" />
                 )}
+            </div>
             </div>
         </motion.div>
     )

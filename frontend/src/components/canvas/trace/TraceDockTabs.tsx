@@ -39,9 +39,9 @@ export function TraceDockTabs({ active, onChange, drilldownCount, hasNotice }: T
         role="tablist"
         aria-label="Trace dock sections"
         className={cn(
-          'relative flex items-center gap-1.5 px-4 h-11 shrink-0',
-          'border-b border-white/[0.06]',
-          'bg-gradient-to-r from-white/[0.02] via-transparent to-white/[0.02]',
+          'relative flex items-center gap-1.5 px-4 h-10 shrink-0',
+          'border-b border-white/[0.08]',
+          'bg-white/[0.015]',
         )}
       >
         {tabs.map(tab => {
