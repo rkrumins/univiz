@@ -45,11 +45,35 @@ fi
 
 usage() { sed -n '4,21p' "$0" | sed 's/^# //; s/^#//'; }
 
+# ── Postgres preflight ─────────────────────────────────────────────
+# An unclean container shutdown (Docker Desktop quit, OOM, host sleep)
+# can leave pg_logical/replorigin_checkpoint truncated, which makes
+# Postgres PANIC on next start with:
+#   replication checkpoint has wrong magic 0 instead of 307747550
+# We don't use logical replication in dev, so a corrupt file is safe
+# to delete — Postgres rebuilds it from an empty origin set on boot.
+pg_repair_replorigin() {
+    local volume="synodic-postgres-dev-data"
+    docker volume inspect "$volume" >/dev/null 2>&1 || return 0
+    docker run --rm -v "${volume}:/data" alpine sh -c '
+        f=/data/pg_logical/replorigin_checkpoint
+        [ -f "$f" ] || exit 0
+        # Valid file is >=8 bytes and starts with magic 0x12597C5E (LE: 5e 7c 59 12)
+        size=$(wc -c < "$f")
+        magic=$(od -An -tx1 -N4 "$f" | tr -d " \n")
+        if [ "$size" -lt 8 ] || [ "$magic" != "5e7c5912" ]; then
+            echo "[dev] repairing corrupt pg_logical/replorigin_checkpoint (size=$size magic=$magic)" >&2
+            rm -f "$f"
+        fi
+    ' 2>&1
+}
+
 cmd="${1:-up}"
 shift || true
 
 case "$cmd" in
     up)
+        pg_repair_replorigin
         "${COMPOSE[@]}" up -d "$@"
         echo ""
         echo "  Frontend     http://localhost:${FRONTEND_PORT:-5173}"
@@ -58,6 +82,7 @@ case "$cmd" in
         echo "  Status:      ./dev.sh ps"
         ;;
     infra)
+        pg_repair_replorigin
         "${COMPOSE[@]}" up -d postgres redis falkordb
         set -a; source "$ENV_FILE"; set +a
         echo ""
@@ -75,6 +100,9 @@ case "$cmd" in
         ;;
     restart)
         [ "$#" -gt 0 ] || { echo "usage: ./dev.sh restart <service>" >&2; exit 1; }
+        for svc in "$@"; do
+            [ "$svc" = postgres ] && pg_repair_replorigin
+        done
         "${COMPOSE[@]}" restart "$@"
         ;;
     build)
