@@ -3039,11 +3039,13 @@ class FalkorDBProvider(GraphDataProvider):
                 tasks.append(("up", self._expand_aggregated_set(
                     list(up_frontier), up_labels, "incoming",
                     effective_level, ltypes, budget, hop_timeout_secs,
+                    default_peer_label=focus_entity_type,
                 )))
             if hop < downstream_depth and down_frontier:
                 tasks.append(("down", self._expand_aggregated_set(
                     list(down_frontier), down_labels, "outgoing",
                     effective_level, ltypes, budget, hop_timeout_secs,
+                    default_peer_label=focus_entity_type,
                 )))
             if not tasks:
                 break
@@ -3171,11 +3173,13 @@ class FalkorDBProvider(GraphDataProvider):
                     tasks.append(("up", self._expand_aggregated_set(
                         list(up_frontier), up_labels, "incoming",
                         effective_level, ltypes, budget, hop_timeout_secs,
+                        default_peer_label=focus_entity_type,
                     )))
                 if hop < downstream_depth and down_frontier:
                     tasks.append(("down", self._expand_aggregated_set(
                         list(down_frontier), down_labels, "outgoing",
                         effective_level, ltypes, budget, hop_timeout_secs,
+                        default_peer_label=focus_entity_type,
                     )))
                 if not tasks:
                     break
@@ -3628,6 +3632,7 @@ class FalkorDBProvider(GraphDataProvider):
         ltypes: Optional[List[str]],
         limit: int,
         timeout_secs: float,
+        default_peer_label: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Per-hop expansion. Direction: 'incoming' (BFS upstream) or 'outgoing'
         (BFS downstream). Returns a list of dicts shaped for the BFS loop:
@@ -3638,6 +3643,13 @@ class FalkorDBProvider(GraphDataProvider):
         an index-seek instead of a full-graph property scan. URNs without a
         known label fall back to a label-less pattern (still correct, just
         slower).
+
+        ``default_peer_label`` is the focus's sanitized entity-type label,
+        used as the neighbour filter when no level-set and no per-bucket
+        label can constrain the expansion. Without this, the query would
+        walk to ANY neighbour and a Layer-focused trace would over-fetch
+        into Attribute children (the original Solidatus bug). Pass the
+        focus's entity_type so peer-rollup always has a fallback.
 
         Sub-queries per label bucket per direction:
 
@@ -3713,23 +3725,38 @@ class FalkorDBProvider(GraphDataProvider):
         # gives FalkorDB a useful slice (~100ms).
         per_query_timeout = max(0.6, min(1.5, timeout_secs))
 
+        # Sanitize the focus's entity-type once — used as the fallback
+        # neighbour filter when a frontier bucket has no per-URN label
+        # (because get_node returned None, entity_type wasn't populated,
+        # or labels(n)[0] didn't match the upsert convention).
+        sanitized_default_peer = (
+            _sanitize_label(default_peer_label) if default_peer_label else ""
+        )
+
         queries: List[tuple[str, Dict[str, Any]]] = []
         for f_label, urns in by_label.items():
             sanitized_self_label = _sanitize_label(f_label) if f_label else ""
             label_clause = f":{sanitized_self_label}" if sanitized_self_label else ""
 
-            # Peer-rollup default neighbour filter. When the ontology's
-            # entity-type-levels map doesn't declare a level for the focus's
-            # type (e.g. Solidatus "layer" without hierarchy.level), the
-            # legacy `types = _types_at_level(level)` returns an empty list,
-            # and `labels(other)[0] IN $types` would be omitted. Without
-            # ANY neighbour filter, raw FLOWS_TO + AGGREGATED queries walk
-            # to whatever they can reach — including finer-grained children
-            # (attributes under layers). Default to same-label peer rollup
-            # in that case so a Layer trace stays layer→layer.
+            # Peer-rollup neighbour filter. Order of preference:
+            #   1. Per-bucket frontier label (sanitized_self_label)
+            #   2. Caller-supplied default (focus entity_type)
+            # If NEITHER is set, refuse to emit an unconstrained query —
+            # the legacy "no filter at all" path is the over-fetch bug
+            # that pulled Attributes into a Layer trace.
+            effective_peer_label = sanitized_self_label or sanitized_default_peer
             peer_filter_clause: Optional[str] = None
-            if sanitized_self_label:
-                peer_filter_clause = f"labels(other)[0] = '{sanitized_self_label}'"
+            if effective_peer_label:
+                peer_filter_clause = f"labels(other)[0] = '{effective_peer_label}'"
+            else:
+                logger.warning(
+                    "trace expand: no peer label for bucket=%r and no default — "
+                    "skipping sub-query to avoid unconstrained over-fetch",
+                    f_label,
+                )
+                # Skip this bucket entirely. Better to return zero edges
+                # than to return every neighbour in the graph.
+                continue
 
             # AGGREGATED branch. The level-pair fast path is the primary
             # filter when available; otherwise label scan or peer fallback.
