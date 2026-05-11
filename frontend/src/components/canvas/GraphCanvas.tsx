@@ -300,9 +300,17 @@ export function GraphCanvas({ className }: { className?: string }) {
   // Track previous aggregation targets to avoid redundant fetches
   const prevAggregationKeyRef = useRef('')
 
-  // Fetch aggregated lineage when visible node set changes
+  // Fetch aggregated lineage when visible node set changes.
+  //
+  // GATED ON !trace.isTracing: when a trace is active, the trace response
+  // already carries the AGGREGATED edges at the right level (skeleton-first
+  // contract — see backend/app/api/v2/endpoints/graph.py). Issuing a parallel
+  // /aggregated-lineage fetch would double the network roundtrip and risk
+  // racing the two results into the canvas. In browse mode (no active trace)
+  // the hook fires as before to populate level-0 rollups for context.
   useEffect(() => {
     if (!showLineageFlow || rawNodes.length === 0) return
+    if (trace.isTracing) return
 
     const fetchDebounced = setTimeout(() => {
       // Collect URNs of all visible nodes
@@ -331,7 +339,7 @@ export function GraphCanvas({ className }: { className?: string }) {
     }, 500) // 500ms debounce
 
     return () => clearTimeout(fetchDebounced)
-  }, [showLineageFlow, rawNodes.length, visibleNodeIds, expandedNodes, fetchAggregated])
+  }, [showLineageFlow, rawNodes.length, visibleNodeIds, expandedNodes, fetchAggregated, trace.isTracing])
 
   // 10. Edge projection — the core of multi-level lineage visualization.
   //

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models.graph import (
-    GraphNode, GraphEdge, LineageResult,
+    GraphNode, GraphEdge,
     NodeQuery, EdgeQuery,
     AggregatedEdgeRequest, AggregatedEdgeResult,
     CreateNodeRequest, CreateNodeResult,
@@ -102,47 +102,53 @@ async def _resolve_data_source_id(
 # Graph endpoints                                                     #
 # ------------------------------------------------------------------ #
 
-@router.post("/trace", response_model=LineageResult, response_model_by_alias=True)
-async def get_lineage_trace(
-    urn: str = Body(..., embed=True),
-    direction: str = Body("both", embed=True),
-    depth: int = Body(3, embed=True),
-    upstream_depth: Optional[int] = Body(None, embed=True, alias="upstreamDepth"),
-    downstream_depth: Optional[int] = Body(None, embed=True, alias="downstreamDepth"),
-    granularity: Optional[str] = Body(None, embed=True),
-    aggregate_edges: bool = Body(True, embed=True, alias="aggregateEdges"),
-    exclude_containment_edges: bool = Body(True, embed=True, alias="excludeContainmentEdges"),
-    include_inherited_lineage: bool = Body(True, embed=True, alias="includeInheritedLineage"),
-    lineage_edge_types: Optional[List[str]] = Body(None, embed=True, alias="lineageEdgeTypes"),
-    engine: ContextEngine = Depends(get_context_engine),
-):
-    """
-    Unified Lineage Trace Endpoint.
+# V1 trace sunset date — 2 weeks from the cutover. Update if the
+# deprecation window changes. RFC 8594 Sunset header format.
+_V1_TRACE_SUNSET = "Mon, 25 May 2026 00:00:00 GMT"
 
-    Supports:
-    - Separate upstream/downstream depth configuration
-    - Server-side aggregation and filtering by granularity
-    - Containment edge filtering (for pure data lineage)
-    - Inherited lineage from children (aggregate child lineage to parent)
-    - Ontology-driven edge classification (no hardcoded edge types)
-    - Optional lineage edge type filtering (trace only specific relationship types)
-    - Optional connectionId to target a specific registered graph connection
-    """
-    effective_upstream = upstream_depth if upstream_depth is not None else (depth if direction in ["upstream", "both"] else 0)
-    effective_downstream = downstream_depth if downstream_depth is not None else (depth if direction in ["downstream", "both"] else 0)
-    if effective_upstream == 0 and effective_downstream == 0:
-        effective_upstream = depth if direction in ["upstream", "both"] else 0
-        effective_downstream = depth if direction in ["downstream", "both"] else 0
 
-    return await engine.get_lineage(
-        urn,
-        effective_upstream,
-        effective_downstream,
-        granularity=granularity,
-        aggregate_edges=aggregate_edges,
-        exclude_containment_edges=exclude_containment_edges,
-        include_inherited_lineage=include_inherited_lineage,
-        lineage_edge_types=lineage_edge_types,
+@router.post("/trace", response_model=None, response_model_by_alias=False, deprecated=True)
+async def get_lineage_trace_deprecated(request: Request):
+    """**REMOVED — V1 trace is no longer served.**
+
+    The legacy ``/api/v1/{ws}/graph/trace`` endpoint backed by
+    ``engine.get_lineage()`` was the slow path that timed out on 100k+
+    node graphs. Skeleton-first replacement lives at
+    ``POST /api/v2/{ws}/graph/trace`` and serves the top-level Domain
+    skeleton in <100 ms.
+
+    Clients during the 2-week deprecation window receive HTTP 410 with
+    a ``Sunset`` header and a migration pointer. After the window the
+    route is removed entirely.
+    """
+    client_host = request.client.host if request.client else "?"
+    logger.warning(
+        "v1_trace_deprecated called from %s — clients must migrate to "
+        "POST /api/v2/{ws}/graph/trace",
+        client_host,
+    )
+    return JSONResponse(
+        status_code=410,
+        headers={
+            "Sunset": _V1_TRACE_SUNSET,
+            "Deprecation": "true",
+            "Link": '</api/v2/{ws_id}/graph/trace>; rel="successor-version"',
+        },
+        content={
+            "error": {
+                "code": "v1_trace_deprecated",
+                "message": (
+                    "POST /api/v1/{ws}/graph/trace has been removed. "
+                    "Use POST /api/v2/{ws}/graph/trace — the skeleton-first "
+                    "trace returns the top-level Domain skeleton by default "
+                    "and supports lazy drill-down via /trace/expand."
+                ),
+                "details": {
+                    "successor": "POST /api/v2/{ws_id}/graph/trace",
+                    "sunset": _V1_TRACE_SUNSET,
+                },
+            },
+        },
     )
 
 

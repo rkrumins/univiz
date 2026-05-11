@@ -643,8 +643,8 @@ export function useTraceStatistics(): TraceStatistics {
       totalEdges: data.edges.length,
       edgeTypes: Array.from(edgeTypes),
       regime: meta.regime,
-      materializedHitRate: meta.materializedHitRate,
-      queryMs: meta.queryMs,
+      materializedHitRate: meta.materializedHitRate ?? 0,
+      queryMs: meta.queryMs ?? meta.cypherMs ?? 0,
       isInherited: data.inheritedFrom.length > 0,
       inheritedFrom: data.inheritedFrom,
     }
