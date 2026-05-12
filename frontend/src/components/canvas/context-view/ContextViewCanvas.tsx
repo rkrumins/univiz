@@ -1389,8 +1389,12 @@ export function ContextViewCanvas({
           className="flex-1 overflow-auto relative scroll-smooth"
           onClick={handleBackgroundClick}
         >
-          {/* Lineage Flow Overlay - Render BEFORE columns to be behind them (z-index managed in component to 0, cols should be higher) */}
-          {(showLineageFlow || trace.isTracing) && (
+          {/* Lineage Flow Overlay - Render BEFORE columns to be behind them
+              (z-index managed in component to 0, cols should be higher).
+              Flow is the master switch — Trace mode respects it so the user
+              can dial back ambient edge noise while keeping trace highlights
+              on the nodes and trace panels open. */}
+          {showLineageFlow && (
             <LineageFlowOverlay
               nodes={renderFlat}
               edges={visibleLineageEdges}

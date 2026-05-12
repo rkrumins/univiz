@@ -154,7 +154,11 @@ export function ContextViewHeader({
             <motion.div animate={{ rotate: showLineageFlow ? 0 : -180 }} transition={{ duration: 0.3 }}>
               <LucideIcons.GitBranch className="w-4 h-4" />
             </motion.div>
-            <span>{showLineageFlow ? 'Flow Active' : 'Show Flow'}</span>
+            <span>
+              {showLineageFlow
+                ? (traceActive ? 'Flow + Trace' : 'Flow Active')
+                : 'Show Flow'}
+            </span>
             <div className={cn(
               "w-2 h-2 rounded-full transition-colors duration-300",
               showLineageFlow ? "bg-green-500 dark:bg-green-400 dark:shadow-lg dark:shadow-green-400/50" : "bg-ink-muted/30"
