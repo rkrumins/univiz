@@ -23,8 +23,7 @@ slowapi>=0.1.9           # Rate limiting for auth endpoints
 # Graph adapter dependencies
 neo4j>=5.14.0            # Neo4j async driver (Phase 4)
 httpx>=0.26.0            # DataHub GraphQL HTTP client + async test client
-google-cloud-spanner>=3.49.0                 # Spanner Graph adapter — sync client wrapped in anyio.to_thread
-google-cloud-spanner-admin-database>=3.49.0  # CREATE TABLE / CREATE PROPERTY GRAPH bootstrap
+google-cloud-spanner>=3.49.0                 # Spanner Graph adapter (bundles spanner_admin_database_v1 for CREATE TABLE / CREATE PROPERTY GRAPH bootstrap)
 anyio>=4.0.0                                 # Threadpool used by Spanner async/sync seam
 
 # Structured logging

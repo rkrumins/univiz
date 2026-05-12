@@ -49,7 +49,7 @@ export default defineConfig({
       '/api': {
         target:
           process.env.VITE_PROXY_TARGET ||
-          `http://127.0.0.1:${process.env.VIZ_PORT || '8000'}`,
+          `http://127.0.0.1:${process.env.VIZ_PORT || '8001'}`,
         changeOrigin: true,
       },
     },
