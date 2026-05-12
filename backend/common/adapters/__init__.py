@@ -11,6 +11,7 @@ call and pipeline execution has an ``asyncio.wait_for()`` deadline.
 from .circuit import (
     CircuitBreakerProxy,
     ProviderUnavailable,
+    ProviderBusy,
     _AsyncCircuitBreaker as AsyncCircuitBreaker,
     _BreakerOpenError as BreakerOpenError,
     BreakerState,
@@ -20,6 +21,7 @@ from .timeout_redis import TimeoutRedis
 __all__ = [
     "CircuitBreakerProxy",
     "ProviderUnavailable",
+    "ProviderBusy",
     "AsyncCircuitBreaker",
     "BreakerOpenError",
     "BreakerState",

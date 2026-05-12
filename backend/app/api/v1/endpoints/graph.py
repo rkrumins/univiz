@@ -174,9 +174,11 @@ async def trace_v2(
     AGGREGATED edges between them. Filters by ``s.level``/``t.level`` at
     the database — never explodes a Domain-level trace down to Columns.
 
-    Hard caps: ``TRACE_MAX_NODES=2000`` nodes, ``TRACE_TIMEOUT_MS=8000`` ms
-    (server config; not per-request). On trip, returns ``truncated: true``
-    with ``truncationReason``. Always HTTP 200 unless input is malformed.
+    Hard caps: ``TRACE_MAX_NODES`` (default 2000) nodes,
+    ``TRACE_TIMEOUT_SECS`` (default 60 s) outer budget — both server
+    config, not per-request. See ``app/config/resilience.py``. On trip,
+    returns ``truncated: true`` with ``truncationReason``. Always HTTP
+    200 unless input is malformed.
     """
     return await engine.trace(request)
 

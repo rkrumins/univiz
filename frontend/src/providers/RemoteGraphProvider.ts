@@ -1,6 +1,7 @@
 import { unwrapEnvelope } from '@/services/cacheEnvelope'
 import { getCircuitBreaker, type CircuitBreaker } from '@/services/circuitBreaker'
 import { fetchWithTimeout } from '@/services/fetchWithTimeout'
+import { TIMEOUTS } from '@/config/timeouts'
 
 import type {
     GraphDataProvider,
@@ -283,7 +284,9 @@ export class RemoteGraphProvider implements GraphDataProvider {
             options.edgeTypes.forEach(t => params.append('edgeTypes', t))
         }
 
-        return await this.fetch<GraphNode[]>(`/nodes/${encodeURIComponent(parentUrn)}/children?${params.toString()}`)
+        return await this.fetch<GraphNode[]>(`/nodes/${encodeURIComponent(parentUrn)}/children?${params.toString()}`, {
+            timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
+        })
     }
 
     async getChildrenWithEdges(
@@ -321,7 +324,9 @@ export class RemoteGraphProvider implements GraphDataProvider {
             options.lineageEdgeTypes.forEach(t => params.append('lineageEdgeTypes', t))
         }
 
-        return await this.fetch(`/nodes/${encodeURIComponent(parentUrn)}/children-with-edges?${params.toString()}`)
+        return await this.fetch(`/nodes/${encodeURIComponent(parentUrn)}/children-with-edges?${params.toString()}`, {
+            timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
+        })
     }
 
     async getParent(childUrn: URN): Promise<GraphNode | null> {
@@ -452,6 +457,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
         const raw = await this.fetch<RawTraceV2Result>('/trace/v2', {
             method: 'POST',
             body: JSON.stringify(request),
+            timeoutMs: TIMEOUTS.TRACE_MS,
         })
         return normalizeTraceV2(raw)
     }
@@ -460,6 +466,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
         const raw = await this.fetch<RawTraceV2Result>('/trace/expand', {
             method: 'POST',
             body: JSON.stringify(request),
+            timeoutMs: TIMEOUTS.TRACE_MS,
         })
         return normalizeTraceV2(raw)
     }
@@ -568,13 +575,13 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // ==========================================
 
     async getAggregatedEdges(request: AggregatedEdgeRequest): Promise<AggregatedEdgeResult> {
-        // Aligns with backend HTTP_TIMEOUT_AGGREGATION_SECS (45s) for the
-        // aggregated-edges route — the 8s default is sized for cache-hit
-        // graph endpoints and aborts legitimately-slow Cypher reads.
+        // Aligns with backend HTTP_TIMEOUT_AGGREGATION_SECS for the
+        // aggregated-edges route — value sourced from the central
+        // src/config/timeouts.ts so FE and BE stay in lockstep.
         return await this.fetch<AggregatedEdgeResult>('/edges/aggregated', {
             method: 'POST',
             body: JSON.stringify(request),
-            timeoutMs: 45_000,
+            timeoutMs: TIMEOUTS.AGGREGATED_EDGES_MS,
         })
     }
 

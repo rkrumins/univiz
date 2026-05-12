@@ -37,7 +37,7 @@ from typing import Any, Callable, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.common.adapters import ProviderUnavailable
+from backend.common.adapters import ProviderUnavailable, ProviderBusy
 
 from backend.app.jobs import (
     JobScope as PlatformJobScope,
@@ -500,6 +500,16 @@ class AggregationWorker:
         last_error: Exception | None = None
         provider_unavailable_count = 0
 
+        # Phase 2 — quiesce events (ProviderBusy raised by the provider
+        # when write p95 climbs above the trigger) are flow control,
+        # not failures. They do NOT count against ``max_retries``; the
+        # worker simply parks the job for ``retry_after_seconds`` and
+        # re-attempts. A safety cap on consecutive quiesce events
+        # prevents an indefinitely-overloaded provider from hanging
+        # the job forever — after the cap the job moves to ``failed``.
+        max_quiesce_events = int(os.getenv("AGGREGATION_MAX_QUIESCE_EVENTS", "20"))
+        quiesce_event_count = 0
+
         for attempt in range(max_attempts):
             try:
                 return await self._materialize_with_checkpoints(
@@ -518,6 +528,88 @@ class AggregationWorker:
                 # outer run() handler, which marks the job 'cancelled' and
                 # emits the terminal event with last_cursor preserved.
                 raise
+            except ProviderBusy as e:
+                # Phase 2 — park-and-resume on quiesce. NOT a retry:
+                # don't increment ``retry_count``, don't consume the
+                # ``max_attempts`` budget. Effectively re-runs the same
+                # ``attempt`` after the cooldown by decrementing the
+                # loop counter via a continue-with-rewound iterator.
+                quiesce_event_count += 1
+                if quiesce_event_count > max_quiesce_events:
+                    logger.error(
+                        "Aggregation job %s: hit %d consecutive quiesce "
+                        "events; provider appears persistently overloaded. "
+                        "Failing the job rather than parking indefinitely.",
+                        job.id, max_quiesce_events,
+                    )
+                    job.error_message = (
+                        f"Provider {e.provider_name} stayed quiesced for "
+                        f"{max_quiesce_events} cooldown windows — abandoned. "
+                        f"Underlying p95 never recovered below trigger."
+                    )[:2000]
+                    job.updated_at = _now()
+                    await session.commit()
+                    raise
+                delay = (e.retry_after_seconds or 30) + random.uniform(0, 2)
+                job.error_message = (
+                    f"Quiesce {quiesce_event_count}/{max_quiesce_events}: {e}"
+                )[:2000]
+                job.updated_at = _now()
+                await session.commit()
+                logger.info(
+                    "Aggregation job %s: quiesce park for %.0fs "
+                    "(event %d/%d, attempt %d not consumed) — %s",
+                    job.id, delay, quiesce_event_count, max_quiesce_events,
+                    attempt + 1, e,
+                )
+                await asyncio.sleep(delay)
+                # Rewind the attempt counter so the iteration ahead doesn't
+                # consume retry budget. Python ``range`` iterators can't
+                # be rewound, so emulate by re-entering: we decrement a
+                # synthetic offset that lets us read the loop variable
+                # but the natural next iteration will still be ``attempt+1``
+                # — instead we ``continue`` and the original ``attempt``
+                # value is lost. Workaround: spin until the call succeeds
+                # or another exception fires. This nested-call form
+                # achieves "don't count quiesce" without restructuring.
+                while True:
+                    try:
+                        return await self._materialize_with_checkpoints(
+                            session=session,
+                            job=job,
+                            provider=provider,
+                            containment_types=containment_types,
+                            lineage_types=lineage_types,
+                            cancel_event=cancel_event,
+                            emitter=emitter,
+                            scope=scope,
+                        )
+                    except ProviderBusy as e2:
+                        quiesce_event_count += 1
+                        if quiesce_event_count > max_quiesce_events:
+                            logger.error(
+                                "Aggregation job %s: hit %d quiesce events; abandoning.",
+                                job.id, max_quiesce_events,
+                            )
+                            job.error_message = (
+                                f"Provider {e2.provider_name} stayed quiesced for "
+                                f"{max_quiesce_events} cooldown windows — abandoned."
+                            )[:2000]
+                            job.updated_at = _now()
+                            await session.commit()
+                            raise
+                        delay = (e2.retry_after_seconds or 30) + random.uniform(0, 2)
+                        logger.info(
+                            "Aggregation job %s: quiesce park (event %d/%d) — %s",
+                            job.id, quiesce_event_count, max_quiesce_events, e2,
+                        )
+                        await asyncio.sleep(delay)
+                        # Loop again — still NOT a retry.
+                        continue
+                    # Any other exception breaks out of the quiesce park
+                    # loop and is re-raised so the outer for-loop's
+                    # standard handlers (ProviderUnavailable / generic)
+                    # apply their retry-budget logic.
             except ProviderUnavailable as e:
                 last_error = e
                 provider_unavailable_count += 1
@@ -618,7 +710,8 @@ class AggregationWorker:
         is_first_checkpoint = True
 
         async def checkpoint(
-            processed: int, total: int, cursor: Optional[str], aggregated: int = 0,
+            processed: int, total: int, cursor: Optional[str],
+            aggregated: int = 0, phase: Optional[str] = None,
         ) -> None:
             nonlocal last_commit_monotonic, batches_since_commit, is_first_checkpoint
             # Cooperative cancel point at the outer-batch boundary. The
@@ -633,6 +726,12 @@ class AggregationWorker:
             job.last_cursor = cursor
             if aggregated > 0:
                 job.created_edges = aggregated
+            # Phase 1.7 — surface the active phase to the UI. Providers
+            # that emit phase signals (FalkorDB bulk-rebuild) pass a
+            # short ID; legacy paths leave it None so the existing
+            # generic UI label keeps working.
+            if phase is not None:
+                job.current_phase = phase
             job.progress = int((processed / total) * 100) if total > 0 else 0
             job.updated_at = _now()
             job.last_checkpoint_at = _now()

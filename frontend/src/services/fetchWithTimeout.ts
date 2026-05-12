@@ -16,18 +16,21 @@
  *     with the rotated cookies. Concurrent 401s share the same in-flight
  *     refresh. If refresh fails we dispatch ``'auth:session-lost'`` on
  *     ``window`` so the auth store can transition to unauthenticated.
- *   * Default 8 s timeout via AbortController; overridable per call.
- *     (P4.5 — bumped from 5 s after the SRE review found the BE's
- *     /admin/providers/status overall budget is 6 s; a 5 s FE timeout
- *     was aborting legitimate slow responses and silently swallowing
- *     them in the providerStatus store's `catch` block.)
+ *   * Default timeout via AbortController, sourced from
+ *     ``TIMEOUTS.DEFAULT_MS`` in ``src/config/timeouts.ts`` (30 s out of
+ *     the box, overridable via ``VITE_TIMEOUT_DEFAULT_MS``). Per-call
+ *     override remains supported via the ``timeoutMs`` option — see
+ *     ``RemoteGraphProvider`` for trace / children / aggregated-edges
+ *     overrides. Earlier 8 s default was aborting legitimately slow BE
+ *     responses on deep trace traversals.
  *
  * /auth/* URLs are exempt from the refresh-on-401 dance — /auth/refresh
  * itself returning 401 means the session really is gone, and /auth/me
  * returning 401 is handled by the bootstrap flow directly.
  */
 
-const DEFAULT_TIMEOUT_MS = 8_000
+import { TIMEOUTS } from '../config/timeouts'
+
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 const CSRF_COOKIE = 'nx_csrf'
 const CSRF_HEADER = 'X-CSRF-Token'
@@ -209,7 +212,7 @@ export async function fetchWithTimeout(
   input: RequestInfo | URL,
   init?: RequestInit & { timeoutMs?: number },
 ): Promise<Response> {
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...fetchInit } = init ?? {}
+  const { timeoutMs = TIMEOUTS.DEFAULT_MS, ...fetchInit } = init ?? {}
   const method = (fetchInit.method ?? 'GET').toUpperCase()
 
   let res: Response

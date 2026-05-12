@@ -147,6 +147,37 @@ class ProviderUnavailable(Exception):
         super().__init__(f"Provider '{provider_name}' unavailable: {reason}")
 
 
+class ProviderBusy(ProviderUnavailable):
+    """Phase 2 — flow-control signal, NOT a failure.
+
+    Raised by a provider when its observed write-side latency has crept
+    above the latency-quiesce threshold. Semantically distinct from
+    ``ProviderUnavailable``:
+
+    - ``ProviderUnavailable`` = the provider is broken (network down,
+      breaker open, credentials wrong). Worker counts this against the
+      retry budget; on exhaustion the job moves to ``failed``.
+    - ``ProviderBusy`` = the provider is healthy but overloaded right
+      now. Worker should **park the job** (preserve cursor / phase, do
+      NOT increment retry_count, do NOT mark failed) and re-dispatch
+      after the ``retry_after_seconds`` cooldown.
+
+    The two share the same surface (``ProviderUnavailable`` ancestor)
+    so existing HTTP handlers / metric emitters that filter on the
+    parent type continue to work. New worker code can isinstance-check
+    for ``ProviderBusy`` specifically to apply the park-and-resume
+    treatment.
+    """
+
+    def __init__(
+        self,
+        provider_name: str,
+        reason: str,
+        retry_after_seconds: int = 30,
+    ) -> None:
+        super().__init__(provider_name, reason, retry_after_seconds)
+
+
 class _AsyncCircuitBreaker:
     """Minimal async-safe circuit-breaker state machine.
 

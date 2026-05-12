@@ -11,6 +11,26 @@ import { useJob } from '@/hooks/useJob'
 import { getProviderLogo } from '../ProviderLogos'
 import { formatDuration, timeAgo, STATUS_CONFIG, type DataSourceMeta } from './shared'
 
+// Phase 1.7 — UI phase visibility. Maps the backend's short phase IDs
+// (emitted by FalkorDBProvider's bulk-rebuild path) to operator-
+// readable status labels. ``null`` / unrecognized values fall back to
+// the generic "Processing lineage edges" string so legacy / non-
+// FalkorDB paths keep the old UX.
+const PHASE_LABELS: Record<string, string> = {
+    wiping: 'Wiping previous aggregated edges',
+    scanning: 'Scanning lineage edges',
+    resolving_labels: 'Resolving entity labels',
+    creating: 'Creating aggregated edges in graph',
+    finalizing: 'Finalizing bookkeeping',
+}
+
+function phaseLabel(currentPhase: string | null | undefined): string {
+    if (currentPhase && PHASE_LABELS[currentPhase]) {
+        return PHASE_LABELS[currentPhase]
+    }
+    return 'Processing lineage edges'
+}
+
 // ── Tooltip ──────────────────────────────────────────────────────────
 
 export function Tip({ children, label }: { children: React.ReactNode; label: string }) {
@@ -382,7 +402,7 @@ export const JobRow = memo(function JobRow({ job: jobFromList, meta, expanded, o
                                                     <div className="flex items-center gap-2">
                                                         <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
                                                         <span className="text-[11px] font-semibold text-ink">
-                                                            {isRunning ? 'Processing lineage edges' : 'Queued'}
+                                                            {isRunning ? phaseLabel(job.currentPhase) : 'Queued'}
                                                         </span>
                                                     </div>
                                                     <span className="text-[12px] font-bold text-indigo-400 tabular-nums">

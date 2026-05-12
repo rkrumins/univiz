@@ -71,14 +71,47 @@ async def init_aggregation_db() -> None:
                     )
                     logger.debug("Table '%s.%s' ready", SCHEMA_NAME, table.name)
 
+            # 3. Apply column-level migrations idempotently.
+            #
+            # ``create_all(checkfirst=True)`` creates missing tables but
+            # does NOT alter existing tables to add new columns. Each
+            # column added to the ORM after the table was first
+            # created needs an explicit idempotent ALTER here.
+            # Postgres ``ADD COLUMN IF NOT EXISTS`` (Postgres ≥9.6)
+            # makes each statement safe to run on every startup,
+            # whether or not the column already exists.
+            #
+            # Migrations list — append-only, in chronological order:
+            _additive_migrations = (
+                # Phase 1.7 (2026-05-12) — phase visibility for UI
+                f"ALTER TABLE {SCHEMA_NAME}.aggregation_jobs "
+                "ADD COLUMN IF NOT EXISTS current_phase TEXT NULL",
+            )
+            async with engine.begin() as conn:
+                for stmt in _additive_migrations:
+                    try:
+                        await conn.execute(text(stmt))
+                    except Exception as exc:
+                        # Don't fail init on a single migration — log
+                        # and continue. Worst case the affected feature
+                        # degrades gracefully (e.g. UI phase label
+                        # stays NULL).
+                        logger.warning(
+                            "Aggregation additive migration failed "
+                            "(continuing init): %s — %s",
+                            stmt, exc,
+                        )
+
             if attempt > 1:
                 logger.info(
                     "Aggregation DB init succeeded on attempt %d (Postgres became reachable)",
                     attempt,
                 )
             logger.info(
-                "Aggregation DB init complete (%d tables in '%s' schema)",
+                "Aggregation DB init complete (%d tables in '%s' schema, "
+                "%d additive migrations applied)",
                 len(aggregation_tables), SCHEMA_NAME,
+                len(_additive_migrations),
             )
             return
 

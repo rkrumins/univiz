@@ -16,7 +16,7 @@ from backend.common.models.graph import (
 )
 
 from ..providers.base import GraphDataProvider
-from ..config.resilience import FALKORDB_AGGREGATED_READ_TIMEOUT_SECS
+from ..config.resilience import FALKORDB_AGGREGATED_READ_TIMEOUT_SECS, TRACE_TIMEOUT_SECS
 from backend.common.adapters import ProviderUnavailable
 
 if TYPE_CHECKING:
@@ -1155,10 +1155,13 @@ class ContextEngine:
             self._trace_sem = sem
         return sem
 
-    # Hard caps for trace v2. Override via env vars; not per-request.
+    # Hard caps for trace v2. TRACE_MAX_NODES still env-var driven here
+    # (it's not a timeout); TRACE_TIMEOUT_MS derives from the central
+    # TRACE_TIMEOUT_SECS in app.config.resilience so a single env var
+    # tunes both backend layers and stays in sync with the frontend.
     import os as _os
     TRACE_MAX_NODES: int = int(_os.getenv("TRACE_MAX_NODES", "2000"))
-    TRACE_TIMEOUT_MS: int = int(_os.getenv("TRACE_TIMEOUT_MS", "8000"))
+    TRACE_TIMEOUT_MS: int = int(TRACE_TIMEOUT_SECS * 1000)
     del _os
 
     async def get_ancestors(self, urn: str, limit: int = 100, offset: int = 0) -> List[GraphNode]:

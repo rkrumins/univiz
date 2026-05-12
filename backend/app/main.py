@@ -922,25 +922,35 @@ class _TimeoutMiddleware:
         # Tier list order matters when prefixes nest (e.g. /api/v1/health
         # vs. /api/v1/health/providers — both legitimate; longer matches
         # wins via list-then-startswith).
+        # Trace routes get their own (longer) tier ahead of the generic
+        # /graph/ tier so the prefix-longest-wins lookup picks them up.
+        # Both /api/v1 and /api/v2 surface trace endpoints; main.py
+        # collapses the workspace segment so the listed prefixes match
+        # /api/v1/{ws}/graph/trace/... and /api/v2/{ws}/graph/trace/...
         self._tiers: list[tuple[str, float]] = [
             ("/api/v1/health",        float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
             ("/health",               float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
             ("/api/v1/graph/edges/aggregated", float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
+            ("/api/v1/graph/trace",   float(os.getenv("HTTP_TIMEOUT_TRACE_SECS", "60"))),
+            ("/api/v2/graph/trace",   float(os.getenv("HTTP_TIMEOUT_TRACE_SECS", "60"))),
             ("/api/v1/graph/",        float(os.getenv("HTTP_TIMEOUT_GRAPH_SECS", "15"))),
+            ("/api/v2/graph/",        float(os.getenv("HTTP_TIMEOUT_GRAPH_SECS", "15"))),
             ("/api/v1/aggregation/",  float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
         ]
         self._default_timeout: float = float(os.getenv("HTTP_TIMEOUT_DEFAULT_SECS", "30"))
 
     def _resolve_timeout(self, path: str) -> float:
-        # Workspace-scoped graph routes are mounted under
-        # /api/v1/{ws_id}/graph/... — collapse the dynamic segment so the
-        # literal-prefix tiers above can still match.
+        # Workspace-scoped routes are mounted under
+        # /api/v{1,2}/{ws_id}/graph/... — collapse the dynamic segment
+        # so the literal-prefix tiers above can still match.
         candidates = [path]
-        if path.startswith("/api/v1/"):
-            tail = path[len("/api/v1/"):]
-            sep = tail.find("/")
-            if sep > 0:
-                candidates.append("/api/v1" + tail[sep:])
+        for api_prefix in ("/api/v1/", "/api/v2/"):
+            if path.startswith(api_prefix):
+                tail = path[len(api_prefix):]
+                sep = tail.find("/")
+                if sep > 0:
+                    candidates.append(api_prefix.rstrip("/") + tail[sep:])
+                break
         for pattern, timeout in self._tiers:
             for candidate in candidates:
                 if candidate.startswith(pattern):
