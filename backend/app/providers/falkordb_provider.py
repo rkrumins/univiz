@@ -136,6 +136,60 @@ class FalkorDBProvider(GraphDataProvider):
         self._aggregation_sub_batch_size: int = self._MERGE_SUB_BATCH_SIZE
         self._aggregation_sub_batch_under_target_run: int = 0
 
+        # Phase 1.6 — operator dial for the bulk-CREATE UNWIND batch
+        # size. Env-var lets operators dial back per-call cost on graphs
+        # where the default 10k batch monopolizes the single FalkorDB
+        # Cypher thread for too long under concurrent trace load.
+        # Bounded to a sane floor/ceiling to prevent obviously-bad
+        # values from causing surprise.
+        _bulk_size_raw = os.getenv("FALKORDB_BULK_CREATE_BATCH_SIZE")
+        if _bulk_size_raw is None:
+            self._bulk_create_batch_size: int = self._BULK_CREATE_BATCH_SIZE
+        else:
+            try:
+                _bulk_size_parsed = int(_bulk_size_raw)
+                self._bulk_create_batch_size = max(100, min(50000, _bulk_size_parsed))
+                if self._bulk_create_batch_size != self._BULK_CREATE_BATCH_SIZE:
+                    logger.info(
+                        "FALKORDB_BULK_CREATE_BATCH_SIZE=%s (clamped to %d, "
+                        "default %d): operator-tuned bulk-CREATE batch size.",
+                        _bulk_size_raw, self._bulk_create_batch_size,
+                        self._BULK_CREATE_BATCH_SIZE,
+                    )
+            except ValueError:
+                logger.warning(
+                    "FALKORDB_BULK_CREATE_BATCH_SIZE=%r is not an integer; "
+                    "falling back to default %d.",
+                    _bulk_size_raw, self._BULK_CREATE_BATCH_SIZE,
+                )
+                self._bulk_create_batch_size = self._BULK_CREATE_BATCH_SIZE
+
+        # Phase 1.8 — dedicated timeout for bulk-CREATE batches. Default
+        # 60s vs the standard 15s ``_WRITE_TIMEOUT``: bulk writes
+        # legitimately need more headroom than incremental MERGEs,
+        # especially on graphs where FalkorDB is concurrently serving
+        # trace reads. Clamped to [5s, 600s].
+        _bulk_timeout_raw = os.getenv("FALKORDB_BULK_CREATE_TIMEOUT_S")
+        if _bulk_timeout_raw is None:
+            self._bulk_create_timeout_s: float = 60.0
+        else:
+            try:
+                _bulk_timeout_parsed = float(_bulk_timeout_raw)
+                self._bulk_create_timeout_s = max(5.0, min(600.0, _bulk_timeout_parsed))
+                if self._bulk_create_timeout_s != 60.0:
+                    logger.info(
+                        "FALKORDB_BULK_CREATE_TIMEOUT_S=%s (clamped to %.1fs, "
+                        "default 60.0s): operator-tuned bulk-CREATE write timeout.",
+                        _bulk_timeout_raw, self._bulk_create_timeout_s,
+                    )
+            except ValueError:
+                logger.warning(
+                    "FALKORDB_BULK_CREATE_TIMEOUT_S=%r is not a float; "
+                    "falling back to default 60.0s.",
+                    _bulk_timeout_raw,
+                )
+                self._bulk_create_timeout_s = 60.0
+
     @property
     def _proj(self):
         """Transparent access to the projection graph.
@@ -1646,6 +1700,125 @@ class FalkorDBProvider(GraphDataProvider):
                 "index in place.", exc,
             )
 
+        # Smoke-probe: log which AGGREGATED-relevant indexes actually
+        # exist in the graph now. Best-effort — surfaces the silent-fail
+        # case where CREATE INDEX returned success on an older FalkorDB
+        # that ignores unsupported syntax (or where a deployment skipped
+        # _initialize_indices entirely). Two sessions of guessing at
+        # whether indexes are "really there" justifies running this
+        # explicitly at startup.
+        await self._log_aggregation_index_health()
+
+    async def _log_aggregation_index_health(self) -> None:
+        """Introspect the projection graph's index catalogue and log a
+        one-line summary of AGGREGATED-relevant indexes.
+
+        Runs ``CALL db.indexes()`` defensively (column order varies by
+        FalkorDB version; row shape may differ on very old releases).
+        Categorizes results into:
+
+        - **labeled URN indexes**: ``(:Label) ON (n.urn)`` — drives every
+          label-qualified MATCH in the bulk-rebuild path.
+        - **unlabeled URN index**: ``() ON (n.urn)`` — drives the
+          incremental MERGE path and the label-resolution fallback.
+        - **AGGREGATED edge indexes**: ``()-[r:AGGREGATED]-() ON
+          (r.sourceLevel ...)`` — drives the trace fast path.
+
+        Never raises; never blocks startup. A missing index is reported
+        at WARNING level so it surfaces in operator alerts.
+        """
+        try:
+            res = await asyncio.wait_for(
+                self._proj.ro_query("CALL db.indexes()", {}),
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.info(
+                "Index health probe on %s: CALL db.indexes() not "
+                "available (%s) — skipping. Operator should verify "
+                "indexes manually if aggregation perf is poor.",
+                self._graph_name, exc,
+            )
+            return
+
+        rows = res.result_set or []
+        labeled_urn: List[str] = []
+        unlabeled_urn = False
+        aggregated_indexes: List[str] = []
+
+        for row in rows:
+            # FalkorDB row column order historically: label, properties,
+            # types, language, stopwords, entitytype, info. We only need
+            # the first three and read defensively.
+            if not row:
+                continue
+            label = row[0] if len(row) > 0 else None
+            props = row[1] if len(row) > 1 else None
+            entity_type_col = row[5] if len(row) > 5 else None
+
+            # Normalize: label may be None / "" for unlabeled indexes.
+            # props is typically a list of strings.
+            prop_list: List[str] = []
+            if isinstance(props, (list, tuple)):
+                prop_list = [str(p) for p in props]
+            elif isinstance(props, str):
+                prop_list = [props]
+
+            is_edge_index = False
+            if isinstance(entity_type_col, str):
+                is_edge_index = entity_type_col.upper().startswith("RELAT")
+
+            # Edge index on AGGREGATED?
+            if (
+                is_edge_index
+                and isinstance(label, str)
+                and label.upper() == "AGGREGATED"
+            ):
+                aggregated_indexes.append(
+                    f"({label} ON {prop_list})"
+                )
+                continue
+
+            # Node index on URN.
+            if "urn" in prop_list:
+                if label:
+                    labeled_urn.append(str(label))
+                else:
+                    unlabeled_urn = True
+
+        if labeled_urn or unlabeled_urn or aggregated_indexes:
+            logger.info(
+                "Index health on %s: labeled_urn=%d (%s), "
+                "unlabeled_urn=%s, aggregated_edge_indexes=%d (%s)",
+                self._graph_name,
+                len(labeled_urn),
+                ",".join(sorted(set(labeled_urn))[:8])
+                + ("..." if len(set(labeled_urn)) > 8 else ""),
+                "present" if unlabeled_urn else "MISSING",
+                len(aggregated_indexes),
+                "; ".join(aggregated_indexes) or "none",
+            )
+        else:
+            logger.warning(
+                "Index health on %s: NO URN or AGGREGATED indexes detected. "
+                "Aggregation will scan every node on every MERGE/MATCH — "
+                "this is the 200%% CPU configuration. Verify "
+                "_initialize_indices ran and the FalkorDB version supports "
+                "the CREATE INDEX syntax in use.",
+                self._graph_name,
+            )
+
+        if not unlabeled_urn:
+            logger.warning(
+                "Index health on %s: unlabeled URN index is missing. The "
+                "bulk-rebuild label-resolution fallback path and the "
+                "incremental MERGE path will both scan. If FalkorDB version "
+                "< 2.10, this is expected; consider upgrading or accept the "
+                "labeled-only path. If FalkorDB version >= 2.10, "
+                "investigate why CREATE INDEX FOR (n) ON (n.urn) was rejected.",
+                self._graph_name,
+            )
+
     def _ancestors_cache_key(self) -> str:
         """Return the Redis Hash key for ancestor chains in this graph,
         scoped by the resolved containment-types fingerprint.
@@ -1850,11 +2023,18 @@ class FalkorDBProvider(GraphDataProvider):
         # query plan that itself spikes provider CPU.
         chunk_size = 500
 
+        # ``MATCH (child) WHERE child.urn IN $urns`` is one node-scan for
+        # the whole chunk; ``UNWIND $urns AS u MATCH (child {urn:u})``
+        # was N scans (one per URN), which on a multi-million-node graph
+        # without an unlabeled URN index busts the 5s read timeout and
+        # triggers the worker retry loop. Same pathology as the original
+        # MERGE-on-relationship problem, just hiding in the ancestor
+        # lookup. URNs that don't exist in the graph simply produce no
+        # row; the caller's pre-initialization to ``[]`` handles them.
         cypher = (
-            "UNWIND $urns AS u "
-            "MATCH (child {urn: u}) "
+            "MATCH (child) WHERE child.urn IN $urns "
             f"OPTIONAL MATCH path = (child)<-[:{containment_cypher}*1..{max_depth}]-(a) "
-            "WITH u, "
+            "WITH child.urn AS u, "
             "     [n IN nodes(path)[1..] | n.urn] AS chain_candidate, "
             "     coalesce(length(path), 0) AS plen "
             "ORDER BY u, plen DESC "
@@ -2170,7 +2350,14 @@ class FalkorDBProvider(GraphDataProvider):
     # phase cleans up any partial AGGREGATED writes from a prior attempt.    #
     # ====================================================================== #
 
-    _BULK_CREATE_BATCH_SIZE = 2000   # matches solidatus-generator BATCH_SIZE
+    # UNWIND batch size for bulk-CREATE. FalkorDB's documented best
+    # practice is 10k–50k rows per UNWIND: large batches amortize the
+    # parser/planner overhead, and CREATE is O(1) per row so larger
+    # batches don't widen the per-row variance. solidatus-generator
+    # uses 2000 because its writes are MERGE-on-node (which is more
+    # variance-prone); our path is CREATE-on-relationship, which
+    # tolerates and benefits from the higher number.
+    _BULK_CREATE_BATCH_SIZE = 10000
     _BULK_WIPE_BATCH_SIZE = 50000    # cursored DELETE chunk for AGGREGATED wipe
 
     async def _wipe_aggregated_edges(
@@ -2378,6 +2565,114 @@ class FalkorDBProvider(GraphDataProvider):
             except Exception:
                 pass  # already exists or unsupported
 
+    async def _warmup_urn_label_cache_for_aggregation(self) -> None:
+        """Pre-populate the Redis URN→label cache via one labeled scan
+        per label in the graph.
+
+        This is the Phase 1.8 fix for the write-side timeout fire on
+        `sol_xlarge_test2`. Without warmup, `_resolve_urn_labels_bulk`
+        falls back to a single unlabeled bulk Cypher
+        (``MATCH (n) WHERE n.urn IN $urns ...``) on every cache miss.
+        On a multi-million-node graph without an unlabeled URN index,
+        that single Cypher can exceed the 5s read timeout and return
+        no rows — leaving every URN in the missing list mapped to
+        ``None``, which previously routed pairs to the (now-removed)
+        unlabeled-fallback CREATE that scanned per row and busted the
+        write timeout.
+
+        With warmup, the cache is hot for every legitimately-labeled
+        node BEFORE Phase C runs. Per-label scans use the per-label
+        URN index (already created in ``_initialize_indices`` /
+        ``_ensure_label_urn_indexes``), so each scan is index-assisted
+        and fast. URNs still unresolved after warmup are genuinely
+        label-less (legacy MERGE residue) or missing nodes; Phase 1.8
+        drops those pairs with a count + sample warning rather than
+        scanning forever.
+        """
+        try:
+            res = await asyncio.wait_for(
+                self._proj.ro_query("CALL db.labels() YIELD label RETURN label", {}),
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.info(
+                "URN→label warmup on %s: CALL db.labels() unavailable (%s); "
+                "skipping warmup. _resolve_urn_labels_bulk will run its "
+                "fallback Cypher on cache miss.",
+                self._graph_name, exc,
+            )
+            return
+
+        labels: List[str] = []
+        for row in (res.result_set or []):
+            if row and row[0]:
+                lbl = row[0].decode("utf-8") if isinstance(row[0], (bytes, bytearray)) else str(row[0])
+                labels.append(lbl)
+        if not labels:
+            return
+
+        label_key = self._urn_label_key()
+        t_start = time.monotonic()
+        total_cached = 0
+
+        # Per-label hard cap to bound memory + cache size on huge labels.
+        # ``solidatus_perf_xlarge`` style graphs sit well below this, and
+        # any label with >200k nodes likely doesn't benefit from a full
+        # cache pre-warm anyway (the per-label index seek at lookup time
+        # is already fast).
+        per_label_cap = int(os.getenv("FALKORDB_URN_LABEL_WARMUP_PER_LABEL_CAP", "200000"))
+        per_label_timeout = float(os.getenv("FALKORDB_URN_LABEL_WARMUP_TIMEOUT_S", "30"))
+
+        for label in labels:
+            safe = _sanitize_label(label)
+            try:
+                lr = await asyncio.wait_for(
+                    self._proj.ro_query(
+                        f"MATCH (n:{safe}) RETURN n.urn LIMIT {per_label_cap}",
+                        {},
+                    ),
+                    timeout=per_label_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "URN→label warmup on %s: scan for label %r failed (%s); "
+                    "skipping. Pairs with %s-labeled endpoints may still hit "
+                    "the resolver fallback Cypher.",
+                    self._graph_name, label, exc, label,
+                )
+                continue
+
+            rows = lr.result_set or []
+            if not rows:
+                continue
+
+            pipe = self._redis.pipeline(transaction=False)
+            count = 0
+            for row in rows:
+                urn = row[0]
+                if not urn:
+                    continue
+                if isinstance(urn, (bytes, bytearray)):
+                    urn = urn.decode("utf-8")
+                pipe.hset(label_key, urn, safe)
+                count += 1
+            try:
+                await pipe.execute()
+                total_cached += count
+            except Exception as exc:
+                logger.warning(
+                    "URN→label warmup on %s: pipeline failed for label %r "
+                    "(%d entries lost): %s",
+                    self._graph_name, label, count, exc,
+                )
+
+        elapsed_ms = (time.monotonic() - t_start) * 1000
+        logger.info(
+            "URN→label warmup on %s: cached %d urn→label entries across "
+            "%d labels in %.1fms",
+            self._graph_name, total_cached, len(labels), elapsed_ms,
+        )
+
     async def _bulk_create_aggregated_edges_from_pairs(
         self,
         *,
@@ -2426,47 +2721,44 @@ class FalkorDBProvider(GraphDataProvider):
         created = 0
         digest_val = level_digest or ""
 
+        # Phase 1.8: drop-and-warn for pairs whose endpoint labels could
+        # not be resolved (after the URN→label warmup that ran in
+        # Phase C). The unlabeled-fallback CREATE that previously lived
+        # here was the root cause of the ``sol_xlarge_test2`` write-
+        # timeout fire: a single batch's per-row unlabeled scan can
+        # run for many minutes on a multi-million-node graph, bust
+        # the write timeout, trigger worker retries from scratch, and
+        # never make forward progress. After warmup, any URN still
+        # without a resolved label is genuinely label-less (legacy
+        # MERGE-on-node residue) or a missing-node reference — the
+        # unlabeled CREATE wouldn't have produced a usable edge for
+        # those anyway. Drop the pair, log a count + URN sample, and
+        # let the rest of the run finish cleanly.
+        dropped_pairs = 0
+        dropped_sample: List[Tuple[Optional[str], Optional[str]]] = []
         for (sl_label, tl_label), items in grouped.items():
-            if sl_label and tl_label:
-                cypher = (
-                    f"UNWIND $batch AS item "
-                    f"MATCH (a:{sl_label} {{urn: item.s}}) "
-                    f"MATCH (b:{tl_label} {{urn: item.t}}) "
-                    f"CREATE (a)-[r:AGGREGATED {{"
-                    f"weight: item.w, "
-                    f"sourceLevel: item.sl, "
-                    f"targetLevel: item.tl, "
-                    f"sourceEdgeTypes: item.et, "
-                    f"levelDigest: $digest, "
-                    f"latestUpdate: timestamp()"
-                    f"}}]->(b)"
-                )
-            else:
-                # Unlabeled fallback: no index help, but bounded to URNs
-                # whose label couldn't be resolved. Logged so an operator
-                # can investigate if the count is non-trivial.
-                cypher = (
-                    "UNWIND $batch AS item "
-                    "MATCH (a {urn: item.s}) "
-                    "MATCH (b {urn: item.t}) "
-                    "CREATE (a)-[r:AGGREGATED {"
-                    "weight: item.w, "
-                    "sourceLevel: item.sl, "
-                    "targetLevel: item.tl, "
-                    "sourceEdgeTypes: item.et, "
-                    "levelDigest: $digest, "
-                    "latestUpdate: timestamp()"
-                    "}]->(b)"
-                )
-                if len(items) > 1000:
-                    logger.warning(
-                        "Bulk CREATE: %d pairs with unresolved endpoint labels "
-                        "(src=%s, tgt=%s) — these use the unlabeled MATCH "
-                        "fallback. Investigate the URN→label cache.",
-                        len(items), sl_label, tl_label,
-                    )
+            if not (sl_label and tl_label):
+                dropped_pairs += len(items)
+                if len(dropped_sample) < 10:
+                    for item in items[: 10 - len(dropped_sample)]:
+                        dropped_sample.append((item.get("s"), item.get("t")))
+                continue
 
-            for i in range(0, len(items), self._BULK_CREATE_BATCH_SIZE):
+            cypher = (
+                f"UNWIND $batch AS item "
+                f"MATCH (a:{sl_label} {{urn: item.s}}) "
+                f"MATCH (b:{tl_label} {{urn: item.t}}) "
+                f"CREATE (a)-[r:AGGREGATED {{"
+                f"weight: item.w, "
+                f"sourceLevel: item.sl, "
+                f"targetLevel: item.tl, "
+                f"sourceEdgeTypes: item.et, "
+                f"levelDigest: $digest, "
+                f"latestUpdate: timestamp()"
+                f"}}]->(b)"
+            )
+
+            for i in range(0, len(items), self._bulk_create_batch_size):
                 if should_cancel is not None and should_cancel():
                     from backend.app.services.aggregation.cancel import JobCancelled
                     from datetime import datetime, timezone
@@ -2475,11 +2767,17 @@ class FalkorDBProvider(GraphDataProvider):
                         observed_at=datetime.now(timezone.utc).isoformat(),
                     )
 
-                chunk = items[i : i + self._BULK_CREATE_BATCH_SIZE]
+                chunk = items[i : i + self._bulk_create_batch_size]
                 t_batch_start = time.monotonic()
+                # Phase 1.8: pass a Phase-D-specific timeout (default
+                # 60s, env-tunable) rather than the 15s ``_WRITE_TIMEOUT``
+                # default. Bulk-CREATE batches against a graph under
+                # concurrent trace load can legitimately exceed 15s
+                # without indicating a stuck/runaway query.
                 await self._proj_query(
                     cypher,
                     params={"batch": chunk, "digest": digest_val},
+                    timeout=self._bulk_create_timeout_s,
                 )
                 t_batch = (time.monotonic() - t_batch_start) * 1000
                 created += len(chunk)
@@ -2499,6 +2797,26 @@ class FalkorDBProvider(GraphDataProvider):
                             "Intra-batch progress callback failed during bulk "
                             "CREATE (continuing): %s", cb_exc, exc_info=True,
                         )
+
+        if dropped_pairs > 0:
+            sample_str = ", ".join(
+                f"({s!r}→{t!r})" for s, t in dropped_sample
+            ) or "<none captured>"
+            logger.warning(
+                "Bulk CREATE on %s: dropped %d pairs with unresolvable "
+                "endpoint labels (one or both endpoints are label-less "
+                "or missing nodes — typically legacy MERGE residue or "
+                "ancestor URNs not yet hydrated into the graph). These "
+                "pairs were NOT materialised; the rest of the run "
+                "completed successfully. Sample of dropped pairs (up to "
+                "10): %s. Action: query "
+                "``MATCH (n) WHERE size(labels(n)) = 0 RETURN count(n)`` "
+                "to confirm label-less node count; consider rebuilding "
+                "those nodes with their proper entity-type labels and "
+                "re-running aggregation to materialise the dropped "
+                "pairs.",
+                self._graph_name, dropped_pairs, sample_str,
+            )
 
         return created
 
@@ -2744,13 +3062,18 @@ class FalkorDBProvider(GraphDataProvider):
 
             if progress_callback is not None:
                 try:
-                    # Bulk rebuild's "created_count" during scan is the
-                    # accumulated pair count — it becomes the actual
-                    # created edge count after the CREATE phase. We
-                    # report it here so the UI gets an early signal of
-                    # how many AGGREGATED edges the run will produce.
+                    # During Phase B no edges have been written to
+                    # FalkorDB yet — they're accumulating in worker
+                    # memory. Reporting ``len(pair_data)`` here is
+                    # misleading: the UI's "Materialized" counter
+                    # shows hundreds of thousands while a check
+                    # against FalkorDB returns zero. Pass 0 so
+                    # "Materialized" stays at 0 until Phase D actually
+                    # starts writing edges; the per-batch callback in
+                    # ``_bulk_create_aggregated_edges_from_pairs``
+                    # then bumps it up in real time as CREATEs land.
                     await progress_callback(
-                        processed, total, current_cursor, len(pair_data),
+                        processed, total, current_cursor, 0,
                     )
                 except Exception as cb_exc:
                     logger.error(
@@ -2778,7 +3101,17 @@ class FalkorDBProvider(GraphDataProvider):
             }
 
         # ===== PHASE C: Resolve URN labels + ensure indexes =====
+        # Phase 1.8: warm the URN→label cache via one labeled scan per
+        # label BEFORE running the per-URN resolver. This converts what
+        # was a single unlabeled-MATCH-with-large-IN ($urns) Cypher
+        # (slow / timeout-prone on multi-million-node graphs without an
+        # unlabeled URN index) into N small index-assisted labeled
+        # scans. URNs still unresolved after warmup are label-less /
+        # missing and their pairs get dropped at the CREATE step
+        # (Phase 1.8 drop-and-warn) rather than scanning forever.
         t_phase_c_start = time.monotonic()
+        await self._warmup_urn_label_cache_for_aggregation()
+
         pair_urns: Set[str] = set()
         for s, t in pair_data:
             pair_urns.add(s)
@@ -2804,12 +3137,48 @@ class FalkorDBProvider(GraphDataProvider):
         )
 
         # ===== PHASE D: Bulk-CREATE =====
+        #
+        # Composite per-batch callback: drives BOTH the event-bus
+        # heartbeat (intra_batch_callback) AND the durable DB
+        # checkpoint (progress_callback). Without this, the UI's
+        # "Materialized" counter would jump from 0 → final count at
+        # the very end of Phase D — which is exactly the "nothing is
+        # ever written" feeling operators reported even though Phase
+        # D was, in fact, writing edges. With this in place, the UI
+        # climbs in real time as each 10k-row CREATE batch lands in
+        # FalkorDB.
+        #
+        # Note: progress_callback is fed (total, total, cursor, running_created)
+        # rather than (processed, ...) because Phase B has already
+        # completed at this point — processed == total. The cursor
+        # stays at Phase B's final value for resume-correctness even
+        # though resume from mid-Phase-D is not implemented yet.
+        async def _phase_d_progress(running_created: int) -> None:
+            if intra_batch_callback is not None:
+                try:
+                    await intra_batch_callback(running_created)
+                except Exception as cb_exc:
+                    logger.error(
+                        "Phase D intra_batch_callback failed (continuing): %s",
+                        cb_exc, exc_info=True,
+                    )
+            if progress_callback is not None:
+                try:
+                    await progress_callback(
+                        total, total, current_cursor, running_created,
+                    )
+                except Exception as cb_exc:
+                    logger.error(
+                        "Phase D progress_callback failed (continuing): %s",
+                        cb_exc, exc_info=True,
+                    )
+
         t_phase_d_start = time.monotonic()
         created = await self._bulk_create_aggregated_edges_from_pairs(
             pair_data=pair_data,
             urn_label_map=urn_label_map,
             level_digest=level_digest,
-            intra_batch_callback=intra_batch_callback,
+            intra_batch_callback=_phase_d_progress,
             baseline_aggregated=0,
             should_cancel=should_cancel,
         )
@@ -3068,6 +3437,13 @@ class FalkorDBProvider(GraphDataProvider):
 
         if delete_batch:
             try:
+                # nolint-unlabeled-unwind-match: pair-bounded DELETE.
+                # Rewriting to ``WHERE s.urn IN $sUrns AND t.urn IN
+                # $tUrns`` would Cartesian-delete (every edge between
+                # ANY s in sUrns and ANY t in tUrns), which is wrong
+                # semantics here — we need to delete only the specific
+                # (s, t) pairs in delete_batch. Bounded by lineage-edge
+                # deletion rate (rare in steady state).
                 await self._proj_query(
                     "UNWIND $batch AS item "
                     "MATCH (s {urn: item.s})-[r:AGGREGATED]->(t {urn: item.t}) "
@@ -3084,6 +3460,10 @@ class FalkorDBProvider(GraphDataProvider):
 
         if update_batch:
             try:
+                # nolint-unlabeled-unwind-match: pair-bounded UPDATE.
+                # Same reasoning as the DELETE branch above — must
+                # update only specific (s, t) pairs from update_batch,
+                # not the Cartesian of two URN sets.
                 await self._proj_query(
                     "UNWIND $batch AS item "
                     "MATCH (s {urn: item.s})-[r:AGGREGATED]->(t {urn: item.t}) "
@@ -4674,7 +5054,16 @@ class FalkorDBProvider(GraphDataProvider):
             source_var, target_var = "f", "other"
 
         def _build(rel_clause: str, *, where_parts: List[str], order_by_weight: bool) -> str:
-            where = ("WHERE " + " AND ".join(where_parts) + " ") if where_parts else ""
+            # WS1.5: Replace ``UNWIND $frontier AS u MATCH (f {urn:u})``
+            # with ``MATCH (f) WHERE f.urn IN $frontier`` so the empty-
+            # label bucket (URNs whose entity_type wasn't in
+            # ``frontier_labels``) doesn't degenerate into N unlabeled
+            # node scans. When F_LABEL substitutes to a real label, the
+            # ``:Label(urn)`` index still drives the seek via the IN
+            # predicate; when F_LABEL is empty, this still pays exactly
+            # one scan rather than N.
+            extended = ["f.urn IN $frontier"] + where_parts
+            where = "WHERE " + " AND ".join(extended) + " "
             # For AGGREGATED edges, ORDER BY r.weight DESC ensures the
             # per-source LIMIT keeps the highest-confidence edges first
             # (top-N by edge count). Without it, a super-hub Domain would
@@ -4682,8 +5071,7 @@ class FalkorDBProvider(GraphDataProvider):
             # so we skip the ORDER BY in that branch.
             order = "ORDER BY weight DESC " if order_by_weight else ""
             return (
-                "UNWIND $frontier AS u "
-                f"MATCH (f{{F_LABEL}} {{urn: u}}){arrow_template.format(rel=rel_clause)}(other) "
+                f"MATCH (f{{F_LABEL}}){arrow_template.format(rel=rel_clause)}(other) "
                 + where
                 + f"WITH {source_var}.urn AS sourceUrn, {target_var}.urn AS targetUrn, "
                 "id(r) AS edgeId, type(r) AS edgeType, "
@@ -4978,15 +5366,21 @@ class FalkorDBProvider(GraphDataProvider):
         if not s_urns or not t_urns:
             return []
 
+        # Rewritten away from ``UNWIND $sUrns AS srcUrn MATCH (s {urn:
+        # srcUrn})`` because the inner unlabeled MATCH does a node scan
+        # PER UNWIND iteration when the unlabeled URN index is absent —
+        # exactly the antipattern that took down aggregation. The
+        # ``WHERE s.urn IN $sUrns AND t.urn IN $tUrns`` form is ONE
+        # scan/seek total, regardless of |sUrns|. See plan Phase 1.5.
         if use_raw:
             # Raw lineage edges by type — caller passes ltypes (lineage types)
             ltypes_eff = ltypes or []
             if not ltypes_eff:
                 return []
             cypher = (
-                "UNWIND $sUrns AS srcUrn "
-                "MATCH (s {urn: srcUrn})-[r]->(t) "
-                "WHERE t.urn IN $tUrns AND type(r) IN $ltypes "
+                "MATCH (s)-[r]->(t) "
+                "WHERE s.urn IN $sUrns AND t.urn IN $tUrns "
+                "  AND type(r) IN $ltypes "
                 "RETURN s.urn AS sUrn, t.urn AS tUrn, type(r) AS edgeType, "
                 "id(r) AS edgeId, properties(r) AS props "
                 "LIMIT $limit"
@@ -4995,9 +5389,8 @@ class FalkorDBProvider(GraphDataProvider):
             graph_query = self._ro_query
         else:
             cypher = (
-                "UNWIND $sUrns AS srcUrn "
-                "MATCH (s {urn: srcUrn})-[r:AGGREGATED]->(t) "
-                "WHERE t.urn IN $tUrns "
+                "MATCH (s)-[r:AGGREGATED]->(t) "
+                "WHERE s.urn IN $sUrns AND t.urn IN $tUrns "
                 + ("AND any(et IN r.sourceEdgeTypes WHERE et IN $ltypes) " if ltypes else "")
                 + "RETURN s.urn AS sUrn, t.urn AS tUrn, 'AGGREGATED' AS edgeType, "
                 "id(r) AS edgeId, "
@@ -5075,31 +5468,41 @@ class FalkorDBProvider(GraphDataProvider):
                     pairs.add((ancestor, prev))
                 prev = ancestor
 
+        # Rewritten away from the ``UNWIND … MATCH (s {urn: …})`` form
+        # for the same reason as ``_edges_between_sets``: the inner
+        # unlabeled MATCH scans per-iteration without an unlabeled URN
+        # index. ``WHERE s.urn IN $sUrns AND t.urn IN $tUrns`` runs one
+        # scan/seek for the whole batch. The pair-bounded branch
+        # post-filters Cartesian results down to the requested pairs.
         if pairs:
-            pair_list = [{"s": s, "t": t} for s, t in pairs]
+            s_urns = sorted({s for s, _ in pairs})
+            t_urns = sorted({t for _, t in pairs})
+            allowed_pairs: Set[Tuple[str, str]] = set(pairs)
             cypher = (
-                "UNWIND $pairs AS p "
-                f"MATCH (s {{urn: p.s}})-[r:{rel_alt}]->(t {{urn: p.t}}) "
-                "RETURN p.s AS sUrn, p.t AS tUrn, "
+                f"MATCH (s)-[r:{rel_alt}]->(t) "
+                "WHERE s.urn IN $sUrns AND t.urn IN $tUrns "
+                "RETURN s.urn AS sUrn, t.urn AS tUrn, "
                 "type(r) AS edgeType, id(r) AS edgeId"
             )
             try:
                 result = await self._ro_query(
-                    cypher, params={"pairs": pair_list}, timeout=2.0,
+                    cypher,
+                    params={"sUrns": s_urns, "tUrns": t_urns},
+                    timeout=2.0,
                 )
             except Exception as exc:
                 logger.warning(
-                    "trace_at_level: containment edge pair-fetch failed (%d pairs): %s",
-                    len(pair_list), exc,
+                    "trace_at_level: containment edge pair-fetch failed "
+                    "(%d pairs): %s", len(pairs), exc,
                 )
                 return []
         else:
+            allowed_pairs = None  # type: ignore[assignment]  # no post-filter
             # Cold-cache fallback. Still rel-typed (avoids the OR-on-type
             # full edge scan of the legacy query).
             cypher = (
-                "UNWIND $urns AS u "
-                f"MATCH (s {{urn: u}})-[r:{rel_alt}]->(t) "
-                "WHERE t.urn IN $urns "
+                f"MATCH (s)-[r:{rel_alt}]->(t) "
+                "WHERE s.urn IN $urns AND t.urn IN $urns "
                 "RETURN s.urn AS sUrn, t.urn AS tUrn, "
                 "type(r) AS edgeType, id(r) AS edgeId"
             )
@@ -5116,6 +5519,14 @@ class FalkorDBProvider(GraphDataProvider):
 
         out: List[GraphEdge] = []
         for row in (result.result_set or []):
+            # In the pair-bounded branch, the rewritten Cypher returns
+            # the Cartesian of (sUrns × tUrns) that have a matching
+            # edge — broader than the original ``UNWIND $pairs`` form.
+            # Filter back down to the exact requested pairs so the
+            # caller sees the same set it would have before the WS1.5
+            # rewrite.
+            if allowed_pairs is not None and (row[0], row[1]) not in allowed_pairs:
+                continue
             try:
                 out.append(GraphEdge(
                     id=str(row[3]),
