@@ -931,6 +931,7 @@ class _TimeoutMiddleware:
             ("/api/v1/health",        float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
             ("/health",               float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))),
             ("/api/v1/graph/edges/aggregated", float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
+            ("/api/v1/graph/edges/between",    float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))),
             ("/api/v1/graph/trace",   float(os.getenv("HTTP_TIMEOUT_TRACE_SECS", "60"))),
             ("/api/v2/graph/trace",   float(os.getenv("HTTP_TIMEOUT_TRACE_SECS", "60"))),
             ("/api/v1/graph/",        float(os.getenv("HTTP_TIMEOUT_GRAPH_SECS", "15"))),

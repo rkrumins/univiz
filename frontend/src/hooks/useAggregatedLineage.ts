@@ -80,6 +80,14 @@ export interface UseAggregatedLineageResult {
     /** Clear all cached data */
     clearCache: () => void
 
+    /**
+     * Drop every aggregated-edge entry whose `sourceUrn` or `targetUrn` is
+     * in the supplied URN set. Used on subtree collapse so stale child-level
+     * aggregated edges disappear synchronously instead of waiting for the
+     * 500 ms debounced refetch.
+     */
+    purgeEdgesIncidentToUrns: (urns: Iterable<string>) => void
+
     /** Get edge count for a specific aggregated edge */
     getEdgeCount: (aggregatedEdgeId: string) => number
 
@@ -425,6 +433,26 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
         setMaterializationTriggered(false)
     }, [])
 
+    // Synchronous purge: drop entries incident to the supplied URN set.
+    // Caller is the collapse path in ContextViewCanvas — it computes the
+    // collapsed subtree's URNs and asks us to drop their aggregated edges
+    // immediately, avoiding the 500 ms debounce flicker.
+    const purgeEdgesIncidentToUrns = useCallback((urns: Iterable<string>) => {
+        const urnSet = urns instanceof Set ? urns : new Set(urns)
+        if (urnSet.size === 0) return
+        setAggregatedEdges(prev => {
+            let removed = 0
+            const next = new Map(prev)
+            for (const [id, entry] of prev) {
+                if (urnSet.has(entry.aggregated.sourceUrn) || urnSet.has(entry.aggregated.targetUrn)) {
+                    next.delete(id)
+                    removed++
+                }
+            }
+            return removed > 0 ? next : prev
+        })
+    }, [])
+
     // Get edge count
     const getEdgeCount = useCallback((aggregatedEdgeId: string) => {
         return aggregatedEdges.get(aggregatedEdgeId)?.aggregated.edgeCount ?? 0
@@ -448,6 +476,7 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
         getVisibleEdges,
         setGranularity: handleSetGranularity,
         clearCache,
+        purgeEdgesIncidentToUrns,
         getEdgeCount,
         getEdgeTypes,
         truncated,

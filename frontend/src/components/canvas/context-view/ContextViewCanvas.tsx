@@ -92,6 +92,8 @@ export function ContextViewCanvas({
   const edges = useCanvasStore((s) => s.edges)
   const addNodes = useCanvasStore((s) => s.addNodes)
   const addEdges = useCanvasStore((s) => s.addEdges)
+  const removeEdgesByNodeIds = useCanvasStore((s) => s.removeEdgesByNodeIds)
+  const removeStoreEdges = useCanvasStore((s) => s.removeEdges)
   const selectNode = useCanvasStore((s) => s.selectNode)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
   const selectedNodeId = selectedNodeIds[0] ?? null
@@ -183,6 +185,7 @@ export function ContextViewCanvas({
           }))
         if (newCanvasEdges.length > 0) {
           addEdges(newCanvasEdges as any[])
+          trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
         }
 
         // Containment edges from /trace/v2: keep only those whose
@@ -206,6 +209,7 @@ export function ContextViewCanvas({
           }))
         if (newContainmentEdges.length > 0) {
           addEdges(newContainmentEdges as any[])
+          trace.recordAddedEdgeIds(newContainmentEdges.map(e => e.id))
         }
 
         // Auto-expand ancestors of traced nodes — but only walk
@@ -243,6 +247,18 @@ export function ContextViewCanvas({
   const startTraceRef = useRef<(nodeId: string) => void>(() => {})
   const toggleTraceRef = useRef<(nodeId: string) => void>(() => {})
 
+  // Exit-trace cleanup. Purges the edges the trace merged into the canvas
+  // store so the ambient edge mesh doesn't permanently inherit them.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) removeStoreEdges(idsToRemove)
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace, removeStoreEdges])
+
   // UX-first Canvas Interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => startTraceRef.current(nodeId),
@@ -262,10 +278,7 @@ export function ContextViewCanvas({
     },
     // ESC exits an active trace before any other panel close — gives the
     // user a single, predictable escape from a busy trace view.
-    onExitTrace: () => {
-      if (trace.isTracing) { trace.clearTrace(); setExpandedNodes(new Set()); return true }
-      return false
-    },
+    onExitTrace: exitTrace,
   })
 
   // Keyboard shortcuts
@@ -283,6 +296,7 @@ export function ContextViewCanvas({
     granularity: lineageGranularity,
     setGranularity: setLineageGranularity,
     truncated: aggregationTruncated,
+    purgeEdgesIncidentToUrns: purgeAggregatedEdgesIncidentToUrns,
   } = useAggregatedLineage({ granularity: null })
 
   // Instance-level assignments from store (user drag-and-drop)
@@ -1029,7 +1043,10 @@ export function ContextViewCanvas({
         confidence: ge.confidence,
       },
     }))
-    if (newCanvasEdges.length > 0) addEdges(newCanvasEdges as any[])
+    if (newCanvasEdges.length > 0) {
+      addEdges(newCanvasEdges as any[])
+      trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
+    }
 
     // Hydrated containment edges from /trace/expand — link new nodes into
     // the canvas hierarchy alongside the lineage edges. Without these the
@@ -1046,7 +1063,10 @@ export function ContextViewCanvas({
         confidence: ge.confidence,
       },
     }))
-    if (newContainmentCanvasEdges.length > 0) addEdges(newContainmentCanvasEdges as any[])
+    if (newContainmentCanvasEdges.length > 0) {
+      addEdges(newContainmentCanvasEdges as any[])
+      trace.recordAddedEdgeIds(newContainmentCanvasEdges.map(e => e.id))
+    }
 
     const drillContainmentMap = new Map<string, string>()
     expanded.containmentEdges?.forEach(ce => {
@@ -1164,8 +1184,43 @@ export function ContextViewCanvas({
       } finally {
         pendingLoadRef.current.delete(nodeId)
       }
+    } else if (wasExpanded) {
+      // Collapse: drop every edge with an endpoint inside the collapsed
+      // subtree (the node itself + all descendants). Runs in BOTH browse
+      // mode and trace mode — `loadChildren` (browse) and trace drilldowns
+      // both add edges to the canvas store on expand, so collapse must
+      // unconditionally release them. Re-expanding refetches via
+      // loadChildren / drill paths (cached by the trace store).
+      const subtreeIds = new Set<string>()
+      subtreeIds.add(nodeId)
+      const stack: string[] = [nodeId]
+      while (stack.length > 0) {
+        const id = stack.pop()!
+        const children = childMap.get(id)
+        if (!children) continue
+        for (const cid of children) {
+          if (!subtreeIds.has(cid)) { subtreeIds.add(cid); stack.push(cid) }
+        }
+      }
+      // Edges where the collapsed node is one endpoint should also drop so the
+      // node's children-level lineage doesn't linger as orphan edges. The
+      // collapsed parent re-acquires its aggregated edges via fetchAggregated
+      // on the next render tick.
+      removeEdgesByNodeIds(subtreeIds)
+
+      // Synchronous companion: drop matching entries in the aggregated-edge
+      // map too. Otherwise stale child-level aggregated edges linger for up
+      // to 500 ms (until the debounced fetchAggregated refreshes), producing
+      // a flicker after collapse. Resolve subtree URNs from displayMap so
+      // we don't depend on id == urn invariants.
+      const subtreeUrns = new Set<string>()
+      for (const id of subtreeIds) {
+        const u = (displayMap.get(id)?.data?.urn as string | undefined) ?? id
+        if (u) subtreeUrns.add(u)
+      }
+      if (subtreeUrns.size > 0) purgeAggregatedEdgesIncidentToUrns(subtreeUrns)
     }
-  }, [displayMap, loadChildren, trace.isTracing, autoDrillOnExpand])
+  }, [displayMap, loadChildren, trace.isTracing, autoDrillOnExpand, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns])
 
 
 
@@ -1284,7 +1339,7 @@ export function ContextViewCanvas({
         traceActive={trace.isTracing}
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
         onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
-        onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+        onExitTrace={exitTrace}
         onAddEntity={() => { setIsCreatingEntity(true); setCreationParentId(null); setCreationLayerId(null) }}
         viewName={activeView?.name}
         entityTypeCount={activeView?.content.visibleEntityTypes.length}
@@ -1313,7 +1368,7 @@ export function ContextViewCanvas({
               resolveEdgeColor={resolveEdgeColor}
               expanded={dockExpanded}
               onToggleExpanded={() => setDockExpanded(v => !v)}
-              onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+              onExit={exitTrace}
               onJumpToUrn={(urn) => {
                 const id = urnToIdMap.get(urn) ?? urn
                 startTraceWithSmartLevel(id)

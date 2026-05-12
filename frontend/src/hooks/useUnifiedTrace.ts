@@ -145,6 +145,13 @@ export interface TraceState {
     drilldowns: Map<DrilldownKey, TraceV2Result>
     /** Recent-focus breadcrumb (newest first, capped at 5). Session-scoped. */
     traceHistory: TraceHistoryEntry[]
+    /**
+     * Edge ids that were merged into the canvas store as part of this trace
+     * session (initial fetch + drilldowns). Lets the canvas purge exactly the
+     * edges it added when the user clears the trace — instead of leaving them
+     * to leak into the ambient edge mesh.
+     */
+    addedEdgeIds: Set<string>
 
     // Actions
     setFocus: (nodeId: string | null) => void
@@ -165,6 +172,10 @@ export interface TraceState {
     clearTraceHistory: () => void
     clearTrace: () => void
     reset: () => void
+    /** Record edge ids that were merged into the canvas as part of this trace session. */
+    recordAddedEdgeIds: (ids: Iterable<string>) => void
+    /** Drop the tracked added-edge ids (without affecting the canvas store). */
+    resetAddedEdgeIds: () => void
 }
 
 /** History capacity. Older entries are evicted FIFO. */
@@ -215,10 +226,11 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     showDownstream: true,
     drilldowns: new Map(),
     traceHistory: [],
+    addedEdgeIds: new Set(),
 
     setFocus: (nodeId) => {
         if (nodeId === null) {
-            set({ focusId: null, result: null, status: 'idle', drilldowns: new Map() })
+            set({ focusId: null, result: null, status: 'idle', drilldowns: new Map(), addedEdgeIds: new Set() })
         } else {
             set({ focusId: nodeId })
         }
@@ -236,8 +248,8 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     fetchTrace: async (nodeId, provider, urnResolver) => {
         const { config } = get()
 
-        // New trace clears any drilldowns from a previous focus.
-        set({ status: 'loading', error: null, focusId: nodeId, drilldowns: new Map() })
+        // New trace clears any drilldowns and tracked edges from a previous focus.
+        set({ status: 'loading', error: null, focusId: nodeId, drilldowns: new Map(), addedEdgeIds: new Set() })
 
         try {
             const urn = urnResolver ? urnResolver(nodeId) : nodeId
@@ -350,6 +362,9 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     clearTraceHistory: () => set({ traceHistory: [] }),
 
     clearTrace: () => {
+        // Note: addedEdgeIds is intentionally *not* cleared here. The canvas
+        // reads it after clearTrace to know which edges to remove from the
+        // store, then clears it explicitly via the action below.
         set({
             focusId: null,
             result: null,
@@ -359,6 +374,20 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showDownstream: true,
             drilldowns: new Map(),
         })
+    },
+
+    recordAddedEdgeIds: (ids) => {
+        const { addedEdgeIds } = get()
+        let changed = false
+        const next = new Set(addedEdgeIds)
+        for (const id of ids) {
+            if (!next.has(id)) { next.add(id); changed = true }
+        }
+        if (changed) set({ addedEdgeIds: next })
+    },
+
+    resetAddedEdgeIds: () => {
+        if (get().addedEdgeIds.size > 0) set({ addedEdgeIds: new Set() })
     },
 
     reset: () => {
@@ -371,6 +400,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showUpstream: true,
             showDownstream: true,
             drilldowns: new Map(),
+            addedEdgeIds: new Set(),
             traceHistory: [],
         })
     },
@@ -562,6 +592,13 @@ export interface UseUnifiedTraceResult {
     jumpToHistoryEntry: (entry: TraceHistoryEntry) => Promise<void>
     /** Drop the entire trace-history breadcrumb. */
     clearTraceHistory: () => void
+
+    /** Edge ids the canvas merged in for this trace session — initial fetch + drilldowns. */
+    addedEdgeIds: Set<string>
+    /** Record edge ids added to the canvas as part of this trace session. */
+    recordAddedEdgeIds: (ids: Iterable<string>) => void
+    /** Drop the tracked added-edge ids (without affecting the canvas store). */
+    resetAddedEdgeIds: () => void
 }
 
 export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTraceResult {
@@ -577,6 +614,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const showDownstream = useTraceStore(s => s.showDownstream)
     const drilldowns = useTraceStore(s => s.drilldowns)
     const traceHistory = useTraceStore(s => s.traceHistory)
+    const addedEdgeIds = useTraceStore(s => s.addedEdgeIds)
 
     // Actions
     const setConfig = useTraceStore(s => s.setConfig)
@@ -588,6 +626,8 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const expandAggregatedEdgeAction = useTraceStore(s => s.expandAggregatedEdge)
     const collapseDrilldown = useTraceStore(s => s.collapseDrilldown)
     const clearTraceHistory = useTraceStore(s => s.clearTraceHistory)
+    const recordAddedEdgeIds = useTraceStore(s => s.recordAddedEdgeIds)
+    const resetAddedEdgeIds = useTraceStore(s => s.resetAddedEdgeIds)
 
     // Canvas store for auto-sync
     const { nodes: canvasNodes } = useCanvasStore()
@@ -820,6 +860,9 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
         traceHistory,
         jumpToHistoryEntry,
         clearTraceHistory,
+        addedEdgeIds,
+        recordAddedEdgeIds,
+        resetAddedEdgeIds,
     }
 }
 

@@ -254,6 +254,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
         return await this.fetch<GraphEdge[]>('/edges/between', {
             method: 'POST',
             body: JSON.stringify({ urns, edgeTypes, limit }),
+            timeoutMs: TIMEOUTS.EDGES_BETWEEN_MS,
         })
     }
 
