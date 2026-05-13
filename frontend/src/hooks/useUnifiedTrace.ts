@@ -235,12 +235,18 @@ const TRACE_HISTORY_LIMIT = 5
 // ============================================
 
 const DEFAULT_CONFIG: TraceConfig = {
-    // Skeleton-first defaults. At level=0 (top-level Domain rollup), the
-    // ontology bounds the result set to ~10s of nodes — depth=99 is "as
-    // deep as the rollup extends", not "walk 99 hops of raw lineage".
-    // Backend hard caps via TRACE_MAX_NODES + TRACE_TIMEOUT_MS.
-    upstreamDepth: 99,
-    downstreamDepth: 99,
+    // Bounded defaults. The previous values (99/99) assumed the level=0
+    // ontology rollup would self-bound the result — true at the absolute
+    // skeleton level, but the server's safety-net fallback re-runs the
+    // trace at the focus's own level when level=0 yields zero edges, and
+    // at object/column levels 99 hops returns the entire downstream cone
+    // (10k+ edges for hub nodes like a Campaigns object). 5/5 covers the
+    // typical end-to-end pipeline (source → staging → refined → mart →
+    // reporting) without exploding hub-node traces. Users can still ask
+    // for deeper walks via the presets (traceUpstream/Downstream =50,
+    // traceFullLineage = 25/25).
+    upstreamDepth: 5,
+    downstreamDepth: 5,
     includeColumnLineage: true,
     excludeContainmentEdges: true,
     includeInheritedLineage: true,

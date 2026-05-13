@@ -41,6 +41,33 @@ export interface UseEdgeProjectionOptions {
    * either endpoint is collapsed. Only consulted in trace mode.
    */
   suppressedAggEdgeKeys?: Set<string>
+  /**
+   * Edge ids the trace explicitly merged into the canvas store (from
+   * `trace.addedEdgeIds`). When in trace mode, these bypass the
+   * `traceContextSet` gate: by construction they belong to the trace and
+   * must render even if one endpoint hasn't yet been routed into the
+   * trace-filtered hierarchy. Endpoint resolution via displayMap/ancestorMap
+   * still applies — edges to entirely-unresolved nodes are still dropped.
+   */
+  traceAddedEdgeIds?: Set<string>
+  /**
+   * Canvas containment parent map (child id → parent id) from
+   * useContainmentHierarchy. Used by the trace-mode bundling projection
+   * to walk leaf-level edge endpoints up to the focus's hierarchy level so
+   * thousands of column-to-column edges collapse into a handful of
+   * container-to-container bundles.
+   */
+  traceBundleParentMap?: Map<string, string>
+  /** entityType → hierarchy.level map. Required for traceFocusLevel-based bundling. */
+  entityTypeLevels?: Map<string, number>
+  /**
+   * Hierarchy level the active trace ran at (`result.effectiveLevel`). When
+   * set with `traceBundleParentMap` + `entityTypeLevels`, edges whose
+   * endpoints are at a finer level get projected UP to the closest
+   * ancestor that sits at this level — visualising as bundled rollups
+   * rather than per-leaf spaghetti.
+   */
+  traceFocusLevel?: number
 }
 
 // ============================================
@@ -148,6 +175,10 @@ export function useEdgeProjection({
   isContainmentEdge,
   hoveredNodeId,
   suppressedAggEdgeKeys,
+  traceAddedEdgeIds,
+  traceBundleParentMap,
+  entityTypeLevels,
+  traceFocusLevel,
 }: UseEdgeProjectionOptions): { lineageEdges: any[], visibleLineageEdges: any[], unresolvedAggregatedCount: number } {
 
   // Telemetry for silently-dropped aggregated edges whose endpoints can't be
@@ -327,14 +358,72 @@ export function useEdgeProjection({
       }
     }
 
+    // Trace-mode bundling: walk an endpoint up the canvas containment
+    // hierarchy until we land on an ancestor at the focus's trace level
+    // (or coarser). This rolls every column-to-column edge up to the
+    // object/dataset/schema level the trace ran at, so per-pair bundling
+    // (which groups by `${sourceId}->${targetId}`) actually collapses
+    // thousands of leaf edges into a handful of container bundles. Without
+    // this, expanding a container exposes every leaf's lineage and the
+    // canvas renders 10k+ individual edges.
+    //
+    // Returns null when no ancestor in `traceBundleParentMap` reaches the
+    // focus level — that's when we fall back to the regular ancestorMap
+    // projection. Disabled outside trace mode and when configuration is
+    // missing (so non-trace canvases behave unchanged).
+    const bundleEnabled =
+      isTracing
+      && traceBundleParentMap !== undefined
+      && entityTypeLevels !== undefined
+      && typeof traceFocusLevel === 'number'
+    const projectToTraceLevel = (endpointId: string): string | null => {
+      if (!bundleEnabled) return null
+      // Walk up while the endpoint is at a finer level than the focus.
+      let cursor: string | undefined = endpointId
+      const seen = new Set<string>()
+      while (cursor && !seen.has(cursor)) {
+        seen.add(cursor)
+        const node = nodeIndex.get(cursor) ?? displayMap.get(cursor)
+        const entityType = (node?.data?.type as string | undefined) ?? node?.typeId
+        const level = entityType ? entityTypeLevels!.get(entityType) : undefined
+        if (level === undefined) {
+          // Unknown level — stop here rather than over-walk into nothing.
+          return cursor
+        }
+        if (level <= traceFocusLevel!) return cursor
+        const parent = traceBundleParentMap!.get(cursor)
+        if (!parent) return cursor  // top of chain; keep what we have
+        cursor = parent
+      }
+      return cursor ?? null
+    }
+
     // B. Regular / Trace Edges
     edges
       .filter(edge => !isContainmentEdge(normalizeEdgeType(edge)))
       .forEach(edge => {
-        const sId = ancestorMap.get(edge.source) || (displayMap.has(edge.source) ? edge.source : null)
-        const tId = ancestorMap.get(edge.target) || (displayMap.has(edge.target) ? edge.target : null)
+        let sId = ancestorMap.get(edge.source) || (displayMap.has(edge.source) ? edge.source : null)
+        let tId = ancestorMap.get(edge.target) || (displayMap.has(edge.target) ? edge.target : null)
+
+        if (sId && tId && bundleEnabled) {
+          // Apply the trace-level rollup. Result endpoints are always at
+          // the focus level (or coarser); ancestor pairs become the
+          // visible bundle.
+          const bundledS = projectToTraceLevel(sId)
+          const bundledT = projectToTraceLevel(tId)
+          if (bundledS) sId = bundledS
+          if (bundledT) tId = bundledT
+        }
+
         if (sId && tId && sId !== tId) {
-          if (isTracing && (!traceContextSet.has(sId) || !traceContextSet.has(tId))) return
+          // Trace-merged edges (recorded in addedEdgeIds) bypass the
+          // contextSet gate — they're definitionally part of the trace and
+          // must render even if one endpoint hasn't been routed into the
+          // trace-filtered hierarchy yet. Ambient (non-trace) edges still
+          // need both endpoints inside the trace context.
+          const isTraceMerged = isTracing && traceAddedEdgeIds?.has(edge.id)
+          if (isTracing && !isTraceMerged
+              && (!traceContextSet.has(sId) || !traceContextSet.has(tId))) return
           // Suppress drilled parent AGG edges (URN-pair match on the original endpoints).
           if (
             isTracing
@@ -405,7 +494,7 @@ export function useEdgeProjection({
     })
 
     return projected
-  }, [ancestorMap, lineageEdges, edges, aggregatedEdges, displayMap, urnToIdMap, showLineageFlow, isTracing, traceContextSet, isContainmentEdge, expandedNodes, suppressedAggEdgeKeys])
+  }, [ancestorMap, lineageEdges, edges, aggregatedEdges, displayMap, urnToIdMap, showLineageFlow, isTracing, traceContextSet, isContainmentEdge, expandedNodes, suppressedAggEdgeKeys, traceAddedEdgeIds, traceBundleParentMap, entityTypeLevels, traceFocusLevel, nodeIndex])
 
   // ── Edge delegation — separate memo so hoveredNodeId changes are O(E) not O(expensive) ──
   //

@@ -66,6 +66,7 @@ import { useContainmentHierarchy } from '@/hooks/useContainmentHierarchy'
 import { useEdgeProjection } from '@/hooks/useEdgeProjection'
 import { useHighlightState, useHoverHighlight, useHoveredNodeId } from '@/hooks/useHighlightState'
 import { useTraceFilteredHierarchy } from '@/hooks/useTraceFilteredHierarchy'
+import { computeTraceMergeSpine } from '@/hooks/lib/traceMergeSpine'
 import { LayerColumn } from './LayerColumn'
 import { LineageFlowOverlay } from './LineageFlowOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
@@ -121,58 +122,84 @@ export function ContextViewCanvas({
       // Auto-enable lineage flow so edges are visible
       setShowLineageFlow(true)
 
-      // CRITICAL: Merge trace result nodes/edges into canvas store
-      // Without this, LineageFlowOverlay can't draw trace edges
+      // Merge trace result into the canvas store using a spine-based strategy
+      // (see frontend/src/hooks/lib/traceMergeSpine.ts).
+      //
+      // Why not "all" or "nothing":
+      //   - Blanket-merging every node the backend returned re-parents existing
+      //     canvas nodes under alien ancestors (e.g. Snowflake stealing
+      //     REPORTING) via useLayerAssignment's "children inherit parent's
+      //     layer" HARD RULE — destroys legitimate placements.
+      //   - Blanket-dropping every ancestor (the previous approach) leaves new
+      //     lineage participants floating with no path to a layer root, so
+      //     useLayerAssignment marks them unassigned and useEdgeProjection
+      //     silently drops their edges (the "trace returns nodes but UI shows
+      //     no lineage" bug).
+      //
+      // The spine helper returns the minimum ancestor chain needed to route
+      // each new participant up to a node the canvas already places. We merge
+      // participants + spine, then attach an `assignmentHint` to spine roots
+      // whose chain never reached a known anchor — useLayerAssignment honours
+      // that hint as a last-resort fallback so the lineage stays visible.
       if (result.lineageResult) {
         const lr = result.lineageResult
 
-        // Discriminate lineage participants from containment ancestors.
-        //
-        // The backend response packs the focus's containment ancestor
-        // chain alongside the lineage participants (added by the server
-        // invariant so free-flow canvases can position deep nodes). In
-        // ContextViewCanvas that's actively harmful: the view's
-        // effectiveAssignments already place every legitimate node into
-        // its correct layer, and adding an ancestor like Snowflake
-        // (Data Platform parent of REPORTING, GOLD, …) triggers
-        // useLayerAssignment's HARD RULE — children inherit parent's
-        // layer — which collapses every descendant into Snowflake's
-        // layer (Raw, since the view didn't assign Snowflake) and
-        // destroys the original layer placement.
-        //
-        // Solution: merge only lineage participants (focus + upstream +
-        // downstream URNs). Skip nodes in result.ancestorUrns. Drop
-        // containment edges that link to skipped nodes — they'd dangle.
-        const ancestorUrns: Set<string> = result.ancestorUrns ?? new Set<string>()
-        const isLineageParticipant = (urn: string): boolean => !ancestorUrns.has(urn)
+        const participantUrns = new Set<string>()
+        result.traceNodes.forEach(u => participantUrns.add(u))
+        lr.upstreamUrns.forEach(u => participantUrns.add(u))
+        lr.downstreamUrns.forEach(u => participantUrns.add(u))
 
-        // Convert GraphNode[] → LineageNode[] and add to canvas
+        const knownAssignedUrns = new Set<string>(displayMap.keys())
+        const { spineUrns, unreachableRoots } = computeTraceMergeSpine({
+          participantUrns,
+          containmentEdges: result.containmentEdges ?? [],
+          knownAssignedUrns,
+        })
+
+        // Determine the focus's effective layer for the assignmentHint
+        // fallback. In ContextViewCanvas the canvas node id == urn, so we
+        // can look it up directly. Outside trace mode this map is rebuilt
+        // every render; reading it here is O(1).
+        const focusLayerId = result.focusId ? nodeLayerMap.get(result.focusId) : undefined
+
+        const shouldMergeNode = (urn: string): boolean =>
+          (participantUrns.has(urn) || spineUrns.has(urn)) && !knownAssignedUrns.has(urn)
+
         const newCanvasNodes = lr.nodes
-          .filter(gn => isLineageParticipant(gn.urn))
-          .map(gn => ({
-            id: gn.urn,
-            type: 'default' as const,
-            position: { x: 0, y: 0 },
-            data: {
-              label: gn.displayName,
-              urn: gn.urn,
-              type: gn.entityType,
-              classifications: gn.tags ?? [],
-              metadata: {
-                ...gn.properties,
-                childCount: gn.childCount,
-                sourceSystem: gn.sourceSystem,
+          .filter(gn => shouldMergeNode(gn.urn))
+          .map(gn => {
+            const metadata: Record<string, unknown> = {
+              ...gn.properties,
+              childCount: gn.childCount,
+              sourceSystem: gn.sourceSystem,
+            }
+            if (unreachableRoots.has(gn.urn) && focusLayerId) {
+              metadata.assignmentHint = focusLayerId
+            }
+            return {
+              id: gn.urn,
+              type: 'default' as const,
+              position: { x: 0, y: 0 },
+              data: {
+                label: gn.displayName,
+                urn: gn.urn,
+                type: gn.entityType,
+                classifications: gn.tags ?? [],
+                metadata,
               },
-            },
-          }))
+            }
+          })
         if (newCanvasNodes.length > 0) {
           addNodes(newCanvasNodes as any[])
         }
 
-        // Convert GraphEdge[] → LineageEdge[] and add to canvas. Drop
-        // edges whose endpoints are filtered ancestors (would dangle).
+        // Lineage edges: both endpoints must be either newly-merged or
+        // already on the canvas. Drops only the rare edge whose endpoint
+        // is an ancestor the spine excluded — those dangle.
+        const isResolvableEndpoint = (urn: string): boolean =>
+          shouldMergeNode(urn) || knownAssignedUrns.has(urn)
         const newCanvasEdges = lr.edges
-          .filter(ge => isLineageParticipant(ge.sourceUrn) && isLineageParticipant(ge.targetUrn))
+          .filter(ge => isResolvableEndpoint(ge.sourceUrn) && isResolvableEndpoint(ge.targetUrn))
           .map(ge => ({
             id: ge.id,
             source: ge.sourceUrn,
@@ -188,15 +215,12 @@ export function ContextViewCanvas({
           trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
         }
 
-        // Containment edges from /trace/v2: keep only those whose
-        // endpoints we actually merged. In practice this drops every
-        // edge that points at the ancestor chain — the view's existing
-        // canvas edges already wire each container into its layer-root
-        // parent (via the view's own containment hierarchy), so we
-        // don't need the backend's ancestor edges to position trace
-        // results.
+        // Containment edges: only when the TARGET (child) is a newly-merged
+        // node. Never add an edge whose target is already on the canvas —
+        // that would re-parent an existing node under an alien ancestor and
+        // collapse its layer assignment via the HARD RULE.
         const newContainmentEdges = (result.containmentEdges ?? [])
-          .filter(ge => isLineageParticipant(ge.sourceUrn) && isLineageParticipant(ge.targetUrn))
+          .filter(ge => shouldMergeNode(ge.targetUrn) && isResolvableEndpoint(ge.sourceUrn))
           .map(ge => ({
             id: ge.id,
             source: ge.sourceUrn,
@@ -212,11 +236,14 @@ export function ContextViewCanvas({
           trace.recordAddedEdgeIds(newContainmentEdges.map(e => e.id))
         }
 
-        // Auto-expand ancestors of traced nodes — but only walk
-        // parents that are themselves lineage participants. Don't
-        // expand a filtered-out ancestor (it isn't on the canvas, and
-        // expanding it would do nothing useful while leaking the
-        // ancestor URN back into expanded state).
+        // Auto-expand only the focus's containment chain. Expanding every
+        // participant's container would unfold the entire layered canvas for
+        // a hub focus (a Campaigns object with 216 downstream participants
+        // would expand 17 entity types × 4 layers worth of containers,
+        // rendering tens of thousands of edges on initial trace). Leaving
+        // other participants rolled up means the user sees AGGREGATED
+        // edges between containers; expanding a container drills via
+        // autoDrillOnExpand to reveal its lineage participants on demand.
         const nodesToExpand = new Set(expandedNodes)
         const allCurrentEdges = [...edges, ...newCanvasEdges, ...newContainmentEdges]
         const traceParentMap = new Map<string, string>()
@@ -226,14 +253,14 @@ export function ContextViewCanvas({
           }
         })
 
-        result.traceNodes.forEach(id => {
-          let curr = traceParentMap.get(id)
+        if (result.focusId) {
+          let curr = traceParentMap.get(result.focusId)
           while (curr) {
-            if (ancestorUrns.has(curr)) break  // stop at filtered ancestor
+            if (nodesToExpand.has(curr)) break  // already on the walk
             nodesToExpand.add(curr)
             curr = traceParentMap.get(curr)
           }
-        })
+        }
 
         setExpandedNodes(nodesToExpand)
       }
@@ -841,8 +868,8 @@ export function ContextViewCanvas({
 
   // === Extracted Hooks ===
 
-  // Layer assignment: rules, nodesByLayer, displayFlat, displayMap, urnToIdMap
-  const { nodesByLayer, displayFlat, displayMap, urnToIdMap } = useLayerAssignment({
+  // Layer assignment: rules, nodesByLayer, displayFlat, displayMap, urnToIdMap, nodeLayerMap
+  const { nodesByLayer, displayFlat, displayMap, urnToIdMap, nodeLayerMap } = useLayerAssignment({
     nodes, sortedLayers, nodeEdgeFingerprint,
     instanceAssignments, effectiveAssignments,
     nodeMap, childMap, parentMap,
@@ -861,6 +888,7 @@ export function ContextViewCanvas({
     traceNodes: trace.result?.traceNodes ?? new Set<string>(),
     drilldowns: trace.drilldowns,
     parentMap,
+    childMap,
     expandedNodes,
   })
 
@@ -1015,54 +1043,92 @@ export function ContextViewCanvas({
   // their hosts. Used by both manual edge double-click and auto-drill on
   // node expansion.
   const mergeDrilldownIntoCanvas = useCallback((expanded: TraceV2Result) => {
-    const newCanvasNodes = expanded.nodes.map(gn => ({
-      id: gn.urn,
-      type: 'default' as const,
-      position: { x: 0, y: 0 },
-      data: {
-        label: gn.displayName,
-        urn: gn.urn,
-        type: gn.entityType,
-        classifications: gn.tags ?? [],
-        metadata: {
+    // Same spine strategy as onTraceComplete — see the comment there for the
+    // full rationale. Drilldowns rarely include alien ancestors (the server
+    // returns lineage between two already-visible subtrees), but applying the
+    // same filter keeps the two merge paths consistent and protects against
+    // the Snowflake-style re-parenting if the server response widens.
+    const participantUrns = new Set<string>()
+    expanded.nodes.forEach(n => participantUrns.add(n.urn))
+    expanded.upstreamUrns.forEach(u => participantUrns.add(u))
+    expanded.downstreamUrns.forEach(u => participantUrns.add(u))
+
+    const knownAssignedUrns = new Set<string>(displayMap.keys())
+    const { spineUrns, unreachableRoots } = computeTraceMergeSpine({
+      participantUrns,
+      containmentEdges: expanded.containmentEdges ?? [],
+      knownAssignedUrns,
+    })
+
+    // For drilldowns we don't have a single focus, so derive a hint from
+    // expanded.focus.urn (the trace anchor). If unavailable, leave
+    // unreachable participants without a hint — they still fall through
+    // useLayerAssignment's existing chain.
+    const drillAnchor = expanded.focus?.urn
+    const focusLayerId = drillAnchor ? nodeLayerMap.get(drillAnchor) : undefined
+
+    const shouldMergeNode = (urn: string): boolean =>
+      (participantUrns.has(urn) || spineUrns.has(urn)) && !knownAssignedUrns.has(urn)
+    const isResolvableEndpoint = (urn: string): boolean =>
+      shouldMergeNode(urn) || knownAssignedUrns.has(urn)
+
+    const newCanvasNodes = expanded.nodes
+      .filter(gn => shouldMergeNode(gn.urn))
+      .map(gn => {
+        const metadata: Record<string, unknown> = {
           ...gn.properties,
           childCount: gn.childCount,
           sourceSystem: gn.sourceSystem,
-        },
-      },
-    }))
+        }
+        if (unreachableRoots.has(gn.urn) && focusLayerId) {
+          metadata.assignmentHint = focusLayerId
+        }
+        return {
+          id: gn.urn,
+          type: 'default' as const,
+          position: { x: 0, y: 0 },
+          data: {
+            label: gn.displayName,
+            urn: gn.urn,
+            type: gn.entityType,
+            classifications: gn.tags ?? [],
+            metadata,
+          },
+        }
+      })
     if (newCanvasNodes.length > 0) addNodes(newCanvasNodes as any[])
 
-    const newCanvasEdges = expanded.edges.map(ge => ({
-      id: ge.id,
-      source: ge.sourceUrn,
-      target: ge.targetUrn,
-      data: {
-        edgeType: ge.edgeType,
-        relationship: ge.edgeType,
-        confidence: ge.confidence,
-      },
-    }))
+    const newCanvasEdges = expanded.edges
+      .filter(ge => isResolvableEndpoint(ge.sourceUrn) && isResolvableEndpoint(ge.targetUrn))
+      .map(ge => ({
+        id: ge.id,
+        source: ge.sourceUrn,
+        target: ge.targetUrn,
+        data: {
+          edgeType: ge.edgeType,
+          relationship: ge.edgeType,
+          confidence: ge.confidence,
+        },
+      }))
     if (newCanvasEdges.length > 0) {
       addEdges(newCanvasEdges as any[])
       trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
     }
 
-    // Hydrated containment edges from /trace/expand — link new nodes into
-    // the canvas hierarchy alongside the lineage edges. Without these the
-    // drilled-into nodes are floating; useContainmentHierarchy can't put
-    // them under their parents and they end up filtered out by layer
-    // assignment.
-    const newContainmentCanvasEdges = (expanded.containmentEdges ?? []).map(ge => ({
-      id: ge.id,
-      source: ge.sourceUrn,
-      target: ge.targetUrn,
-      data: {
-        edgeType: ge.edgeType,
-        relationship: ge.edgeType,
-        confidence: ge.confidence,
-      },
-    }))
+    // Containment edges: only when target is newly-merged. Never re-parent
+    // existing canvas nodes (the HARD RULE would steal their layer).
+    const newContainmentCanvasEdges = (expanded.containmentEdges ?? [])
+      .filter(ge => shouldMergeNode(ge.targetUrn) && isResolvableEndpoint(ge.sourceUrn))
+      .map(ge => ({
+        id: ge.id,
+        source: ge.sourceUrn,
+        target: ge.targetUrn,
+        data: {
+          edgeType: ge.edgeType,
+          relationship: ge.edgeType,
+          confidence: ge.confidence,
+        },
+      }))
     if (newContainmentCanvasEdges.length > 0) {
       addEdges(newContainmentCanvasEdges as any[])
       trace.recordAddedEdgeIds(newContainmentCanvasEdges.map(e => e.id))
@@ -1083,7 +1149,7 @@ export function ContextViewCanvas({
       })
       return next
     })
-  }, [addNodes, addEdges, parentMap])
+  }, [addNodes, addEdges, parentMap, displayMap, nodeLayerMap, trace])
 
   // Entity-type → hierarchy.level lookup for auto-drill. The drill-down
   // RPC takes the *current* level and returns one level finer; we derive
@@ -1167,14 +1233,21 @@ export function ContextViewCanvas({
     if (!wasExpanded && !pendingLoadRef.current.has(nodeId)) {
       pendingLoadRef.current.add(nodeId)
       try {
-        // In trace mode, auto-drill so the next-finer level of trace nodes
-        // becomes visible inside the expanded container. Outside trace mode
-        // this is a no-op. Both run in parallel — they touch independent
-        // pieces of state.
-        await Promise.all([
-          loadChildren(nodeId),
-          trace.isTracing ? autoDrillOnExpand(nodeId) : Promise.resolve(),
-        ])
+        // NOTE: autoDrillOnExpand intentionally NOT invoked here.
+        //
+        // It used to fire on every traced-container expansion, batching a
+        // /trace/expand call for every incident AGGREGATED edge. For a hub
+        // node (a Campaigns object touching 17 entity types × 4 layers)
+        // that's a single batch that returns tens of thousands of
+        // finer-level edges — the canvas renders 14k+ edges and the user
+        // can't see anything.
+        //
+        // Drilldowns are still available — the user gets them by double-
+        // clicking an AGGREGATED edge, which calls expandAggregatedEdge
+        // for that specific pair. That's a targeted O(1) drill instead of
+        // an O(N) batch. If we re-introduce auto-drill it should be gated
+        // behind a Shift-click / dock toggle, not the default.
+        await loadChildren(nodeId)
       } finally {
         pendingLoadRef.current.delete(nodeId)
       }
@@ -1214,7 +1287,7 @@ export function ContextViewCanvas({
       }
       if (subtreeUrns.size > 0) purgeAggregatedEdgesIncidentToUrns(subtreeUrns)
     }
-  }, [displayMap, loadChildren, trace.isTracing, autoDrillOnExpand, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns])
+  }, [displayMap, loadChildren, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns])
 
 
 
@@ -1235,6 +1308,16 @@ export function ContextViewCanvas({
     traceContextSet, isContainmentEdge,
     hoveredNodeId,
     suppressedAggEdgeKeys,
+    traceAddedEdgeIds: trace.addedEdgeIds,
+    // Trace-mode edge bundling: roll every leaf endpoint up to the focus's
+    // hierarchy level so per-pair grouping collapses thousands of
+    // column-to-column edges into a handful of container-to-container
+    // bundles. parentMap is the canvas containment hierarchy; entityTypeLevels
+    // is the ontology level map; result.effectiveLevel is what the trace
+    // actually ran at.
+    traceBundleParentMap: parentMap,
+    entityTypeLevels,
+    traceFocusLevel: trace.result?.effectiveLevel,
   })
 
   // Highlight state: connected nodes/edges for selected node
