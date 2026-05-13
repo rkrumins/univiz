@@ -8,6 +8,7 @@
  */
 import { create } from 'zustand'
 import { fetchWithTimeout } from '@/services/fetchWithTimeout'
+import { TIMEOUTS } from '@/config/timeouts'
 
 export type ProviderStatus = 'healthy' | 'unhealthy' | 'unknown'
 
@@ -39,7 +40,7 @@ export const useProviderHealthStore = create<ProviderHealthState>((set, get) => 
 
   refresh: async () => {
     try {
-      const res = await fetchWithTimeout('/api/v1/health/providers', { timeoutMs: 8_000 })
+      const res = await fetchWithTimeout('/api/v1/health/providers', { timeoutMs: TIMEOUTS.PROVIDER_HEALTH_MS })
       if (!res.ok) return
 
       const data = await res.json() as { providers: Record<string, { status: string; error?: string }> }

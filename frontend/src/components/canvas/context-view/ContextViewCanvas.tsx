@@ -92,6 +92,8 @@ export function ContextViewCanvas({
   const edges = useCanvasStore((s) => s.edges)
   const addNodes = useCanvasStore((s) => s.addNodes)
   const addEdges = useCanvasStore((s) => s.addEdges)
+  const removeEdgesByNodeIds = useCanvasStore((s) => s.removeEdgesByNodeIds)
+  const removeStoreEdges = useCanvasStore((s) => s.removeEdges)
   const selectNode = useCanvasStore((s) => s.selectNode)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
   const selectedNodeId = selectedNodeIds[0] ?? null
@@ -183,6 +185,7 @@ export function ContextViewCanvas({
           }))
         if (newCanvasEdges.length > 0) {
           addEdges(newCanvasEdges as any[])
+          trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
         }
 
         // Containment edges from /trace/v2: keep only those whose
@@ -206,6 +209,7 @@ export function ContextViewCanvas({
           }))
         if (newContainmentEdges.length > 0) {
           addEdges(newContainmentEdges as any[])
+          trace.recordAddedEdgeIds(newContainmentEdges.map(e => e.id))
         }
 
         // Auto-expand ancestors of traced nodes — but only walk
@@ -243,6 +247,18 @@ export function ContextViewCanvas({
   const startTraceRef = useRef<(nodeId: string) => void>(() => {})
   const toggleTraceRef = useRef<(nodeId: string) => void>(() => {})
 
+  // Exit-trace cleanup. Purges the edges the trace merged into the canvas
+  // store so the ambient edge mesh doesn't permanently inherit them.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) removeStoreEdges(idsToRemove)
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace, removeStoreEdges])
+
   // UX-first Canvas Interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => startTraceRef.current(nodeId),
@@ -262,10 +278,7 @@ export function ContextViewCanvas({
     },
     // ESC exits an active trace before any other panel close — gives the
     // user a single, predictable escape from a busy trace view.
-    onExitTrace: () => {
-      if (trace.isTracing) { trace.clearTrace(); setExpandedNodes(new Set()); return true }
-      return false
-    },
+    onExitTrace: exitTrace,
   })
 
   // Keyboard shortcuts
@@ -283,6 +296,7 @@ export function ContextViewCanvas({
     granularity: lineageGranularity,
     setGranularity: setLineageGranularity,
     truncated: aggregationTruncated,
+    purgeEdgesIncidentToUrns: purgeAggregatedEdgesIncidentToUrns,
   } = useAggregatedLineage({ granularity: null })
 
   // Instance-level assignments from store (user drag-and-drop)
@@ -1029,7 +1043,10 @@ export function ContextViewCanvas({
         confidence: ge.confidence,
       },
     }))
-    if (newCanvasEdges.length > 0) addEdges(newCanvasEdges as any[])
+    if (newCanvasEdges.length > 0) {
+      addEdges(newCanvasEdges as any[])
+      trace.recordAddedEdgeIds(newCanvasEdges.map(e => e.id))
+    }
 
     // Hydrated containment edges from /trace/expand — link new nodes into
     // the canvas hierarchy alongside the lineage edges. Without these the
@@ -1046,7 +1063,10 @@ export function ContextViewCanvas({
         confidence: ge.confidence,
       },
     }))
-    if (newContainmentCanvasEdges.length > 0) addEdges(newContainmentCanvasEdges as any[])
+    if (newContainmentCanvasEdges.length > 0) {
+      addEdges(newContainmentCanvasEdges as any[])
+      trace.recordAddedEdgeIds(newContainmentCanvasEdges.map(e => e.id))
+    }
 
     const drillContainmentMap = new Map<string, string>()
     expanded.containmentEdges?.forEach(ce => {
@@ -1083,14 +1103,12 @@ export function ContextViewCanvas({
   // (which reads `trace.drilldowns`) reveals them in the canvas — recursively
   // at any depth.
   //
-  // Idempotent: `trace.expandAggregatedEdge` caches results by
-  // `${s}->${t}@${nextLevel}`, so re-expanding a previously-drilled node
-  // is a no-op against the network.
-  //
-  // Concurrency cap (AUTO_DRILL_CONCURRENCY): a hub node may have dozens of
-  // incident AGGREGATED edges. Firing them all in parallel hammers the
-  // backend; serializing all of them makes the wait visible. 6 keeps the
-  // network busy without overwhelming the trace endpoint.
+  // Single batched call: previously this fired one /trace/expand request per
+  // incident aggregated edge (concurrency-6 worker pool). A hub node with
+  // 30 edges produced 30 HTTP requests. Now we collect every pair into one
+  // /trace/expand-batch call; the server fans out internally and returns a
+  // single merged result. The drilldowns cache still keys per (s, t, lvl)
+  // so re-expanding a previously-drilled node remains a no-op.
   const autoDrillOnExpand = useCallback(async (nodeId: string) => {
     if (!trace.isTracing) return
     const node = nodes.find(n => n.id === nodeId)
@@ -1111,19 +1129,15 @@ export function ContextViewCanvas({
     })
     if (incidentEdges.length === 0) return
 
-    const AUTO_DRILL_CONCURRENCY = 6
-    let cursor = 0
-    const drillOne = async () => {
-      while (cursor < incidentEdges.length) {
-        const edge = incidentEdges[cursor++]
-        const s = (edge as any).source ?? (edge as any).sourceUrn
-        const t = (edge as any).target ?? (edge as any).targetUrn
-        const r = await trace.expandAggregatedEdge(s, t, currentLevel)
-        if (r) mergeDrilldownIntoCanvas(r)
-      }
-    }
-    const workerCount = Math.min(AUTO_DRILL_CONCURRENCY, incidentEdges.length)
-    await Promise.all(Array.from({ length: workerCount }, drillOne))
+    const pairs = incidentEdges.map(edge => ({
+      sourceUrn: (edge as any).source ?? (edge as any).sourceUrn,
+      targetUrn: (edge as any).target ?? (edge as any).targetUrn,
+      currentLevel,
+    })).filter(p => p.sourceUrn && p.targetUrn)
+    if (pairs.length === 0) return
+
+    const merged = await trace.expandAggregatedEdgesBatch(pairs)
+    if (merged) mergeDrilldownIntoCanvas(merged)
   }, [trace, nodes, edges, entityTypeLevels, mergeDrilldownIntoCanvas])
 
   const toggleNode = useCallback(async (nodeId: string) => {
@@ -1164,8 +1178,43 @@ export function ContextViewCanvas({
       } finally {
         pendingLoadRef.current.delete(nodeId)
       }
+    } else if (wasExpanded) {
+      // Collapse: drop every edge with an endpoint inside the collapsed
+      // subtree (the node itself + all descendants). Runs in BOTH browse
+      // mode and trace mode — `loadChildren` (browse) and trace drilldowns
+      // both add edges to the canvas store on expand, so collapse must
+      // unconditionally release them. Re-expanding refetches via
+      // loadChildren / drill paths (cached by the trace store).
+      const subtreeIds = new Set<string>()
+      subtreeIds.add(nodeId)
+      const stack: string[] = [nodeId]
+      while (stack.length > 0) {
+        const id = stack.pop()!
+        const children = childMap.get(id)
+        if (!children) continue
+        for (const cid of children) {
+          if (!subtreeIds.has(cid)) { subtreeIds.add(cid); stack.push(cid) }
+        }
+      }
+      // Edges where the collapsed node is one endpoint should also drop so the
+      // node's children-level lineage doesn't linger as orphan edges. The
+      // collapsed parent re-acquires its aggregated edges via fetchAggregated
+      // on the next render tick.
+      removeEdgesByNodeIds(subtreeIds)
+
+      // Synchronous companion: drop matching entries in the aggregated-edge
+      // map too. Otherwise stale child-level aggregated edges linger for up
+      // to 500 ms (until the debounced fetchAggregated refreshes), producing
+      // a flicker after collapse. Resolve subtree URNs from displayMap so
+      // we don't depend on id == urn invariants.
+      const subtreeUrns = new Set<string>()
+      for (const id of subtreeIds) {
+        const u = (displayMap.get(id)?.data?.urn as string | undefined) ?? id
+        if (u) subtreeUrns.add(u)
+      }
+      if (subtreeUrns.size > 0) purgeAggregatedEdgesIncidentToUrns(subtreeUrns)
     }
-  }, [displayMap, loadChildren, trace.isTracing, autoDrillOnExpand])
+  }, [displayMap, loadChildren, trace.isTracing, autoDrillOnExpand, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns])
 
 
 
@@ -1284,7 +1333,7 @@ export function ContextViewCanvas({
         traceActive={trace.isTracing}
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
         onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
-        onExitTrace={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+        onExitTrace={exitTrace}
         onAddEntity={() => { setIsCreatingEntity(true); setCreationParentId(null); setCreationLayerId(null) }}
         viewName={activeView?.name}
         entityTypeCount={activeView?.content.visibleEntityTypes.length}
@@ -1313,7 +1362,7 @@ export function ContextViewCanvas({
               resolveEdgeColor={resolveEdgeColor}
               expanded={dockExpanded}
               onToggleExpanded={() => setDockExpanded(v => !v)}
-              onExit={() => { trace.clearTrace(); setExpandedNodes(new Set()) }}
+              onExit={exitTrace}
               onJumpToUrn={(urn) => {
                 const id = urnToIdMap.get(urn) ?? urn
                 startTraceWithSmartLevel(id)
@@ -1383,14 +1432,19 @@ export function ContextViewCanvas({
           <EdgeLegend defaultExpanded={false} visibleEdges={visibleLineageEdges} />
         </div>
 
+
         {/* Layer Columns. */}
         <div
           ref={horizontalScrollRef}
           className="flex-1 overflow-auto relative scroll-smooth"
           onClick={handleBackgroundClick}
         >
-          {/* Lineage Flow Overlay - Render BEFORE columns to be behind them (z-index managed in component to 0, cols should be higher) */}
-          {(showLineageFlow || trace.isTracing) && (
+          {/* Lineage Flow Overlay - Render BEFORE columns to be behind them
+              (z-index managed in component to 0, cols should be higher).
+              Flow is the master switch — Trace mode respects it so the user
+              can dial back ambient edge noise while keeping trace highlights
+              on the nodes and trace panels open. */}
+          {showLineageFlow && (
             <LineageFlowOverlay
               nodes={renderFlat}
               edges={visibleLineageEdges}

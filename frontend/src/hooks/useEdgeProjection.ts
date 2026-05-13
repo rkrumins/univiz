@@ -165,8 +165,11 @@ export function useEdgeProjection({
   const prevExpandedNodesRef = useRef<Set<string>>(new Set())
 
   // ── lineageEdges ───────────────────────────────────────────────────────
+  // Flow is the master switch for edge rendering. Trace mode keeps its node
+  // highlights and side panels but respects Flow off — the canvas stays clean
+  // when the user wants to inspect a trace path without ambient mesh noise.
   const lineageEdges = useMemo(() => {
-    if (!showLineageFlow && !isTracing) return []
+    if (!showLineageFlow) return []
 
     // 1. Aggregated Edges
     const aggEdges = Array.from(aggregatedEdges.values())
@@ -201,18 +204,15 @@ export function useEdgeProjection({
           }
         })))
 
-    // 3. Regular canvas edges — included when lineage flow is enabled OR tracing.
-    // Performance guard: only include edges where at least one endpoint is in displayMap.
-    let regularEdges: any[] = []
-    if (showLineageFlow || isTracing) {
-      regularEdges = edges.filter(edge => {
-        if (isContainmentEdge(normalizeEdgeType(edge))) return false
-        return displayMap.has(edge.source) || displayMap.has(edge.target)
-      })
-    }
+    // 3. Regular canvas edges — performance guard: only include edges where
+    // at least one endpoint is in displayMap.
+    const regularEdges = edges.filter(edge => {
+      if (isContainmentEdge(normalizeEdgeType(edge))) return false
+      return displayMap.has(edge.source) || displayMap.has(edge.target)
+    })
 
     return [...aggEdges, ...expandedDetailedEdges, ...regularEdges]
-  }, [edges, showLineageFlow, isTracing, aggregatedEdges, isContainmentEdge])
+  }, [edges, showLineageFlow, aggregatedEdges, isContainmentEdge, displayMap])
 
   // ── ancestorMap (Phase 5.1 — incremental) ─────────────────────────────
   //
@@ -279,7 +279,7 @@ export function useEdgeProjection({
   // Now depends on the stable `ancestorMap` instead of rebuilding it here.
   // This memo only re-runs when edges or the ancestorMap actually change.
   const projectedEdges = useMemo(() => {
-    if (!showLineageFlow && !isTracing) return []
+    if (!showLineageFlow) return []
 
     const edgeGroups = new Map<string, any[]>()
 

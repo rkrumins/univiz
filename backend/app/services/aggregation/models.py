@@ -65,6 +65,16 @@ class AggregationJobORM(Base):
     retry_count = Column(Integer, nullable=False, default=0)
     max_retries = Column(Integer, nullable=False, default=3)
 
+    # ── Phase visibility (Phase 1.7) ─────────────────────────────────
+    # Short string identifying which phase of the bulk-rebuild path is
+    # currently running. Surfaced to the UI so operators can see why
+    # FalkorDB has zero edges during the scan window even though the
+    # job is making progress. Values: 'wiping' / 'scanning' /
+    # 'resolving_labels' / 'creating' / 'finalizing'. NULL on legacy
+    # rows and on paths (Neo4j/Spanner/legacy MERGE) that don't emit
+    # phase signals — frontend falls back to a generic label.
+    current_phase = Column(Text, nullable=True)
+
     # ── Dynamic timeout (estimated from graph size at trigger time) ──
     timeout_secs = Column(Integer, nullable=True)  # None = use global default
 

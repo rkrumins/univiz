@@ -174,9 +174,11 @@ async def trace_v2(
     AGGREGATED edges between them. Filters by ``s.level``/``t.level`` at
     the database — never explodes a Domain-level trace down to Columns.
 
-    Hard caps: ``TRACE_MAX_NODES=2000`` nodes, ``TRACE_TIMEOUT_MS=8000`` ms
-    (server config; not per-request). On trip, returns ``truncated: true``
-    with ``truncationReason``. Always HTTP 200 unless input is malformed.
+    Hard caps: ``TRACE_MAX_NODES`` (default 2000) nodes,
+    ``TRACE_TIMEOUT_SECS`` (default 60 s) outer budget — both server
+    config, not per-request. See ``app/config/resilience.py``. On trip,
+    returns ``truncated: true`` with ``truncationReason``. Always HTTP
+    200 unless input is malformed.
     """
     return await engine.trace(request)
 
@@ -194,6 +196,119 @@ async def trace_expand(
     edges directly.
     """
     return await engine.expand_aggregated_edge(request)
+
+
+class _TraceExpandPair(BaseModel):
+    """One aggregated-edge identifier in a batch expand. Aliases match the
+    frontend payload (sourceUrn / targetUrn / nextLevel)."""
+    source_urn: str = Field(alias="sourceUrn")
+    target_urn: str = Field(alias="targetUrn")
+    next_level: int | str = Field(alias="nextLevel")
+
+    class Config:
+        populate_by_name = True
+
+
+class _TraceExpandBatchRequest(BaseModel):
+    """Body for /trace/expand-batch — N edges share the same config."""
+    pairs: List[_TraceExpandPair]
+    lineage_edge_types: Optional[List[str]] = Field(None, alias="lineageEdgeTypes")
+    include_containment_edges: bool = Field(True, alias="includeContainmentEdges")
+
+    class Config:
+        populate_by_name = True
+
+
+@router.post("/trace/expand-batch", response_model=TraceResult, response_model_by_alias=True)
+async def trace_expand_batch(
+    request: _TraceExpandBatchRequest = Body(...),
+    engine: ContextEngine = Depends(get_context_engine),
+) -> TraceResult:
+    """Batched drill-down. Replaces N concurrent POSTs to /trace/expand with
+    one request — the frontend's ``autoDrillOnExpand`` collects every
+    aggregated edge incident to an expanding traced node and ships them
+    together. The server fans out via asyncio.gather and merges results by id.
+
+    Partial-success: pair-level failures are swallowed (with a logged warning)
+    so the rest of the batch returns; total failure returns 404 with the
+    list of pair-level error messages in the response body. Shape matches
+    /trace/expand so the frontend's normalizeTraceV2 handles either."""
+    import asyncio
+    if not request.pairs:
+        # Empty batch — return an empty payload. Use the first pair's URN as
+        # a placeholder focus; never reached because empty pairs short-circuit.
+        raise HTTPException(status_code=400, detail="No pairs provided.")
+
+    pair_errors: List[str] = []
+
+    async def run_one(p: _TraceExpandPair):
+        req = ExpandRequest(
+            source_urn=p.source_urn,
+            target_urn=p.target_urn,
+            next_level=p.next_level,
+            lineage_edge_types=request.lineage_edge_types,
+            include_containment_edges=request.include_containment_edges,
+        )
+        try:
+            return await engine.expand_aggregated_edge(req)
+        except Exception as exc:
+            # Catch ALL exceptions per pair — provider unavailability, value
+            # errors, missing URNs, etc. Surface to the response body so the
+            # frontend can render a partial result with the failure list.
+            msg = f"{p.source_urn} → {p.target_urn} @ {p.next_level}: {type(exc).__name__}: {exc}"
+            pair_errors.append(msg)
+            logger.warning("trace/expand-batch pair failed: %s", msg, exc_info=False)
+            return None
+
+    results = await asyncio.gather(*(run_one(p) for p in request.pairs))
+    successes = [r for r in results if r is not None]
+    if not successes:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "trace_expand_batch_all_failed",
+                "message": "No pair in the batch could be expanded.",
+                "errors": pair_errors[:20],  # cap to keep response readable
+            },
+        )
+
+    # Merge by id. Identical (s, t, lvl) triples produce deterministic results,
+    # so last-write-wins is safe.
+    nodes_by_id: dict = {}
+    edges_by_id: dict = {}
+    containment_by_id: dict = {}
+    upstream_urns: set = set()
+    downstream_urns: set = set()
+    truncated_any = False
+    focus = None
+    effective_level = 0
+    for r in successes:
+        for n in r.nodes: nodes_by_id[n.urn] = n
+        for e in r.edges: edges_by_id[e.id] = e
+        for ce in r.containment_edges: containment_by_id[ce.id] = ce
+        upstream_urns.update(r.upstream_urns)
+        downstream_urns.update(r.downstream_urns)
+        if r.truncated: truncated_any = True
+        if focus is None:
+            focus = r.focus
+            effective_level = r.effective_level
+
+    if pair_errors:
+        logger.info(
+            "trace/expand-batch partial success: %d/%d pairs succeeded",
+            len(successes), len(request.pairs),
+        )
+
+    return TraceResult(
+        nodes=list(nodes_by_id.values()),
+        edges=list(edges_by_id.values()),
+        containment_edges=list(containment_by_id.values()),
+        upstream_urns=upstream_urns,
+        downstream_urns=downstream_urns,
+        focus=focus,
+        effective_level=effective_level,
+        truncated=truncated_any,
+    )
 
 
 @router.get(

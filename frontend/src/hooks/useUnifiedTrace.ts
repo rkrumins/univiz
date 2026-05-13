@@ -127,6 +127,46 @@ export type DrilldownKey = string
 export const drilldownKey = (sourceUrn: string, targetUrn: string, atLevel: number): DrilldownKey =>
     `${sourceUrn}->${targetUrn}@${atLevel}`
 
+/**
+ * Merge several TraceV2Result payloads into one. Deduplicates nodes by urn
+ * and edges by id; unions the upstream/downstream URN sets. Used by the
+ * batch expand path (and the per-call fallback) so the drilldowns cache
+ * sees the same shape regardless of which transport path produced it.
+ */
+function mergeDrilldownResults(results: TraceV2Result[]): TraceV2Result | null {
+    if (results.length === 0) return null
+    if (results.length === 1) return results[0]
+    const nodesByUrn = new Map<string, TraceV2Result['nodes'][number]>()
+    const edgesById = new Map<string, TraceV2Result['edges'][number]>()
+    const containmentById = new Map<string, TraceV2Result['edges'][number]>()
+    const upstreamUrns = new Set<string>()
+    const downstreamUrns = new Set<string>()
+    let truncated = false
+    for (const r of results) {
+        for (const n of r.nodes) nodesByUrn.set(n.urn, n)
+        for (const e of r.edges) edgesById.set(e.id, e)
+        for (const ce of r.containmentEdges ?? []) containmentById.set(ce.id, ce)
+        r.upstreamUrns.forEach(u => upstreamUrns.add(u))
+        r.downstreamUrns.forEach(u => downstreamUrns.add(u))
+        if (r.truncated) truncated = true
+    }
+    // Effective level / focus / inheritance: take the first result's values.
+    // Batch callers use a single configuration, so these are uniform across results.
+    const first = results[0]
+    return {
+        nodes: Array.from(nodesByUrn.values()),
+        edges: Array.from(edgesById.values()),
+        containmentEdges: Array.from(containmentById.values()),
+        upstreamUrns,
+        downstreamUrns,
+        focus: first.focus,
+        effectiveLevel: first.effectiveLevel,
+        isInherited: first.isInherited,
+        inheritedFromUrn: first.inheritedFromUrn,
+        truncated,
+    }
+}
+
 export interface TraceState {
     /** Current trace status */
     status: TraceStatus
@@ -145,6 +185,13 @@ export interface TraceState {
     drilldowns: Map<DrilldownKey, TraceV2Result>
     /** Recent-focus breadcrumb (newest first, capped at 5). Session-scoped. */
     traceHistory: TraceHistoryEntry[]
+    /**
+     * Edge ids that were merged into the canvas store as part of this trace
+     * session (initial fetch + drilldowns). Lets the canvas purge exactly the
+     * edges it added when the user clears the trace — instead of leaving them
+     * to leak into the ambient edge mesh.
+     */
+    addedEdgeIds: Set<string>
 
     // Actions
     setFocus: (nodeId: string | null) => void
@@ -159,12 +206,25 @@ export interface TraceState {
         currentLevel: number,
         provider: GraphDataProvider,
     ) => Promise<TraceV2Result | null>
+    /**
+     * Batched drill-down — collects multiple aggregated edges of an
+     * expanding node into one provider call (when the provider supports
+     * /trace/expand-batch) and merges into the drilldowns cache.
+     */
+    expandAggregatedEdgesBatch: (
+        pairs: Array<{ sourceUrn: string; targetUrn: string; currentLevel: number }>,
+        provider: GraphDataProvider,
+    ) => Promise<TraceV2Result | null>
     /** Collapse a previously-opened drilldown (reverts to the original AGGREGATED edge). */
     collapseDrilldown: (key: DrilldownKey) => void
     /** Drop the trace-history breadcrumb. */
     clearTraceHistory: () => void
     clearTrace: () => void
     reset: () => void
+    /** Record edge ids that were merged into the canvas as part of this trace session. */
+    recordAddedEdgeIds: (ids: Iterable<string>) => void
+    /** Drop the tracked added-edge ids (without affecting the canvas store). */
+    resetAddedEdgeIds: () => void
 }
 
 /** History capacity. Older entries are evicted FIFO. */
@@ -215,10 +275,11 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     showDownstream: true,
     drilldowns: new Map(),
     traceHistory: [],
+    addedEdgeIds: new Set(),
 
     setFocus: (nodeId) => {
         if (nodeId === null) {
-            set({ focusId: null, result: null, status: 'idle', drilldowns: new Map() })
+            set({ focusId: null, result: null, status: 'idle', drilldowns: new Map(), addedEdgeIds: new Set() })
         } else {
             set({ focusId: nodeId })
         }
@@ -236,8 +297,8 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     fetchTrace: async (nodeId, provider, urnResolver) => {
         const { config } = get()
 
-        // New trace clears any drilldowns from a previous focus.
-        set({ status: 'loading', error: null, focusId: nodeId, drilldowns: new Map() })
+        // New trace clears any drilldowns and tracked edges from a previous focus.
+        set({ status: 'loading', error: null, focusId: nodeId, drilldowns: new Map(), addedEdgeIds: new Set() })
 
         try {
             const urn = urnResolver ? urnResolver(nodeId) : nodeId
@@ -339,6 +400,84 @@ export const useTraceStore = create<TraceState>((set, get) => ({
         }
     },
 
+    expandAggregatedEdgesBatch: async (pairs, provider) => {
+        if (pairs.length === 0) return null
+        const { config, drilldowns } = get()
+
+        // Per-pair cache check: filter to pairs whose drilldown isn't already
+        // materialised. If everything is cached, no network call.
+        const keysByPair = new Map<string, { sourceUrn: string; targetUrn: string; nextLevel: number }>()
+        const uncached: Array<{ sourceUrn: string; targetUrn: string; nextLevel: number }> = []
+        for (const p of pairs) {
+            const nextLevel = p.currentLevel + 1
+            const key = drilldownKey(p.sourceUrn, p.targetUrn, nextLevel)
+            keysByPair.set(key, { sourceUrn: p.sourceUrn, targetUrn: p.targetUrn, nextLevel })
+            if (!drilldowns.has(key)) uncached.push({ sourceUrn: p.sourceUrn, targetUrn: p.targetUrn, nextLevel })
+        }
+        if (uncached.length === 0) {
+            // Everything's cached — return the union of cached results.
+            return mergeDrilldownResults(Array.from(keysByPair.keys())
+                .map(k => drilldowns.get(k))
+                .filter((r): r is TraceV2Result => r !== undefined))
+        }
+
+        // Try the batch endpoint first. On ANY failure (4xx, 5xx, network),
+        // fall back to N concurrent per-edge expandAggregated calls so the
+        // drill flow keeps working. Without this fallback, a single
+        // backend bug in /trace/expand-batch silently breaks the trace
+        // (the user sees only the level-0 skeleton with no way to drill).
+        const callPerEdge = async (): Promise<TraceV2Result | null> => {
+            if (typeof provider.expandAggregated !== 'function') return null
+            const settled = await Promise.allSettled(uncached.map(p => provider.expandAggregated!({
+                sourceUrn: p.sourceUrn,
+                targetUrn: p.targetUrn,
+                nextLevel: p.nextLevel,
+                lineageEdgeTypes: config.lineageEdgeTypes.length > 0 ? config.lineageEdgeTypes : null,
+                includeContainmentEdges: config.includeContainmentEdges,
+            })))
+            const ok = settled
+                .filter((s): s is PromiseFulfilledResult<TraceV2Result> => s.status === 'fulfilled')
+                .map(s => s.value)
+            return ok.length > 0 ? mergeDrilldownResults(ok) : null
+        }
+
+        let merged: TraceV2Result | null = null
+        if (typeof provider.expandAggregatedBatch === 'function') {
+            try {
+                merged = await provider.expandAggregatedBatch({
+                    pairs: uncached,
+                    lineageEdgeTypes: config.lineageEdgeTypes.length > 0 ? config.lineageEdgeTypes : null,
+                    includeContainmentEdges: config.includeContainmentEdges,
+                })
+            } catch (err) {
+                // Log the batch failure but don't abort — drill back via per-edge.
+                console.warn('[trace] expand-batch failed, falling back to per-edge expand:', err)
+                merged = await callPerEdge()
+                if (!merged) {
+                    set({ error: err instanceof Error ? err.message : 'Failed to expand aggregated edges (batch)' })
+                    return null
+                }
+            }
+        } else {
+            merged = await callPerEdge()
+            if (!merged) return null
+        }
+
+        // Cache the merged response under each (s, t, nextLevel) key so
+        // future calls for the same pair are no-ops. The cached entry per
+        // key is the full merged result — not ideal for memory but keeps
+        // the lookup contract identical to single-edge expand.
+        const next = new Map(drilldowns)
+        if (merged) {
+            for (const p of uncached) {
+                const key = drilldownKey(p.sourceUrn, p.targetUrn, p.nextLevel)
+                next.set(key, merged)
+            }
+            set({ drilldowns: next })
+        }
+        return merged
+    },
+
     collapseDrilldown: (key) => {
         const { drilldowns } = get()
         if (!drilldowns.has(key)) return
@@ -350,6 +489,9 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     clearTraceHistory: () => set({ traceHistory: [] }),
 
     clearTrace: () => {
+        // Note: addedEdgeIds is intentionally *not* cleared here. The canvas
+        // reads it after clearTrace to know which edges to remove from the
+        // store, then clears it explicitly via the action below.
         set({
             focusId: null,
             result: null,
@@ -359,6 +501,20 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showDownstream: true,
             drilldowns: new Map(),
         })
+    },
+
+    recordAddedEdgeIds: (ids) => {
+        const { addedEdgeIds } = get()
+        let changed = false
+        const next = new Set(addedEdgeIds)
+        for (const id of ids) {
+            if (!next.has(id)) { next.add(id); changed = true }
+        }
+        if (changed) set({ addedEdgeIds: next })
+    },
+
+    resetAddedEdgeIds: () => {
+        if (get().addedEdgeIds.size > 0) set({ addedEdgeIds: new Set() })
     },
 
     reset: () => {
@@ -371,6 +527,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showUpstream: true,
             showDownstream: true,
             drilldowns: new Map(),
+            addedEdgeIds: new Set(),
             traceHistory: [],
         })
     },
@@ -553,6 +710,8 @@ export interface UseUnifiedTraceResult {
     drilldowns: Map<DrilldownKey, TraceV2Result>
     /** Drill into an AGGREGATED edge */
     expandAggregatedEdge: (sourceUrn: string, targetUrn: string, currentLevel: number) => Promise<TraceV2Result | null>
+    /** Batched drill — one provider call for many edges */
+    expandAggregatedEdgesBatch: (pairs: Array<{ sourceUrn: string; targetUrn: string; currentLevel: number }>) => Promise<TraceV2Result | null>
     /** Collapse a drilldown by key */
     collapseDrilldown: (key: DrilldownKey) => void
 
@@ -562,6 +721,13 @@ export interface UseUnifiedTraceResult {
     jumpToHistoryEntry: (entry: TraceHistoryEntry) => Promise<void>
     /** Drop the entire trace-history breadcrumb. */
     clearTraceHistory: () => void
+
+    /** Edge ids the canvas merged in for this trace session — initial fetch + drilldowns. */
+    addedEdgeIds: Set<string>
+    /** Record edge ids added to the canvas as part of this trace session. */
+    recordAddedEdgeIds: (ids: Iterable<string>) => void
+    /** Drop the tracked added-edge ids (without affecting the canvas store). */
+    resetAddedEdgeIds: () => void
 }
 
 export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTraceResult {
@@ -577,6 +743,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const showDownstream = useTraceStore(s => s.showDownstream)
     const drilldowns = useTraceStore(s => s.drilldowns)
     const traceHistory = useTraceStore(s => s.traceHistory)
+    const addedEdgeIds = useTraceStore(s => s.addedEdgeIds)
 
     // Actions
     const setConfig = useTraceStore(s => s.setConfig)
@@ -586,8 +753,11 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const clearTrace = useTraceStore(s => s.clearTrace)
     const setFocus = useTraceStore(s => s.setFocus)
     const expandAggregatedEdgeAction = useTraceStore(s => s.expandAggregatedEdge)
+    const expandAggregatedEdgesBatchAction = useTraceStore(s => s.expandAggregatedEdgesBatch)
     const collapseDrilldown = useTraceStore(s => s.collapseDrilldown)
     const clearTraceHistory = useTraceStore(s => s.clearTraceHistory)
+    const recordAddedEdgeIds = useTraceStore(s => s.recordAddedEdgeIds)
+    const resetAddedEdgeIds = useTraceStore(s => s.resetAddedEdgeIds)
 
     // Canvas store for auto-sync
     const { nodes: canvasNodes } = useCanvasStore()
@@ -669,6 +839,15 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
         if (!provider) return null
         return expandAggregatedEdgeAction(sourceUrn, targetUrn, currentLevel, provider)
     }, [provider, expandAggregatedEdgeAction])
+
+    // Batched drill — provider-bound wrapper used by autoDrillOnExpand to
+    // collapse N concurrent /trace/expand requests into one /trace/expand-batch.
+    const expandAggregatedEdgesBatch = useCallback(async (
+        pairs: Array<{ sourceUrn: string; targetUrn: string; currentLevel: number }>,
+    ): Promise<TraceV2Result | null> => {
+        if (!provider) return null
+        return expandAggregatedEdgesBatchAction(pairs, provider)
+    }, [provider, expandAggregatedEdgesBatchAction])
 
     // Check functions - support both node ID and URN matching
     const isInTrace = useCallback((nodeId: string) => {
@@ -816,10 +995,14 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
         statistics,
         drilldowns,
         expandAggregatedEdge,
+        expandAggregatedEdgesBatch,
         collapseDrilldown,
         traceHistory,
         jumpToHistoryEntry,
         clearTraceHistory,
+        addedEdgeIds,
+        recordAddedEdgeIds,
+        resetAddedEdgeIds,
     }
 }
 

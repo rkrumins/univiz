@@ -190,6 +190,56 @@ class FalkorDBProvider(GraphDataProvider):
                 )
                 self._bulk_create_timeout_s = 60.0
 
+        # Phase 2 — provider-internal hard cap and latency-quiesce circuit.
+        #
+        # The write semaphore puts a structural ceiling on in-flight
+        # writes to FalkorDB per (provider_id, graph_name) instance.
+        # No caller can exceed it; the worker, ingest hooks, future
+        # callers are all gated through ``_proj_query``. Default 2
+        # tolerates one bulk-rebuild batch + one incremental MERGE
+        # without competing for the single FalkorDB Cypher thread.
+        _write_conc_raw = os.getenv("FALKORDB_WRITE_CONCURRENCY", "2")
+        try:
+            _write_conc = max(1, min(32, int(_write_conc_raw)))
+        except ValueError:
+            _write_conc = 2
+            logger.warning(
+                "FALKORDB_WRITE_CONCURRENCY=%r not an int; default 2.",
+                _write_conc_raw,
+            )
+        self._write_semaphore = asyncio.Semaphore(_write_conc)
+        self._write_concurrency_cap: int = _write_conc
+
+        # Latency-quiesce: rolling window of last 50 write latencies (in
+        # seconds), computed as p95 lazily on each write attempt. When
+        # p95 climbs above ``_quiesce_trigger_s``, the provider enters
+        # a "busy" state — all subsequent writes raise ``ProviderBusy``
+        # for ``_quiesce_cooldown_s`` seconds. The worker treats this
+        # as park-and-resume (not retry/error). Distinct from the
+        # circuit breaker which trips on hard errors; quiesce is flow
+        # control on observed slowness.
+        from collections import deque
+        self._write_latency_window: deque[float] = deque(maxlen=50)
+        self._quiesce_until_monotonic: float = 0.0  # 0 = not quiesced
+
+        # Quiesce trigger: write p95 > ``_QUIESCE_MULTIPLE × WRITE_TIMEOUT_TARGET``.
+        # The target represents the "this is healthy" upper bound; the
+        # trigger is 3× that, on the theory that 3× slowdown means
+        # overload, not jitter.
+        _target_raw = os.getenv("FALKORDB_WRITE_TARGET_S", "2.0")
+        try:
+            _target = max(0.1, min(60.0, float(_target_raw)))
+        except ValueError:
+            _target = 2.0
+        self._quiesce_target_s: float = _target
+        self._quiesce_trigger_s: float = _target * 3.0
+
+        _cooldown_raw = os.getenv("FALKORDB_QUIESCE_COOLDOWN_S", "30")
+        try:
+            self._quiesce_cooldown_s: float = max(1.0, min(600.0, float(_cooldown_raw)))
+        except ValueError:
+            self._quiesce_cooldown_s = 30.0
+
     @property
     def _proj(self):
         """Transparent access to the projection graph.
@@ -411,9 +461,13 @@ class FalkorDBProvider(GraphDataProvider):
     # asyncio.wait_for() deadline. TimeoutError is a network-class
     # exception — the CircuitBreakerProxy counts it toward the failure
     # budget and opens the breaker after fail_max consecutive failures.
-    # See backend/app/config/resilience.py for full reference of all tunables.
-    _READ_TIMEOUT = float(os.getenv("FALKORDB_QUERY_TIMEOUT", "5"))
-    _WRITE_TIMEOUT = float(os.getenv("FALKORDB_WRITE_TIMEOUT", "15"))
+    # Sourced from app.config.resilience so a single env var
+    # (FALKORDB_QUERY_TIMEOUT / FALKORDB_WRITE_TIMEOUT) tunes every
+    # consumer rather than each module reading os.getenv directly.
+    from ..config import resilience as _resilience
+    _READ_TIMEOUT = _resilience.FALKORDB_QUERY_TIMEOUT_SECS
+    _WRITE_TIMEOUT = _resilience.FALKORDB_WRITE_TIMEOUT_SECS
+    del _resilience
 
     # FalkorDB engine cancels the query 500ms before the asyncio deadline so
     # the DB-side cancel races first (frees the worker thread + the pool
@@ -449,14 +503,102 @@ class FalkorDBProvider(GraphDataProvider):
                 timeout=t,
             )
 
-    async def _proj_query(self, cypher: str, params: dict = None, *, timeout: float = None):
-        """Timeout-guarded write query on the projection graph."""
-        t = timeout if timeout is not None else self._WRITE_TIMEOUT
-        async with self._query_semaphore:
-            return await asyncio.wait_for(
-                self._proj.query(cypher, params=params or {}, timeout=self._db_timeout_ms(t)),
-                timeout=t,
+    def _quiesce_p95(self) -> float:
+        """p95 of the rolling write-latency window (seconds). 0 if window empty."""
+        if not self._write_latency_window:
+            return 0.0
+        sorted_lat = sorted(self._write_latency_window)
+        idx = int(0.95 * (len(sorted_lat) - 1))
+        return sorted_lat[idx]
+
+    def _check_quiesce_gate(self) -> None:
+        """Raise ``ProviderBusy`` if quiesce is active. Phase 2.
+
+        Called at the entry of every write before doing any I/O. The
+        check is monotonic-time based so a clock change doesn't
+        accidentally unfreeze a quiesced provider.
+        """
+        if self._quiesce_until_monotonic <= 0.0:
+            return
+        now = time.monotonic()
+        remaining = self._quiesce_until_monotonic - now
+        if remaining <= 0:
+            # Cooldown elapsed — clear the gate. Latency window stays;
+            # if the underlying issue persists, it'll re-trip on the
+            # next slow write.
+            self._quiesce_until_monotonic = 0.0
+            self._write_latency_window.clear()
+            logger.info(
+                "FalkorDB %s: quiesce cooldown elapsed, accepting writes again.",
+                self._graph_name,
             )
+            return
+        from backend.common.adapters import ProviderBusy
+        raise ProviderBusy(
+            provider_name=self._graph_name,
+            reason=(
+                f"write p95 above {self._quiesce_trigger_s:.1f}s; "
+                f"quiesce cooldown {remaining:.0f}s remaining"
+            ),
+            retry_after_seconds=max(1, int(remaining) + 1),
+        )
+
+    def _record_write_latency(self, elapsed_s: float) -> None:
+        """Append a write-latency sample and trip quiesce if p95 crossed
+        the trigger threshold. Phase 2.
+        """
+        self._write_latency_window.append(elapsed_s)
+        # Only consider tripping once we have enough samples for p95 to
+        # be meaningful (avoid one-off slow first call from quiescing
+        # the provider). 10 samples is a reasonable floor.
+        if len(self._write_latency_window) < 10:
+            return
+        if self._quiesce_until_monotonic > 0.0:
+            return  # already quiesced
+        p95 = self._quiesce_p95()
+        if p95 > self._quiesce_trigger_s:
+            self._quiesce_until_monotonic = (
+                time.monotonic() + self._quiesce_cooldown_s
+            )
+            logger.warning(
+                "FalkorDB %s: write p95=%.2fs > trigger %.1fs; entering "
+                "quiesce for %.0fs. New writes will raise ProviderBusy "
+                "until cooldown elapses.",
+                self._graph_name, p95,
+                self._quiesce_trigger_s, self._quiesce_cooldown_s,
+            )
+
+    async def _proj_query(self, cypher: str, params: dict = None, *, timeout: float = None):
+        """Timeout-guarded write query on the projection graph.
+
+        Phase 2: also gated by ``_write_semaphore`` (per-graph hard cap
+        on concurrent writes) and the latency-quiesce circuit. Records
+        observed latency for the p95 trip decision.
+        """
+        # Quiesce gate — raises ``ProviderBusy`` if the provider is
+        # currently in cooldown after a sustained p95 spike. Worker
+        # treats this as park-and-resume (not retry).
+        self._check_quiesce_gate()
+
+        t = timeout if timeout is not None else self._WRITE_TIMEOUT
+        async with self._write_semaphore:
+            async with self._query_semaphore:
+                t_start = time.monotonic()
+                try:
+                    result = await asyncio.wait_for(
+                        self._proj.query(
+                            cypher, params=params or {},
+                            timeout=self._db_timeout_ms(t),
+                        ),
+                        timeout=t,
+                    )
+                finally:
+                    # Record latency regardless of success/failure so
+                    # quiesce trips even when slow writes are also
+                    # erroring out (the symptom we'd want to back off
+                    # from).
+                    self._record_write_latency(time.monotonic() - t_start)
+                return result
 
     async def _seed_from_file(self):
         """Load graph from seed JSON file if graph is empty."""
@@ -1201,7 +1343,8 @@ class FalkorDBProvider(GraphDataProvider):
                 f"RETURN c, count(gc) as childCount"
             )
 
-        result = await self._ro_query(cypher, params=params)
+        from ..config.resilience import FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS
+        result = await self._ro_query(cypher, params=params, timeout=FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS)
         nodes = []
         for row in (result.result_set or []):
             # Extract node and childCount
@@ -1288,7 +1431,8 @@ class FalkorDBProvider(GraphDataProvider):
                 f"RETURN c, count(gc) as childCount, p.urn as parentUrn, type(r) as relType, properties(r) as rprops"
             )
 
-        result = await self._ro_query(cypher, params=params)
+        from ..config.resilience import FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS
+        result = await self._ro_query(cypher, params=params, timeout=FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS)
 
         children: List[GraphNode] = []
         containment_edges: List[GraphEdge] = []
@@ -1334,7 +1478,7 @@ class FalkorDBProvider(GraphDataProvider):
                 f"RETURN a.urn, b.urn, type(lr), properties(lr)"
             )
 
-            lr_result = await self._ro_query(lineage_cypher, params=lineage_params)
+            lr_result = await self._ro_query(lineage_cypher, params=lineage_params, timeout=FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS)
             for row in (lr_result.result_set or []):
                 lineage_edges_list.append(_edge_from_row(row[0], row[1], row[2], row[3] or {}))
 
@@ -2955,7 +3099,42 @@ class FalkorDBProvider(GraphDataProvider):
             self._graph_name, total,
         )
 
+        # Initialize scan-position state up front so the phase-emit
+        # helper (defined below) sees consistent values from its first
+        # call onward. These get mutated in the Phase B scan loop;
+        # closures capture by reference so phase emits after the scan
+        # see the final state.
+        processed = 0
+        current_cursor: Optional[str] = None
+        pair_data: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
+        level_digest = getattr(self, "_level_digest", None)
+
+        # Phase 1.7 — phase-emit helper. Calls the worker's
+        # progress_callback with the current scan-state values plus the
+        # phase ID. The worker's checkpoint() updates progress fields
+        # AND conditionally updates job.current_phase when ``phase`` is
+        # non-None. We always pass aggregated=0 here so a phase
+        # boundary signal can't accidentally regress job.created_edges
+        # — the worker only updates created_edges when aggregated > 0,
+        # so 0 is a safe "leave it alone" sentinel. Best-effort: a
+        # callback failure here must never abort the run.
+        async def _emit_phase(phase_id: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                await progress_callback(
+                    processed, total, current_cursor, 0, phase_id,
+                )
+            except Exception as cb_exc:
+                logger.warning(
+                    "Phase-emit callback failed for phase=%s on %s "
+                    "(continuing): %s",
+                    phase_id, self._graph_name, cb_exc,
+                )
+
         # ===== PHASE A: Wipe + purge idempotency =====
+        await _emit_phase("wiping")
         t_phase_a_start = time.monotonic()
         deleted = await self._wipe_aggregated_edges(should_cancel=should_cancel)
         await self._purge_aggregated_idempotency_namespace()
@@ -2966,12 +3145,7 @@ class FalkorDBProvider(GraphDataProvider):
         )
 
         # ===== PHASE B: Stream lineage, accumulate pair_data =====
-        pair_data: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        entity_levels: Dict[str, int] = getattr(self, "_entity_type_levels", None) or {}
-        level_digest = getattr(self, "_level_digest", None)
-
-        processed = 0
-        current_cursor: Optional[str] = None
+        await _emit_phase("scanning")
         batch_num = 0
         t_phase_b_start = time.monotonic()
 
@@ -3064,16 +3238,12 @@ class FalkorDBProvider(GraphDataProvider):
                 try:
                     # During Phase B no edges have been written to
                     # FalkorDB yet — they're accumulating in worker
-                    # memory. Reporting ``len(pair_data)`` here is
-                    # misleading: the UI's "Materialized" counter
-                    # shows hundreds of thousands while a check
-                    # against FalkorDB returns zero. Pass 0 so
-                    # "Materialized" stays at 0 until Phase D actually
-                    # starts writing edges; the per-batch callback in
-                    # ``_bulk_create_aggregated_edges_from_pairs``
-                    # then bumps it up in real time as CREATEs land.
+                    # memory. Pass 0 for aggregated so "Materialized"
+                    # stays at 0 until Phase D actually starts writing.
+                    # Phase 1.7 — also pass phase="scanning" so the UI
+                    # status label reflects what's actually happening.
                     await progress_callback(
-                        processed, total, current_cursor, 0,
+                        processed, total, current_cursor, 0, "scanning",
                     )
                 except Exception as cb_exc:
                     logger.error(
@@ -3109,6 +3279,7 @@ class FalkorDBProvider(GraphDataProvider):
         # scans. URNs still unresolved after warmup are label-less /
         # missing and their pairs get dropped at the CREATE step
         # (Phase 1.8 drop-and-warn) rather than scanning forever.
+        await _emit_phase("resolving_labels")
         t_phase_c_start = time.monotonic()
         await self._warmup_urn_label_cache_for_aggregation()
 
@@ -3164,8 +3335,11 @@ class FalkorDBProvider(GraphDataProvider):
                     )
             if progress_callback is not None:
                 try:
+                    # Phase 1.7 — emit phase="creating" so the UI shows
+                    # "Creating aggregated edges in graph" while CREATEs
+                    # are actively landing in FalkorDB.
                     await progress_callback(
-                        total, total, current_cursor, running_created,
+                        total, total, current_cursor, running_created, "creating",
                     )
                 except Exception as cb_exc:
                     logger.error(
@@ -3173,6 +3347,11 @@ class FalkorDBProvider(GraphDataProvider):
                         cb_exc, exc_info=True,
                     )
 
+        # Boundary emit at the very start of Phase D — even before the
+        # first batch lands, the UI label flips to "Creating aggregated
+        # edges in graph" so operators can correlate the "started writing"
+        # signal with the FalkorDB count starting to climb.
+        await _emit_phase("creating")
         t_phase_d_start = time.monotonic()
         created = await self._bulk_create_aggregated_edges_from_pairs(
             pair_data=pair_data,
@@ -3191,6 +3370,7 @@ class FalkorDBProvider(GraphDataProvider):
         )
 
         # ===== PHASE E: Rebuild Redis idempotency state =====
+        await _emit_phase("finalizing")
         t_phase_e_start = time.monotonic()
         await self._rebuild_idempotency_state_from_pairs(
             pair_data, should_cancel=should_cancel,
@@ -3202,11 +3382,15 @@ class FalkorDBProvider(GraphDataProvider):
         )
 
         # Final progress flush so the UI's created_edges counter lands
-        # at the true CREATE count, not the in-scan pair-accumulation
-        # estimate.
+        # at the true CREATE count. We keep ``phase="finalizing"`` —
+        # the worker transitions the row to status=completed in its
+        # outer ``finally`` block, which is what flips the UI off
+        # the phase label naturally.
         if progress_callback is not None:
             try:
-                await progress_callback(processed, total, current_cursor, created)
+                await progress_callback(
+                    processed, total, current_cursor, created, "finalizing",
+                )
             except Exception:
                 pass
 
@@ -5309,18 +5493,36 @@ class FalkorDBProvider(GraphDataProvider):
             # Variable-length bound = max ontology depth (floor 10) so
             # very deep ontologies aren't truncated and shallow ones
             # don't pay for unused depth.
+            #
+            # NB: anchor-itself + descendants are split into two UNION
+            # branches per side because FalkorDB's planner intermittently
+            # rejects `[c*0..N]` with "expected List or Null but was Edge"
+            # — using `[c*1..N]` (minimum one hop) avoids the zero-length
+            # edge case. The anchor itself is matched directly without
+            # any traversal. This is the same fix shape used elsewhere
+            # in this module (e.g. _find_ancestor_with_lineage at L5142).
             max_depth = max(len(getattr(self, "_entity_type_levels", {}) or {}), 10)
-            # NB: path-uniqueness predicate removed — legacy form, bounded by
-            # max_depth. See note in _resolve_anchor_at_level.
             cypher = (
-                f"MATCH (a {{urn: $source}})-[c*0..{max_depth}]->(child) "
+                # Source — anchor itself
+                "MATCH (a {urn: $source}) "
+                "WHERE labels(a)[0] IN $types "
+                "RETURN 's' AS side, [a.urn] AS urns "
+                "UNION "
+                # Source — descendants via 1..N containment hops
+                f"MATCH (a {{urn: $source}})-[c*1..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
                 "LIMIT $limit "
                 "RETURN 's' AS side, collect(urn) AS urns "
                 "UNION "
-                f"MATCH (b {{urn: $target}})-[c*0..{max_depth}]->(child) "
+                # Target — anchor itself
+                "MATCH (b {urn: $target}) "
+                "WHERE labels(b)[0] IN $types "
+                "RETURN 't' AS side, [b.urn] AS urns "
+                "UNION "
+                # Target — descendants via 1..N containment hops
+                f"MATCH (b {{urn: $target}})-[c*1..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
@@ -5340,8 +5542,10 @@ class FalkorDBProvider(GraphDataProvider):
             )
             raise
 
-        s_urns: List[str] = []
-        t_urns: List[str] = []
+        # Accumulate per side — the UNION returns 2 rows per side (anchor +
+        # descendants) so overwriting would lose half the URNs.
+        s_set: Set[str] = set()
+        t_set: Set[str] = set()
         for row in (result.result_set or []):
             if not row or len(row) < 2:
                 continue
@@ -5349,10 +5553,10 @@ class FalkorDBProvider(GraphDataProvider):
             urns = row[1] if isinstance(row[1], list) else []
             urn_list = [u for u in urns if u]
             if side == 's':
-                s_urns = urn_list
+                s_set.update(urn_list)
             elif side == 't':
-                t_urns = urn_list
-        return s_urns, t_urns
+                t_set.update(urn_list)
+        return list(s_set), list(t_set)
 
     async def _edges_between_sets(
         self, s_urns: List[str], t_urns: List[str], level: int,

@@ -1,6 +1,7 @@
 import { unwrapEnvelope } from '@/services/cacheEnvelope'
 import { getCircuitBreaker, type CircuitBreaker } from '@/services/circuitBreaker'
 import { fetchWithTimeout } from '@/services/fetchWithTimeout'
+import { TIMEOUTS } from '@/config/timeouts'
 
 import type {
     GraphDataProvider,
@@ -16,6 +17,7 @@ import type {
     TraceV2Request,
     TraceV2Result,
     ExpandAggregatedRequest,
+    ExpandAggregatedBatchRequest,
     LayerAssignmentRequest,
     LayerAssignmentResult,
     GraphSchemaStats,
@@ -95,10 +97,13 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // URL builder — workspace path or legacy query param
     // ==========================================
 
-    private buildUrl(path: string, extraParams?: Record<string, string>): string {
-        // Workspace-scoped: /api/v1/{ws_id}/graph/...
+    private buildUrl(path: string, extraParams?: Record<string, string>, apiVersion: 'v1' | 'v2' = 'v1'): string {
+        // Workspace-scoped: /api/v{1,2}/{ws_id}/graph/...
+        // v2 is used for trace endpoints (skeleton-first with meta) — legacy
+        // v1 trace routes still exist but are deprecated. Non-trace calls
+        // stay on v1.
         const base = this.workspaceId
-            ? `/api/v1/${this.workspaceId}/graph`
+            ? `/api/${apiVersion}/${this.workspaceId}/graph`
             : API_BASE
 
         const url = new URL(`${base}${path}`, window.location.origin)
@@ -123,10 +128,10 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // Internal Fetch Helper
     // ==========================================
 
-    private async fetch<T>(path: string, options?: RequestInit & { extraParams?: Record<string, string>, timeoutMs?: number }): Promise<T> {
-        const { extraParams, timeoutMs, ...fetchOptions } = options ?? {}
+    private async fetch<T>(path: string, options?: RequestInit & { extraParams?: Record<string, string>, timeoutMs?: number, apiVersion?: 'v1' | 'v2' }): Promise<T> {
+        const { extraParams, timeoutMs, apiVersion, ...fetchOptions } = options ?? {}
         const method = (fetchOptions.method ?? 'GET').toUpperCase()
-        const url = this.buildUrl(path, extraParams)
+        const url = this.buildUrl(path, extraParams, apiVersion)
         const cacheKey = `${method}:${url}:${fetchOptions.body ?? ''}`
 
         // Check short-lived response cache for GET requests
@@ -253,6 +258,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
         return await this.fetch<GraphEdge[]>('/edges/between', {
             method: 'POST',
             body: JSON.stringify({ urns, edgeTypes, limit }),
+            timeoutMs: TIMEOUTS.EDGES_BETWEEN_MS,
         })
     }
 
@@ -283,7 +289,9 @@ export class RemoteGraphProvider implements GraphDataProvider {
             options.edgeTypes.forEach(t => params.append('edgeTypes', t))
         }
 
-        return await this.fetch<GraphNode[]>(`/nodes/${encodeURIComponent(parentUrn)}/children?${params.toString()}`)
+        return await this.fetch<GraphNode[]>(`/nodes/${encodeURIComponent(parentUrn)}/children?${params.toString()}`, {
+            timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
+        })
     }
 
     async getChildrenWithEdges(
@@ -321,7 +329,9 @@ export class RemoteGraphProvider implements GraphDataProvider {
             options.lineageEdgeTypes.forEach(t => params.append('lineageEdgeTypes', t))
         }
 
-        return await this.fetch(`/nodes/${encodeURIComponent(parentUrn)}/children-with-edges?${params.toString()}`)
+        return await this.fetch(`/nodes/${encodeURIComponent(parentUrn)}/children-with-edges?${params.toString()}`, {
+            timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
+        })
     }
 
     async getParent(childUrn: URN): Promise<GraphNode | null> {
@@ -449,9 +459,14 @@ export class RemoteGraphProvider implements GraphDataProvider {
      * malformed — clients render partial results without retrying.
      */
     async traceAtLevel(request: TraceV2Request): Promise<TraceV2Result> {
+        // v1 router exposes both /trace/v2 (skeleton-first) and /trace/expand[-batch].
+        // The standalone v2 router exists in the codebase but is not mounted
+        // in main.py today (its include_router line is gated by a never-set
+        // feature flag), so we stay on v1 paths.
         const raw = await this.fetch<RawTraceV2Result>('/trace/v2', {
             method: 'POST',
             body: JSON.stringify(request),
+            timeoutMs: TIMEOUTS.TRACE_MS,
         })
         return normalizeTraceV2(raw)
     }
@@ -460,6 +475,16 @@ export class RemoteGraphProvider implements GraphDataProvider {
         const raw = await this.fetch<RawTraceV2Result>('/trace/expand', {
             method: 'POST',
             body: JSON.stringify(request),
+            timeoutMs: TIMEOUTS.TRACE_MS,
+        })
+        return normalizeTraceV2(raw)
+    }
+
+    async expandAggregatedBatch(request: ExpandAggregatedBatchRequest): Promise<TraceV2Result> {
+        const raw = await this.fetch<RawTraceV2Result>('/trace/expand-batch', {
+            method: 'POST',
+            body: JSON.stringify(request),
+            timeoutMs: TIMEOUTS.TRACE_MS,
         })
         return normalizeTraceV2(raw)
     }
@@ -568,13 +593,13 @@ export class RemoteGraphProvider implements GraphDataProvider {
     // ==========================================
 
     async getAggregatedEdges(request: AggregatedEdgeRequest): Promise<AggregatedEdgeResult> {
-        // Aligns with backend HTTP_TIMEOUT_AGGREGATION_SECS (45s) for the
-        // aggregated-edges route — the 8s default is sized for cache-hit
-        // graph endpoints and aborts legitimately-slow Cypher reads.
+        // Aligns with backend HTTP_TIMEOUT_AGGREGATION_SECS for the
+        // aggregated-edges route — value sourced from the central
+        // src/config/timeouts.ts so FE and BE stay in lockstep.
         return await this.fetch<AggregatedEdgeResult>('/edges/aggregated', {
             method: 'POST',
             body: JSON.stringify(request),
-            timeoutMs: 45_000,
+            timeoutMs: TIMEOUTS.AGGREGATED_EDGES_MS,
         })
     }
 

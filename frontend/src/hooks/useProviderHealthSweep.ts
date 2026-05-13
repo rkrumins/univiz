@@ -29,6 +29,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { providerService, type ProviderResponse } from '@/services/providerService'
 import { getCircuitBreaker } from '@/services/circuitBreaker'
+import { TIMEOUTS } from '@/config/timeouts'
 
 export type HealthStatus = 'checking' | 'healthy' | 'unhealthy' | 'unknown'
 
@@ -44,7 +45,7 @@ export interface UseProviderHealthSweepOptions {
 }
 
 const DEFAULT_CONCURRENCY = 3
-const DEFAULT_PER_CALL_TIMEOUT_MS = 8_000
+const DEFAULT_PER_CALL_TIMEOUT_MS = TIMEOUTS.PROVIDER_HEALTH_MS
 
 export function useProviderHealthSweep(
     providers: ProviderResponse[],

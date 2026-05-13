@@ -627,13 +627,15 @@ export function GraphCanvas({ className }: { className?: string }) {
   //   → Shows data dependencies, highlights on hover/click
   //
   // When lineage flow is off, hide lineage but still show containment structure.
+  // Flow is the master switch — Trace mode respects it so the canvas can be
+  // dialed back to "trace highlights on nodes only" when desired.
   const displayEdges = useMemo(() => {
     return allVisibleEdges
       .filter(edge => {
         // Always show containment edges when parent is expanded
         if (edge._isContainment) return true
-        // Show lineage edges when flow toggle is on or tracing
-        return showLineageFlow || trace.isTracing
+        // Lineage edges follow the Flow toggle, regardless of trace state
+        return showLineageFlow
       })
       .map(edge => {
         if (edge._isContainment) {
@@ -682,6 +684,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         }
       })
   }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges])
+  // (trace.isTracing/trace.result kept in deps because the map step inside reads them for isTraced flagging)
 
   // 16. Display nodes with visual state — only VISIBLE nodes (expand/collapse aware)
   const displayNodes = useMemo(() => {

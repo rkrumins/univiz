@@ -25,6 +25,10 @@ BREAKER_RESET_TIMEOUT_SECS: int = int(os.getenv("PROVIDER_BREAKER_RESET_TIMEOUT_
 # ── FalkorDB-specific query timeouts ────────────────────────────────
 # Read-only Cypher queries (MATCH ... RETURN).
 FALKORDB_QUERY_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_QUERY_TIMEOUT", "5"))
+# get_children / get_children_with_edges per-query timeout. Larger than
+# the generic 5s read default because wide containers with many lineage
+# cross-edges legitimately exceed it; aligns with HTTP_TIMEOUT_GRAPH_SECS.
+FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_CHILDREN_QUERY_TIMEOUT", "15"))
 # Aggregated-edge projection reads can scan large URN sets; the generic
 # 5s read timeout kills these on graphs with hundreds of containers.
 FALKORDB_AGGREGATED_READ_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_AGGREGATED_READ_TIMEOUT_SECS", "30"))
@@ -49,6 +53,10 @@ FALKORDB_INIT_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_INIT_TIMEOUT", "3"
 HTTP_TIMEOUT_HEALTH_SECS: float = float(os.getenv("HTTP_TIMEOUT_HEALTH_SECS", "5"))
 # Read-only graph queries — bounded by per-query timeouts below.
 HTTP_TIMEOUT_GRAPH_SECS: float = float(os.getenv("HTTP_TIMEOUT_GRAPH_SECS", "15"))
+# Trace routes (/trace/v2, /trace/expand on v1; /trace, /trace/expand on
+# v2). Deep BFS traversals legitimately exceed the 15s graph budget;
+# matches the frontend TRACE_MS default so neither side aborts first.
+HTTP_TIMEOUT_TRACE_SECS: float = float(os.getenv("HTTP_TIMEOUT_TRACE_SECS", "60"))
 # Write-heavy aggregation operations.
 HTTP_TIMEOUT_AGGREGATION_SECS: float = float(os.getenv("HTTP_TIMEOUT_AGGREGATION_SECS", "45"))
 # Default for all other endpoints.
@@ -67,6 +75,14 @@ NEO4J_REDIS_OP_TIMEOUT_SECS: float = float(os.getenv("NEO4J_REDIS_OP_TIMEOUT", "
 # This cleanly separates graph queries (FalkorDB) from caching/state
 # (dedicated Redis). Unset = falls back to FalkorDB instance (dev compat).
 # CACHE_REDIS_URL: str (e.g. "redis://cache-redis:6379/0")
+
+# ── Trace outer budget ──────────────────────────────────────────────
+# Outermost deadline for a single ContextEngine.trace_* call. Per-hop
+# budgets inside the FalkorDB provider derive from the remaining
+# share of this number, so bumping it gives genuinely deeper traces
+# more headroom. Was previously read directly as TRACE_TIMEOUT_MS in
+# context_engine.py — moved here for central visibility.
+TRACE_TIMEOUT_SECS: float = float(os.getenv("TRACE_TIMEOUT_SECS", "60"))
 
 # ── Ontology introspection ──────────────────────────────────────────
 # Outer timeout for the aggregate get_ontology_metadata() call (which

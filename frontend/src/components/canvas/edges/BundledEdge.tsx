@@ -144,7 +144,10 @@ export const BundledEdge = memo(function BundledEdge({
                                 : undefined,
                     transition: 'stroke-width 0.2s cubic-bezier(0.4, 0, 0.2, 1), filter 0.2s',
                 }}
-                className={cn("transition-all duration-300", (selected || isHovered) ? "z-50" : "z-0")}
+                // Edges stay structurally behind nodes (z-0). Emphasis on
+                // selected / hovered is conveyed by stroke width + filter
+                // glow, never by z-elevating the edge above node bodies.
+                className="transition-all duration-300 z-0"
             />
 
             {/* Animated Flow Overlay — only on interaction */}

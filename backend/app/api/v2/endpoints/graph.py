@@ -18,6 +18,7 @@ through ontology levels one at a time.
 This file is the v2 router. The v1 router at backend/app/api/v1/endpoints/graph.py
 keeps the legacy /trace shape during the deprecation window (90 days minimum).
 """
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -32,7 +33,9 @@ from backend.common.models.graph import (
     TraceRequest,
     TraceResultV2,
     TraceExpandRequest,
+    TraceExpandBatchRequest,
     TraceDelta,
+    TraceMeta,
 )
 
 router = APIRouter()
@@ -181,3 +184,118 @@ async def post_trace_expand(
             trace_session_id=body.trace_session_id,
         )
     return delta
+
+
+@router.post(
+    "/trace/expand-batch",
+    response_model=TraceDelta,
+    response_model_by_alias=True,
+)
+async def post_trace_expand_batch(
+    request: Request,
+    body: TraceExpandBatchRequest = Body(
+        ...,
+        description="Batch drill-down. Replaces N concurrent POSTs to /trace/expand with one request; the server fans out and merges results by id.",
+    ),
+    engine: ContextEngine = Depends(get_context_engine),
+):
+    """Batched drill-down delta.
+
+    Accepts a list of (sourceUrn, targetUrn, nextLevel) triples that share
+    the same expand configuration (lineageEdgeTypes, includeContainmentEdges).
+    The server fans out via asyncio.gather, then merges results into one
+    deduplicated TraceDelta. The frontend uses this on `autoDrillOnExpand`
+    when a traced hub node has many incident AGGREGATED edges — previously
+    that produced 20+ HTTP requests, now it produces one.
+
+    Failure semantics: partial success is allowed. Pair-level KeyError /
+    ValueError failures are swallowed so the rest of the batch still
+    returns; the response carries the successful subset. Total failure
+    (all pairs error) returns the first error envelope."""
+    if not body.pairs:
+        return TraceDelta(nodes=[], edges=[], focus={"urn": "", "displayName": ""}, effective_level=0, meta=TraceMeta(regime="expand"))
+
+    async def run_one(pair):
+        # Reconstruct a per-pair TraceExpandRequest so the engine entry
+        # point stays unchanged. The batch endpoint is a transport-level
+        # optimization, not a new engine semantic.
+        req = TraceExpandRequest(
+            source_urn=pair.source_urn,
+            target_urn=pair.target_urn,
+            next_level=pair.next_level,
+            lineage_edge_types=body.lineage_edge_types,
+            include_containment_edges=body.include_containment_edges,
+            trace_session_id=body.trace_session_id,
+        )
+        try:
+            return await engine.get_trace_delta_v2(req)
+        except (KeyError, ValueError):
+            return None
+
+    results = await asyncio.gather(*(run_one(p) for p in body.pairs))
+    successes = [r for r in results if r is not None]
+    if not successes:
+        return _trace_error(
+            code="trace_expand_batch_all_failed",
+            message="No pair in the batch could be expanded.",
+            status_code=404,
+            trace_session_id=body.trace_session_id,
+        )
+
+    # Merge by id. Last write wins for duplicates — acceptable because the
+    # backend returns deterministic results for the same (s, t, lvl) triple.
+    nodes_by_id = {}
+    edges_by_id = {}
+    containment_by_id = {}
+    upstream_urns = set()
+    downstream_urns = set()
+    cypher_ms_total = 0
+    node_count_total = 0
+    edge_count_total = 0
+    truncated_any = False
+    truncation_reasons = set()
+    focus = None
+    effective_level = 0
+
+    for delta in successes:
+        for n in delta.nodes:
+            nodes_by_id[n.urn] = n
+        for e in delta.edges:
+            edges_by_id[e.id] = e
+        for ce in delta.containment_edges:
+            containment_by_id[ce.id] = ce
+        upstream_urns.update(delta.upstream_urns)
+        downstream_urns.update(delta.downstream_urns)
+        if delta.truncated:
+            truncated_any = True
+            if delta.truncation_reason:
+                truncation_reasons.add(delta.truncation_reason)
+        if focus is None:
+            focus = delta.focus
+            effective_level = delta.effective_level
+        cypher_ms_total += delta.meta.cypher_ms
+        node_count_total += delta.meta.node_count
+        edge_count_total += delta.meta.edge_count
+
+    merged_meta = TraceMeta(
+        regime="expand",
+        effective_level=effective_level,
+        cypher_ms=cypher_ms_total,
+        node_count=node_count_total,
+        edge_count=edge_count_total,
+        truncation_reason=";".join(sorted(truncation_reasons)) if truncation_reasons else None,
+        trace_session_id=body.trace_session_id,
+    )
+
+    return TraceDelta(
+        nodes=list(nodes_by_id.values()),
+        edges=list(edges_by_id.values()),
+        containment_edges=list(containment_by_id.values()),
+        upstream_urns=upstream_urns,
+        downstream_urns=downstream_urns,
+        focus=focus,
+        effective_level=effective_level,
+        truncated=truncated_any,
+        truncation_reason=";".join(sorted(truncation_reasons)) if truncation_reasons else None,
+        meta=merged_meta,
+    )

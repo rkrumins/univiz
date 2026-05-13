@@ -564,6 +564,12 @@ class AggregationService:
             last_cursor=job.last_cursor,
             max_retries=job.max_retries,
             timeout_secs=job.timeout_secs,
+            # Phase 1.7 — UI phase visibility. May be NULL on legacy
+            # rows (column didn't exist) and on paths that don't emit
+            # phase signals; getattr with default keeps this backward-
+            # compatible against any ORM instance that pre-dates the
+            # column.
+            current_phase=getattr(job, "current_phase", None),
         )
 
     # ── Resume ────────────────────────────────────────────────────────

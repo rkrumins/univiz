@@ -101,6 +101,18 @@ interface CanvasState {
   removeEdge: (id: string) => void
   removeNodes: (ids: string[]) => void
   removeEdges: (ids: string[]) => void
+  /**
+   * Remove every edge whose source OR target is in the supplied set of
+   * node ids. Used on subtree collapse to drop edges that only existed
+   * because that subtree was expanded — without this, edges accumulate
+   * monotonically across expand/collapse cycles.
+   *
+   * Note: this removes edges between the collapsed subtree and *visible*
+   * peers too. That matches the intent — those edges represented the
+   * subtree's relationships at its expanded granularity. Re-expanding
+   * refetches them via loadChildren/drill paths.
+   */
+  removeEdgesByNodeIds: (nodeIds: Iterable<string>) => void
 }
 
 import { persist, createJSONStorage } from 'zustand/middleware'
@@ -321,6 +333,21 @@ export const useCanvasStore = create<CanvasState>()(
           edges: state.edges.filter((e) => !idSet.has(e.id)),
           _edgeIndex: nextEdgeIndex,
         }
+      }),
+      removeEdgesByNodeIds: (nodeIds) => set((state) => {
+        const nodeIdSet = nodeIds instanceof Set ? nodeIds : new Set(nodeIds)
+        if (nodeIdSet.size === 0) return state
+        const nextEdgeIndex = new Set(state._edgeIndex)
+        const remainingEdges: LineageEdge[] = []
+        for (const e of state.edges) {
+          if (nodeIdSet.has(e.source) || nodeIdSet.has(e.target)) {
+            nextEdgeIndex.delete(e.id)
+          } else {
+            remainingEdges.push(e)
+          }
+        }
+        if (remainingEdges.length === state.edges.length) return state
+        return { edges: remainingEdges, _edgeIndex: nextEdgeIndex }
       }),
     })),
     {
