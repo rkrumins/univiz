@@ -187,6 +187,34 @@ class TraceExpandRequest(ExpandRequest):
     trace_session_id: Optional[str] = Field(None, alias="traceSessionId")
 
 
+class TraceExpandPair(BaseModel):
+    """One aggregated-edge identifier inside a batch expand request.
+
+    The full per-edge expand contract (lineage_edge_types, include_containment_edges)
+    is hoisted onto the batch request so every pair shares the same flags —
+    this matches how the frontend issues these calls in practice (one trace
+    session uses one configuration)."""
+    source_urn: str = Field(alias="sourceUrn")
+    target_urn: str = Field(alias="targetUrn")
+    next_level: Union[str, int] = Field(alias="nextLevel")
+
+    class Config:
+        populate_by_name = True
+
+
+class TraceExpandBatchRequest(BaseModel):
+    """Batched drill-down. Replaces N concurrent POSTs to /trace/expand with
+    one request. The server fans out concurrently and merges results by id
+    so the response is a deduplicated TraceDelta."""
+    pairs: List[TraceExpandPair]
+    lineage_edge_types: Optional[List[str]] = Field(None, alias="lineageEdgeTypes")
+    include_containment_edges: bool = Field(True, alias="includeContainmentEdges")
+    trace_session_id: Optional[str] = Field(None, alias="traceSessionId")
+
+    class Config:
+        populate_by_name = True
+
+
 class MegaNodeInfo(BaseModel):
     """A node whose AGGREGATED out-degree exceeded TRACE_DEGREE_CAP.
 

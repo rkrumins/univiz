@@ -164,7 +164,11 @@
     }
   }
   .nx-edge-trace {
-    filter: drop-shadow(0 0 6px rgba(99, 102, 241, 0.7));
+    /* Tighter glow — original `0 0 6px ... 0.7` extended visibly past the
+       stroke and read as overlapping the node bodies during trace. The
+       reduced blur radius + opacity keeps the premium "trace glow" feel
+       without pushing the edge stack visually above nodes. */
+    filter: drop-shadow(0 0 2.5px rgba(99, 102, 241, 0.45));
   }
   @media (prefers-reduced-motion: reduce) {
     [data-trace-active="true"] [data-trace-focus="true"] {

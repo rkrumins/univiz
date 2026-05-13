@@ -1103,14 +1103,12 @@ export function ContextViewCanvas({
   // (which reads `trace.drilldowns`) reveals them in the canvas — recursively
   // at any depth.
   //
-  // Idempotent: `trace.expandAggregatedEdge` caches results by
-  // `${s}->${t}@${nextLevel}`, so re-expanding a previously-drilled node
-  // is a no-op against the network.
-  //
-  // Concurrency cap (AUTO_DRILL_CONCURRENCY): a hub node may have dozens of
-  // incident AGGREGATED edges. Firing them all in parallel hammers the
-  // backend; serializing all of them makes the wait visible. 6 keeps the
-  // network busy without overwhelming the trace endpoint.
+  // Single batched call: previously this fired one /trace/expand request per
+  // incident aggregated edge (concurrency-6 worker pool). A hub node with
+  // 30 edges produced 30 HTTP requests. Now we collect every pair into one
+  // /trace/expand-batch call; the server fans out internally and returns a
+  // single merged result. The drilldowns cache still keys per (s, t, lvl)
+  // so re-expanding a previously-drilled node remains a no-op.
   const autoDrillOnExpand = useCallback(async (nodeId: string) => {
     if (!trace.isTracing) return
     const node = nodes.find(n => n.id === nodeId)
@@ -1131,19 +1129,15 @@ export function ContextViewCanvas({
     })
     if (incidentEdges.length === 0) return
 
-    const AUTO_DRILL_CONCURRENCY = 6
-    let cursor = 0
-    const drillOne = async () => {
-      while (cursor < incidentEdges.length) {
-        const edge = incidentEdges[cursor++]
-        const s = (edge as any).source ?? (edge as any).sourceUrn
-        const t = (edge as any).target ?? (edge as any).targetUrn
-        const r = await trace.expandAggregatedEdge(s, t, currentLevel)
-        if (r) mergeDrilldownIntoCanvas(r)
-      }
-    }
-    const workerCount = Math.min(AUTO_DRILL_CONCURRENCY, incidentEdges.length)
-    await Promise.all(Array.from({ length: workerCount }, drillOne))
+    const pairs = incidentEdges.map(edge => ({
+      sourceUrn: (edge as any).source ?? (edge as any).sourceUrn,
+      targetUrn: (edge as any).target ?? (edge as any).targetUrn,
+      currentLevel,
+    })).filter(p => p.sourceUrn && p.targetUrn)
+    if (pairs.length === 0) return
+
+    const merged = await trace.expandAggregatedEdgesBatch(pairs)
+    if (merged) mergeDrilldownIntoCanvas(merged)
   }, [trace, nodes, edges, entityTypeLevels, mergeDrilldownIntoCanvas])
 
   const toggleNode = useCallback(async (nodeId: string) => {
@@ -1437,6 +1431,7 @@ export function ContextViewCanvas({
         >
           <EdgeLegend defaultExpanded={false} visibleEdges={visibleLineageEdges} />
         </div>
+
 
         {/* Layer Columns. */}
         <div

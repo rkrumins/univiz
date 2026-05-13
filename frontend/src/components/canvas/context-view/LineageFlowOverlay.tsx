@@ -185,10 +185,10 @@ export function LineageFlowOverlay({
           const sRect = sourceEl.getBoundingClientRect()
           const tRect = targetEl.getBoundingClientRect()
 
-          const sx = sRect.right - containerRect.left + 6
-          const sy = sRect.top + sRect.height / 2 - containerRect.top
+          let sx = sRect.right - containerRect.left + 6
+          let sy = sRect.top + sRect.height / 2 - containerRect.top
           let tx = tRect.left - containerRect.left - 8
-          const ty = tRect.top + tRect.height / 2 - containerRect.top
+          let ty = tRect.top + tRect.height / 2 - containerRect.top
 
           const minY = Math.min(sy, ty)
           const maxY = Math.max(sy, ty)
@@ -197,11 +197,45 @@ export function LineageFlowOverlay({
           const isSameColumn = Math.abs(sRect.left - tRect.left) < 50
           const isSelf = edge.source === edge.target
           const index = edge.groupIndex || 0
+          // Sibling case: same row band, different columns. The default
+          // Bézier would cut through whatever node sits between the
+          // endpoints. Route through a dedicated lane above (downstream)
+          // or below (upstream) the row band instead.
+          const ROW_OVERLAP_PX = Math.min(sRect.height, tRect.height) * 0.5
+          const isSibling = !isSelf
+            && !isSameColumn
+            && Math.abs(sRect.top - tRect.top) < ROW_OVERLAP_PX
 
+          // Same-column branch — route through the LEFT gutter (instead of
+          // the right-margin fan that visually collides with cross-layer
+          // outgoing edges in the column gap). Every edge stays visible —
+          // lineage tools must show every connection by default; rolling
+          // up intra-column edges into a chip hides what the user came to see.
           if (isSameColumn && !isSelf) {
-            tx = tRect.right - containerRect.left
-            const curveDist = 30 + (index * 8)
+            sx = sRect.left - containerRect.left - 6
+            tx = tRect.left - containerRect.left - 6
+            const curveDist = -(24 + index * 8)  // negative = leftward
             pathD = `M ${sx} ${sy} C ${sx + curveDist} ${sy}, ${tx + curveDist} ${ty}, ${tx} ${ty}`
+          } else if (isSibling) {
+            // Direction: left-to-right (downstream) → route ABOVE the row band.
+            // Right-to-left (upstream) → route BELOW. Separating directions
+            // into different lanes prevents above/below collisions on the
+            // same row.
+            const downstream = tx > sx
+            const laneOffset = (downstream ? -1 : 1) * (28 + index * 6)
+            // Anchor entry/exit slightly off-centre toward the lane direction.
+            // Tightened from ±30% to ±18% so the edge enters the node a hair
+            // off-centre rather than at the top/bottom corner — reads cleaner
+            // with the gradient stroke.
+            const quadrantSign = downstream ? -1 : 1
+            sy = sRect.top + sRect.height / 2 - containerRect.top + (quadrantSign * sRect.height * 0.18)
+            ty = tRect.top + tRect.height / 2 - containerRect.top + (quadrantSign * tRect.height * 0.18)
+            // Control points pulled vertically off the row band.
+            const cx1 = sx + Math.max(40, Math.abs(tx - sx) * 0.3)
+            const cx2 = tx - Math.max(40, Math.abs(tx - sx) * 0.3)
+            const cy1 = sy + laneOffset
+            const cy2 = ty + laneOffset
+            pathD = `M ${sx} ${sy} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${tx} ${ty}`
           } else {
             const dist = Math.abs(tx - sx)
             const spread = Math.max(dist * 0.5, 24)
@@ -654,22 +688,25 @@ export function LineageFlowOverlay({
           </filter>
 
           {/* Shared arrowhead markers — one per unique color.
-              Sized for clarity: 14×12 with a sharp filled triangle and full
-              opacity so direction is unambiguous at any zoom. */}
+              Sized 12×10: discreet but readable. Direction is also encoded
+              in the per-edge gradient stroke (faded at source, full color at
+              target); the arrowhead is the confirming cue. Marker fill stays
+              solid even when the stroke gradient is at low opacity at the
+              source end, so the tip is always crisply visible. */}
           {sharedDefs.markerColors.map(c => {
             const safeId = c.replace(/[^a-zA-Z0-9]/g, '')
             return (
               <marker
                 key={safeId}
                 id={`arrow-${safeId}`}
-                markerWidth="14"
-                markerHeight="12"
-                refX="13"
-                refY="6"
+                markerWidth="12"
+                markerHeight="10"
+                refX="11"
+                refY="5"
                 orient="auto"
                 markerUnits="userSpaceOnUse"
               >
-                <polygon points="0 0, 14 6, 0 12, 3 6" fill={c} stroke={c} strokeWidth="0.5" />
+                <polygon points="0 0, 12 5, 0 10, 2 5" fill={c} stroke={c} strokeWidth="0.5" />
               </marker>
             )
           })}
@@ -699,12 +736,26 @@ export function LineageFlowOverlay({
           // Staged-change marker — colored halo around the edge if there's a pending change.
           const stagedEdgeColor: string | undefined = stagedEdgeColorByEdgeId.get(edge.id)
 
-          // When a node is selected, dim edges not connected to it to ~8%.
-          // Connected edges stay full-strength with a brightness boost.
+          // Spotlight focus modes:
+          // - Click-highlight (a node is selected): edges connected to it stay
+          //   full, others fade to 8%.
+          // - Edge hover: the hovered edge stays full, others fade to 8%.
+          // - Otherwise: nothing dims.
+          // Click-highlight wins over edge-hover when both are active.
           const isConnectedToSelected = isHighlightActive && highlightedEdges?.has(edge.id)
+          const isEdgeHoverSpotlight = !isHighlightActive && hoveredEdgeId !== null
+          const isThisEdgeHovered = hoveredEdgeId === edge.id
           const groupOpacity = isHighlightActive
             ? (isConnectedToSelected ? 1 : 0.08)
-            : 1
+            : isEdgeHoverSpotlight
+              ? (isThisEdgeHovered ? 1 : 0.08)
+              : 1
+
+          // Per-edge gradient id — direction is encoded in the stroke itself.
+          // Fades from a soft tint of the type color at the source to full
+          // saturation at the target. The arrowhead is the confirming cue.
+          const gradId = `edge-grad-${edge.id.replace(/[^a-zA-Z0-9]/g, '')}`
+          const coreOpacity = isHighlighted ? Math.min(0.95, edgeOpacity * 1.2) : edgeOpacity
 
           return (
             <g
@@ -713,8 +764,26 @@ export function LineageFlowOverlay({
               data-edge-src={edge.source}
               data-edge-tgt={edge.target}
               className={edge.isTraceEdge ? 'nx-edge-trace' : undefined}
-              style={{ opacity: groupOpacity, transition: 'opacity 0.25s ease' }}
+              style={{ opacity: groupOpacity, transition: 'opacity 0.12s ease' }}
             >
+              {/* Per-edge directional gradient. `userSpaceOnUse` with start/
+                  end at the path's source/target endpoints aligns the gradient
+                  vector to the actual edge direction — approximate for curves
+                  but visually correct. Source stop at 35% of edge opacity gives
+                  the soft-tint start; target stop at full edge opacity. */}
+              <defs>
+                <linearGradient
+                  id={gradId}
+                  gradientUnits="userSpaceOnUse"
+                  x1={sx}
+                  y1={sy}
+                  x2={tx}
+                  y2={ty}
+                >
+                  <stop offset="0%" stopColor={color} stopOpacity={coreOpacity * 0.35} />
+                  <stop offset="100%" stopColor={color} stopOpacity={coreOpacity} />
+                </linearGradient>
+              </defs>
 
               {/* SUBTLE GLOW — only on highlight, thin halo */}
               {isHighlighted && (
@@ -748,17 +817,20 @@ export function LineageFlowOverlay({
                 />
               )}
 
-              {/* CORE LINE */}
+              {/* CORE LINE — stroke uses the per-edge gradient so direction
+                  is encoded in the line itself (faded at source, full at
+                  target). strokeOpacity is intentionally 1: the gradient's
+                  stops already carry the effective opacity per endpoint. */}
               <path
                 d={pathD}
                 style={{
-                  stroke: color,
+                  stroke: `url(#${gradId})`,
                   strokeWidth: dynamicStrokeWidth,
                   fill: 'none',
-                  strokeOpacity: isHighlighted ? Math.min(0.95, edgeOpacity * 1.2) : edgeOpacity,
+                  strokeOpacity: 1,
                   strokeDasharray: isGhost ? '6 4' : 'none',
                   strokeLinecap: 'round',
-                  transition: 'all 0.3s ease',
+                  transition: 'stroke-width 0.2s ease',
                 }}
                 markerEnd={showDirection ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
                 className="pointer-events-none"
@@ -844,6 +916,17 @@ export function LineageFlowOverlay({
               {/* Source terminal dot */}
               {!isGhost && (
                 <circle cx={sx} cy={sy} r={isHighlighted ? 3 : 2.5} fill={color} style={{ opacity: edgeOpacity * 0.8, transition: 'r 0.2s ease' }} />
+              )}
+
+              {/* Endpoint rings — only on the spotlight-hovered edge. Visually
+                  pin the focus by ringing both anchor points. r=14 sized to
+                  hug the node edge-anchor area; pointer-events off so they
+                  don't capture hits. */}
+              {isThisEdgeHovered && (
+                <>
+                  <circle cx={sx} cy={sy} r={14} fill="none" stroke={color} strokeWidth={1.2} strokeOpacity={0.6} className="pointer-events-none" />
+                  <circle cx={tx} cy={ty} r={14} fill="none" stroke={color} strokeWidth={1.2} strokeOpacity={0.6} className="pointer-events-none" />
+                </>
               )}
 
               <title>{edge.source} → {edge.target} {isBundled ? `(${edge.edgeCount} bundled logs)` : ''}</title>

@@ -5493,18 +5493,36 @@ class FalkorDBProvider(GraphDataProvider):
             # Variable-length bound = max ontology depth (floor 10) so
             # very deep ontologies aren't truncated and shallow ones
             # don't pay for unused depth.
+            #
+            # NB: anchor-itself + descendants are split into two UNION
+            # branches per side because FalkorDB's planner intermittently
+            # rejects `[c*0..N]` with "expected List or Null but was Edge"
+            # — using `[c*1..N]` (minimum one hop) avoids the zero-length
+            # edge case. The anchor itself is matched directly without
+            # any traversal. This is the same fix shape used elsewhere
+            # in this module (e.g. _find_ancestor_with_lineage at L5142).
             max_depth = max(len(getattr(self, "_entity_type_levels", {}) or {}), 10)
-            # NB: path-uniqueness predicate removed — legacy form, bounded by
-            # max_depth. See note in _resolve_anchor_at_level.
             cypher = (
-                f"MATCH (a {{urn: $source}})-[c*0..{max_depth}]->(child) "
+                # Source — anchor itself
+                "MATCH (a {urn: $source}) "
+                "WHERE labels(a)[0] IN $types "
+                "RETURN 's' AS side, [a.urn] AS urns "
+                "UNION "
+                # Source — descendants via 1..N containment hops
+                f"MATCH (a {{urn: $source}})-[c*1..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
                 "LIMIT $limit "
                 "RETURN 's' AS side, collect(urn) AS urns "
                 "UNION "
-                f"MATCH (b {{urn: $target}})-[c*0..{max_depth}]->(child) "
+                # Target — anchor itself
+                "MATCH (b {urn: $target}) "
+                "WHERE labels(b)[0] IN $types "
+                "RETURN 't' AS side, [b.urn] AS urns "
+                "UNION "
+                # Target — descendants via 1..N containment hops
+                f"MATCH (b {{urn: $target}})-[c*1..{max_depth}]->(child) "
                 "WHERE ALL(rel IN c WHERE type(rel) IN $ctypes) "
                 "  AND labels(child)[0] IN $types "
                 "WITH DISTINCT child.urn AS urn "
@@ -5524,8 +5542,10 @@ class FalkorDBProvider(GraphDataProvider):
             )
             raise
 
-        s_urns: List[str] = []
-        t_urns: List[str] = []
+        # Accumulate per side — the UNION returns 2 rows per side (anchor +
+        # descendants) so overwriting would lose half the URNs.
+        s_set: Set[str] = set()
+        t_set: Set[str] = set()
         for row in (result.result_set or []):
             if not row or len(row) < 2:
                 continue
@@ -5533,10 +5553,10 @@ class FalkorDBProvider(GraphDataProvider):
             urns = row[1] if isinstance(row[1], list) else []
             urn_list = [u for u in urns if u]
             if side == 's':
-                s_urns = urn_list
+                s_set.update(urn_list)
             elif side == 't':
-                t_urns = urn_list
-        return s_urns, t_urns
+                t_set.update(urn_list)
+        return list(s_set), list(t_set)
 
     async def _edges_between_sets(
         self, s_urns: List[str], t_urns: List[str], level: int,

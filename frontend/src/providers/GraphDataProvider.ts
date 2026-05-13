@@ -440,6 +440,17 @@ export interface ExpandAggregatedRequest {
     includeContainmentEdges?: boolean
 }
 
+export interface ExpandAggregatedBatchRequest {
+    /** One entry per aggregated-edge to drill into; all share the same config below. */
+    pairs: Array<{
+        sourceUrn: URN
+        targetUrn: URN
+        nextLevel: number | string
+    }>
+    lineageEdgeTypes?: string[] | null
+    includeContainmentEdges?: boolean
+}
+
 export interface TraceV2Result {
     nodes: GraphNode[]
     edges: GraphEdge[]
@@ -725,6 +736,14 @@ export interface GraphDataProvider {
      * within (source-subtree × target-subtree) at `nextLevel`.
      */
     expandAggregated?(request: ExpandAggregatedRequest): Promise<TraceV2Result>
+
+    /**
+     * Batched drill-down. The frontend collects all incident AGGREGATED
+     * edges of an expanding traced node into a single backend call —
+     * one HTTP round trip instead of one-per-edge. Server fans out and
+     * returns a merged, deduplicated TraceV2Result.
+     */
+    expandAggregatedBatch?(request: ExpandAggregatedBatchRequest): Promise<TraceV2Result>
 
     // ==========================================
     // Layer/Classification Queries
