@@ -146,11 +146,11 @@ export function DetailPanel({ isOpen, nodeId }: DetailPanelProps) {
               </Section>
             )}
 
-            {/* Metadata */}
-            {node.data.metadata && Object.keys(node.data.metadata).length > 0 && (
+            {/* Properties */}
+            {node.data.properties && Object.keys(node.data.properties).length > 0 && (
               <Section title="Properties" icon={Database}>
                 <div className="space-y-2">
-                  {Object.entries(node.data.metadata).map(([key, value]) => (
+                  {Object.entries(node.data.properties).map(([key, value]) => (
                     <MetadataRow key={key} label={key} value={value} />
                   ))}
                 </div>

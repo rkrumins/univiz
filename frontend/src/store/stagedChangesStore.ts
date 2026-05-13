@@ -28,6 +28,7 @@ import type { GraphDataProvider } from '@/providers/GraphDataProvider'
 export type StagedChangeType =
   | 'create_entity'
   | 'rename_entity'
+  | 'update_entity'
   | 'delete_entity'
   | 'assign_layer'
   | 'move_to_layer'
@@ -108,6 +109,7 @@ const APPLY_ORDER_GROUP: Record<StagedChangeType, number> = {
   delete_edge: 1,
   delete_entity: 2,
   rename_entity: 3,
+  update_entity: 3,
   edit_edge: 3,
   reverse_edge: 3,
   assign_layer: 3,
@@ -279,6 +281,7 @@ export const useStagedChangesStore = create<StagedChangesState>((set, get) => ({
     const counts: Record<StagedChangeType, number> = {
       create_entity: 0,
       rename_entity: 0,
+      update_entity: 0,
       delete_entity: 0,
       assign_layer: 0,
       move_to_layer: 0,

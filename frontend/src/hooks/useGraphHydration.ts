@@ -58,7 +58,15 @@ interface UseGraphHydrationOptions {
 
 // ─── Conversion Utilities (exported for reuse) ──────────────────────────────
 
-/** Convert a backend GraphNode to a canvas LineageNode. */
+/**
+ * Convert a backend GraphNode to a canvas LineageNode.
+ *
+ * Explicit field-by-field map (no `...n` spread) so the canvas store doesn't
+ * carry both `displayName` AND `label`, both `entityType` AND `type`, etc.
+ * Values pass through verbatim — including empty strings — to preserve
+ * wire fidelity. Callers that need a "treat empty as absent" rule should
+ * apply it at the consumer, not here.
+ */
 export function toCanvasNode(n: GraphNode, opts?: { randomPosition?: boolean }): LineageNode {
     return {
         id: n.urn,
@@ -67,16 +75,24 @@ export function toCanvasNode(n: GraphNode, opts?: { randomPosition?: boolean }):
             ? { x: Math.random() * 800, y: Math.random() * 600 }
             : { x: 0, y: 0 },
         data: {
-            ...n,
+            // Identity
+            urn: n.urn,
             label: n.displayName,
             type: n.entityType,
-            urn: n.urn,
-            metadata: n.properties,
+            // Descriptive — verbatim from the backend GraphNode
+            qualifiedName: n.qualifiedName,
+            description: n.description,
+            sourceSystem: n.sourceSystem,
+            layerAssignment: n.layerAssignment,
+            lastSyncedAt: n.lastSyncedAt,
             childCount: n.childCount,
+            // Editable property bag (renamed from `metadata` → `properties`)
+            properties: n.properties,
+            // Frontend conveniences derived from the property bag / tags
             classifications: n.tags,
             businessLabel: (n.properties?.businessLabel as string) ?? undefined,
         },
-    } as any
+    }
 }
 
 /** Convert a backend GraphEdge to a canvas LineageEdge using real backend edge data. */
