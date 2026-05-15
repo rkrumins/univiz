@@ -1626,7 +1626,19 @@ export function ContextViewCanvas({
             />
           )}
 
-          <div className="flex h-full min-h-0 relative z-10 gap-12">
+          {/*
+            z-30 + pointer-events-none on the columns wrapper:
+            - z-30 puts the columns ABOVE the hit-test layer (z-20 in
+              LineageFlowOverlay), so node cards win pointer events when the
+              cursor is over them — even when an edge stroke passes
+              geometrically over the same pixel.
+            - pointer-events-none on the wrapper itself means the wrapper
+              doesn't capture clicks in the inter-column gaps; events fall
+              through to the hit layer below for edge interaction. The child
+              LayerColumn / FlatTreeItem elements default to pointer-events:
+              auto and continue to receive their own hover/click events.
+          */}
+          <div className="flex h-full min-h-0 relative z-30 gap-12 pointer-events-none">
             {sortedLayers.map((layer) => (
               <LayerColumn
                 key={layer.id}
