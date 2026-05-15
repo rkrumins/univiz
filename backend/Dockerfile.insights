@@ -1,0 +1,42 @@
+# ── Synodic Insights Service (Background Poller) ─────────────────────
+# Headless entrypoint for `python -m backend.insights_service`. Owns the
+# per-data-source stats refresh loop (node/edge counts, schema, ontology),
+# discovery jobs, and purge. Fully decoupled from viz-service and Control
+# Plane — own connection pools, own circuit breakers, own timeouts.
+#
+# Process layout (all in one asyncio runtime):
+#   - Scheduler task: every STATS_SCHEDULER_TICK_SECS, enqueues due
+#     data sources to the 'stats.jobs' Redis Stream (with SET NX dedup).
+#   - Worker task: XREADGROUP on 'stats.jobs' (group: stats-workers).
+#     Per-graph asyncio.Semaphore prevents contention on shared graphs.
+#     Failures route to 'stats.dlq' after STATS_MAX_DELIVERY_ATTEMPTS.
+#   - Health endpoint on port 8092 (pure asyncio, no web framework).
+#   - Graceful SIGTERM drain of in-flight polls.
+#
+# Horizontal scale:
+#   docker compose up -d --scale stats-service=N
+#
+# Dedup via Redis 'stats:pending:{ds_id}' keys makes multi-replica safe.
+# ──────────────────────────────────────────────────────────────────────
+FROM python:3.13-slim AS base
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libffi-dev libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ /app/backend/
+
+RUN addgroup --system synodic && adduser --system --ingroup synodic synodic
+USER synodic
+
+EXPOSE 8092
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD curl -sf http://localhost:8092/health || exit 1
+
+CMD ["python", "-m", "backend.insights_service"]
