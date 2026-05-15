@@ -68,6 +68,29 @@ export interface UseEdgeProjectionOptions {
    * rather than per-leaf spaghetti.
    */
   traceFocusLevel?: number
+  /**
+   * Browse-mode bundling. When enabled, edges between distinct visible
+   * leaf nodes get projected up the containment hierarchy until pair-count
+   * fan-in shrinks below the threshold — collapsing hub-style "every
+   * object → every object" densities into one bundle per parent pair.
+   * Independent of trace mode; controlled by the canvas.
+   */
+  browseBundleEnabled?: boolean
+  /** Containment parent map used for browse-mode bundling. */
+  browseBundleParentMap?: Map<string, string>
+  /**
+   * Maximum edges per (source, target) pair in browse mode before the
+   * projection walks endpoints one level coarser. Default 1 — every pair
+   * collapses on the first walk pass.
+   */
+  browseBundleFanInThreshold?: number
+  /**
+   * nodeId → layer index map (Source=0, Staging=1, …). When provided,
+   * each projected edge gets `isReverseFlow` set true if the target's
+   * layer index is strictly less than the source's. Used by the
+   * renderer to route reverse-flow edges through a dedicated lane.
+   */
+  nodeLayerIndexMap?: Map<string, number>
 }
 
 // ============================================
@@ -179,6 +202,10 @@ export function useEdgeProjection({
   traceBundleParentMap,
   entityTypeLevels,
   traceFocusLevel,
+  browseBundleEnabled = false,
+  browseBundleParentMap,
+  browseBundleFanInThreshold = 1,
+  nodeLayerIndexMap,
 }: UseEdgeProjectionOptions): { lineageEdges: any[], visibleLineageEdges: any[], unresolvedAggregatedCount: number } {
 
   // Telemetry for silently-dropped aggregated edges whose endpoints can't be
@@ -376,9 +403,21 @@ export function useEdgeProjection({
       && traceBundleParentMap !== undefined
       && entityTypeLevels !== undefined
       && typeof traceFocusLevel === 'number'
+    // Trace renders at exactly the level the user requested. The walk
+    // only consolidates endpoints that are FINER than the focus (e.g. a
+    // dataset-level focus trace returned a column-level edge because of
+    // inherited lineage — walk the column up to its parent dataset). When
+    // the endpoint is already at focus level or coarser, the walk exits
+    // immediately and the edge keeps its visible endpoints.
+    //
+    // Visual density at hub-node traces is the renderer's responsibility
+    // (the density-adaptive tiers in LineageFlowOverlay), not the
+    // projection's. An attribute-level focus must surface as
+    // attribute-to-attribute edges — not be silently rolled up to the
+    // parent object — or the user can't trust what they're seeing.
+    const effectiveBundleCeiling = bundleEnabled ? traceFocusLevel! : 0
     const projectToTraceLevel = (endpointId: string): string | null => {
       if (!bundleEnabled) return null
-      // Walk up while the endpoint is at a finer level than the focus.
       let cursor: string | undefined = endpointId
       const seen = new Set<string>()
       while (cursor && !seen.has(cursor)) {
@@ -387,12 +426,11 @@ export function useEdgeProjection({
         const entityType = (node?.data?.type as string | undefined) ?? node?.typeId
         const level = entityType ? entityTypeLevels!.get(entityType) : undefined
         if (level === undefined) {
-          // Unknown level — stop here rather than over-walk into nothing.
           return cursor
         }
-        if (level <= traceFocusLevel!) return cursor
+        if (level <= effectiveBundleCeiling) return cursor
         const parent = traceBundleParentMap!.get(cursor)
-        if (!parent) return cursor  // top of chain; keep what we have
+        if (!parent) return cursor
         cursor = parent
       }
       return cursor ?? null
@@ -449,12 +487,87 @@ export function useEdgeProjection({
         }
       })
 
+    // ── Browse-mode meta-bundling ─────────────────────────────────────────
+    //
+    // Trace-mode bundling already rolls up via `projectToTraceLevel` above.
+    // For browse mode we run a separate pass over the per-pair `edgeGroups`:
+    // when many distinct visible-leaf pairs share a common COLLAPSED
+    // containment parent (e.g. 76 Compliance objects → 109 Finance objects,
+    // both layers collapsed), the canvas is hopeless. Roll those pairs up
+    // to a single parent-pair bundle so the macro flow is legible.
+    //
+    // CRITICAL — never collapse to an EXPANDED parent. The user's expansion
+    // is an explicit request to see leaf-level detail; rolling those edges
+    // back into the parent would make the fine-grained lineage disappear
+    // the moment they reveal it. The walk only steps to a parent when that
+    // parent is collapsed (i.e. is itself the user's chosen view-level).
+    //
+    // Disabled in trace mode (trace has its own path) and when the parent
+    // map / fan-in config is missing.
+    if (
+      !isTracing
+      && browseBundleEnabled
+      && browseBundleParentMap !== undefined
+      && edgeGroups.size > 0
+    ) {
+      // Walk one parent step. Iterate up to 6 passes; each pass collapses
+      // the highest-fan-in groupings until the count drops under threshold.
+      // 6 is enough to walk leaf → object → schema → domain → layer for
+      // every realistic ontology depth.
+      for (let pass = 0; pass < 6; pass++) {
+        // Group existing keys by their (parent-of-source, parent-of-target),
+        // but only consider parents that are NOT currently expanded.
+        const parentBuckets = new Map<string, string[]>()
+        for (const key of edgeGroups.keys()) {
+          const [sId, tId] = key.split('->')
+          const rawSP = browseBundleParentMap.get(sId)
+          const rawTP = browseBundleParentMap.get(tId)
+          // Skip the walk on a side whose parent is expanded — that side
+          // stays at the visible leaf level (the user explicitly opened it).
+          const sP = rawSP && !expandedNodes.has(rawSP) ? rawSP : undefined
+          const tP = rawTP && !expandedNodes.has(rawTP) ? rawTP : undefined
+          // Only consider buckets where AT LEAST one endpoint has a
+          // collapsed parent available. If both are at user-chosen view
+          // level, the key stays as-is.
+          if (!sP && !tP) continue
+          const parentKey = `${sP ?? sId}->${tP ?? tId}`
+          if (parentKey === key) continue
+          let bucket = parentBuckets.get(parentKey)
+          if (!bucket) { bucket = []; parentBuckets.set(parentKey, bucket) }
+          bucket.push(key)
+        }
+
+        let collapsedAny = false
+        parentBuckets.forEach((childKeys, parentKey) => {
+          if (childKeys.length <= browseBundleFanInThreshold) return
+          // Collapse: merge every child group's edges into one bundle keyed
+          // at the parent pair. Stamp with `isBrowseBundle` so the renderer
+          // (and future drill UI) can distinguish from per-pair groupings.
+          const [sP, tP] = parentKey.split('->')
+          if (sP === tP) return  // self-loop at parent level — skip
+          const merged: any[] = edgeGroups.get(parentKey) ?? []
+          for (const ck of childKeys) {
+            const child = edgeGroups.get(ck)
+            if (!child) continue
+            // Re-key each edge to the new parent endpoints so finalize()
+            // pulls source/target from the merged group consistently.
+            for (const e of child) merged.push({ ...e, source: sP, target: tP, _browseBundled: true })
+            edgeGroups.delete(ck)
+          }
+          edgeGroups.set(parentKey, merged)
+          collapsedAny = true
+        })
+        if (!collapsedAny) break
+      }
+    }
+
     // Finalize: bundle groups into projected edges (without delegation — applied in separate memo)
     const projected: any[] = []
     edgeGroups.forEach((groupEdges, key) => {
       const distinctTypes = new Set<string>()
       let isGhost = false
       let isAggregated = false
+      let isBrowseBundle = false
       let maxConfidence = 0
 
       const sourceId = groupEdges[0].source
@@ -466,6 +579,7 @@ export function useEdgeProjection({
 
       groupEdges.forEach(e => {
         if (e.data?.isAggregated) isAggregated = true
+        if (e._browseBundled) isBrowseBundle = true
         if (e.data?.edgeTypes) {
           e.data.edgeTypes.forEach((et: string) => distinctTypes.add(et))
         } else if (e.originalType) {
@@ -477,16 +591,30 @@ export function useEdgeProjection({
       const edgeCount = groupEdges.length
       const typesArray = Array.from(distinctTypes)
 
+      // Reverse-flow annotation: layer-index of target strictly less than
+      // source means the edge points back upstream against the canonical
+      // left→right flow. Renderer routes these through a dedicated lane.
+      let isReverseFlow = false
+      if (nodeLayerIndexMap) {
+        const sLayer = nodeLayerIndexMap.get(sourceId)
+        const tLayer = nodeLayerIndexMap.get(targetId)
+        if (typeof sLayer === 'number' && typeof tLayer === 'number' && tLayer < sLayer) {
+          isReverseFlow = true
+        }
+      }
+
       projected.push({
         id: `bundle-${key}`,
         source: sourceId,
         target: targetId,
-        isBundled: edgeCount > 1,
+        isBundled: edgeCount > 1 || isBrowseBundle,
+        isBrowseBundle,
         isGhost,
         edgeCount,
         types: typesArray,
         confidence: maxConfidence,
         isAggregated,
+        isReverseFlow,
         isDelegated: false,
         isResidual: false,
         data: { edgeTypes: typesArray, confidence: maxConfidence, edgeCount }
@@ -494,7 +622,7 @@ export function useEdgeProjection({
     })
 
     return projected
-  }, [ancestorMap, lineageEdges, edges, aggregatedEdges, displayMap, urnToIdMap, showLineageFlow, isTracing, traceContextSet, isContainmentEdge, expandedNodes, suppressedAggEdgeKeys, traceAddedEdgeIds, traceBundleParentMap, entityTypeLevels, traceFocusLevel, nodeIndex])
+  }, [ancestorMap, lineageEdges, edges, aggregatedEdges, displayMap, urnToIdMap, showLineageFlow, isTracing, traceContextSet, isContainmentEdge, expandedNodes, suppressedAggEdgeKeys, traceAddedEdgeIds, traceBundleParentMap, entityTypeLevels, traceFocusLevel, nodeIndex, browseBundleEnabled, browseBundleParentMap, browseBundleFanInThreshold, nodeLayerIndexMap])
 
   // ── Edge delegation — separate memo so hoveredNodeId changes are O(E) not O(expensive) ──
   //

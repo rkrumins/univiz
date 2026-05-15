@@ -61,7 +61,7 @@ services:
   # compete with broker data.  AOF persistence ensures stream durability
   # across restarts.  noeviction policy prevents silent message loss.
   redis:
-    image: redis:7.4-alpine
+    image: redis:7-alpine
     restart: unless-stopped
     ports:
       - "${REDIS_PORT:-6380}:6379"
@@ -264,7 +264,7 @@ services:
   stats-service:
     build:
       context: .
-      dockerfile: backend/Dockerfile.stats
+      dockerfile: backend/Dockerfile.insights
     environment:
       # Management DB (polling configs + stats cache + data source catalog)
       MANAGEMENT_DB_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}

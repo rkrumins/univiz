@@ -861,7 +861,9 @@ export function ContextViewCanvas({
       if (aggregationTargets.length > 0) {
         fetchAggregated(aggregationTargets, aggregationTargets)
       }
-    }, 500) // 500ms debounce — coalesces rapid expand/collapse
+    }, 150) // Snappy refetch on expand/collapse — old 500ms felt laggy
+            // when iteratively drilling. 150ms is still long enough to
+            // coalesce a rapid sequence of clicks but feels live.
 
     return () => clearTimeout(fetchDebounced)
   }, [showLineageFlow, getVisibleContainerUrns, fetchAggregated, nodes.length, expandedNodes, trace.isTracing])
@@ -1233,21 +1235,21 @@ export function ContextViewCanvas({
     if (!wasExpanded && !pendingLoadRef.current.has(nodeId)) {
       pendingLoadRef.current.add(nodeId)
       try {
-        // NOTE: autoDrillOnExpand intentionally NOT invoked here.
-        //
-        // It used to fire on every traced-container expansion, batching a
-        // /trace/expand call for every incident AGGREGATED edge. For a hub
-        // node (a Campaigns object touching 17 entity types × 4 layers)
-        // that's a single batch that returns tens of thousands of
-        // finer-level edges — the canvas renders 14k+ edges and the user
-        // can't see anything.
-        //
-        // Drilldowns are still available — the user gets them by double-
-        // clicking an AGGREGATED edge, which calls expandAggregatedEdge
-        // for that specific pair. That's a targeted O(1) drill instead of
-        // an O(N) batch. If we re-introduce auto-drill it should be gated
-        // behind a Shift-click / dock toggle, not the default.
+        // Browse path: loadChildren fetches the children + their lineage
+        // edges (via getChildrenWithEdges with includeLineageEdges:true).
+        // Trace path: also batch-drill the AGGREGATED edges incident to
+        // this node so the server returns the next-finer level of trace
+        // edges between this node's subtree and its peers' subtrees. The
+        // density-tier renderer + browse-mode bundling now absorb the
+        // result; the historical reason this was disabled (canvas
+        // overload) no longer applies.
         await loadChildren(nodeId)
+        if (trace.isTracing) {
+          // Fire-and-forget: drill runs in the background and merges into
+          // the canvas as it returns. No await — the children are already
+          // visible from loadChildren above.
+          void autoDrillOnExpand(nodeId)
+        }
       } finally {
         pendingLoadRef.current.delete(nodeId)
       }
@@ -1287,7 +1289,7 @@ export function ContextViewCanvas({
       }
       if (subtreeUrns.size > 0) purgeAggregatedEdgesIncidentToUrns(subtreeUrns)
     }
-  }, [displayMap, loadChildren, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns])
+  }, [displayMap, loadChildren, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns, trace.isTracing, autoDrillOnExpand])
 
 
 
@@ -1297,6 +1299,30 @@ export function ContextViewCanvas({
 
   // Hovered node — needed by both edge projection (delegation) and hover highlight
   const hoveredNodeId = useHoveredNodeId()
+
+  // Layer-index map: nodeId → layer ordinal (Source=0, Staging=1, …).
+  // Drives reverse-flow detection — projected edges where target.layerIdx <
+  // source.layerIdx get `isReverseFlow:true` so the renderer can route them
+  // through the dedicated lane below the columns. Lazily-cheap: O(N) once
+  // per layer assignment change.
+  const nodeLayerIndexMap = useMemo(() => {
+    const layerOrdinal = new Map<string, number>()
+    sortedLayers.forEach((l, i) => layerOrdinal.set(l.id, i))
+    const byNode = new Map<string, number>()
+    nodeLayerMap.forEach((layerId, nodeId) => {
+      const idx = layerOrdinal.get(layerId)
+      if (typeof idx === 'number') byNode.set(nodeId, idx)
+    })
+    return byNode
+  }, [sortedLayers, nodeLayerMap])
+
+  // Browse-mode bundling threshold. The pre-bundle edge count above which
+  // the projection rolls leaf-pair edges up to their containment parents.
+  // 800 is empirically where SVG-edge density crosses from "readable" into
+  // "fog" on a typical layered canvas — chosen to match the renderer's
+  // density-tier thresholds.
+  const BROWSE_BUNDLE_THRESHOLD = 800
+  const browseBundleEnabled = !trace.isTracing && edges.length > BROWSE_BUNDLE_THRESHOLD
 
   // Edge projection: lineageEdges, visibleLineageEdges
   // Pass the trace-filtered views so projected edges only reference visible
@@ -1318,6 +1344,14 @@ export function ContextViewCanvas({
     traceBundleParentMap: parentMap,
     entityTypeLevels,
     traceFocusLevel: trace.result?.effectiveLevel,
+    // Browse-mode bundling: kicks in only outside trace mode and only when
+    // edge density would otherwise overload the canvas. Walks endpoints up
+    // the containment chain in passes; collapses parent-pairs whose fan-in
+    // exceeds the threshold.
+    browseBundleEnabled,
+    browseBundleParentMap: parentMap,
+    browseBundleFanInThreshold: 1,
+    nodeLayerIndexMap,
   })
 
   // Highlight state: connected nodes/edges for selected node
@@ -1347,20 +1381,66 @@ export function ContextViewCanvas({
   // tracks each drilldown by `${sourceUrn}->${targetUrn}@${atLevel}` so collapse
   // can revert. Single-click still selects/opens the EdgeDetailPanel.
   const handleEdgeDoubleClick = useCallback(async (edgeId: string) => {
+    // Resolve the bundle from the projected edges first — bundle ids look
+    // like `bundle-${sourceId}->${targetId}` and are not in the canvas
+    // store. Falling back to the store lookup keeps the legacy AGGREGATED
+    // drill path working when callers pass a raw store edge id.
+    const bundle = visibleLineageEdges.find(e => e.id === edgeId)
+    const storeEdge = edges.find(e => e.id === edgeId)
+
+    // ── Path 1: browse-mode bundle drill ─────────────────────────────────
+    //
+    // Iterative reveal: expand whichever endpoint has unrevealed children
+    // (priority: source first, then target if source had nothing to expand).
+    // Each double-click peels one layer; the projection re-bundles at the
+    // next-finer level, so the user can keep drilling. Works in BOTH
+    // browse and trace mode for client-side bundles — the trace AGGREGATED
+    // server drill (Path 2) only kicks in when the bundle itself is the
+    // server-returned AGG edge.
+    if (bundle && (bundle.isBrowseBundle || bundle.isBundled)) {
+      const isServerAgg = bundle.isAggregated  // backed by server AGGREGATED edge
+      if (!isServerAgg || !trace.isTracing) {
+        const trySource = displayMap.get(bundle.source)
+        const tryTarget = displayMap.get(bundle.target)
+        const sourceHasChildren = !!trySource && !expandedNodes.has(bundle.source)
+          && (((trySource.data?.childCount as number) ?? trySource.children?.length ?? 0) > 0)
+        const targetHasChildren = !!tryTarget && !expandedNodes.has(bundle.target)
+          && (((tryTarget.data?.childCount as number) ?? tryTarget.children?.length ?? 0) > 0)
+        if (sourceHasChildren) await toggleNode(bundle.source)
+        if (targetHasChildren) await toggleNode(bundle.target)
+        // If neither side had unrevealed children, fall through and let the
+        // server-AGG drill (Path 2) try below — for nested trace structures
+        // the same bundle can be both client-collapsed AND a server AGG
+        // edge underneath. No-op if not in trace mode / not aggregated.
+        if (sourceHasChildren || targetHasChildren) return
+      }
+    }
+
+    // ── Path 2: server AGGREGATED drill (trace mode only) ────────────────
     if (!trace.isTracing) return
-    const edge = edges.find(e => e.id === edgeId)
-    if (!edge) return
-    const isAggregated = String(((edge as any).data?.edgeType) ?? '').toUpperCase() === 'AGGREGATED'
+    const edgeForDrill: any = storeEdge ?? bundle
+    if (!edgeForDrill) return
+    const isAggregated =
+      String((edgeForDrill?.data?.edgeType) ?? '').toUpperCase() === 'AGGREGATED'
+      || edgeForDrill?.isAggregated
     if (!isAggregated) return
 
-    const sourceUrn = (edge as any).source ?? (edge as any).sourceUrn
-    const targetUrn = (edge as any).target ?? (edge as any).targetUrn
+    // The server drill needs URNs, not visible node IDs. For server-edge
+    // ids the source/target are already URNs; for projected bundles the
+    // source/target are node IDs that we resolve through displayMap.
+    const resolveUrn = (id: string): string | undefined => {
+      if (!id) return undefined
+      const node = displayMap.get(id)
+      return (node?.urn as string | undefined) ?? id
+    }
+    const sourceUrn = resolveUrn(edgeForDrill.source ?? edgeForDrill.sourceUrn)
+    const targetUrn = resolveUrn(edgeForDrill.target ?? edgeForDrill.targetUrn)
     if (!sourceUrn || !targetUrn) return
 
     const currentLevel = trace.result?.effectiveLevel ?? 0
     const expanded = await trace.expandAggregatedEdge(sourceUrn, targetUrn, currentLevel)
     if (expanded) mergeDrilldownIntoCanvas(expanded)
-  }, [trace, edges, mergeDrilldownIntoCanvas])
+  }, [trace, edges, visibleLineageEdges, displayMap, expandedNodes, toggleNode, mergeDrilldownIntoCanvas])
 
   // Background click handler to clear selection/highlight
   const handleBackgroundClick = useCallback((e: React.MouseEvent) => {
