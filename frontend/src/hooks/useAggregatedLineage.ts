@@ -8,6 +8,7 @@
 
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { useGraphProvider } from '@/providers/GraphProviderContext'
+import { mapWithConcurrency } from '@/lib/concurrency'
 import type {
     AggregatedEdgeInfo,
     AggregatedEdgeResult,
@@ -126,6 +127,18 @@ const aggregatedEdgeCache = new Map<string, CacheEntry>()
 const CACHE_MAX_ENTRIES = 200
 const AGGREGATED_FETCH_BATCH_SIZE = 500
 
+/**
+ * Cap on parallel `/edges/aggregated` chunks. Aggregation is the
+ * single most expensive endpoint — letting a 100k-URN canvas fire all
+ * 200 chunks at once is a reliable way to saturate FalkorDB's single
+ * Cypher thread. 4 concurrent chunks is the sweet spot per Phase 0 load
+ * tests; tune via VITE_AGGREGATED_FETCH_CONCURRENCY.
+ */
+const AGGREGATED_FETCH_CONCURRENCY = (() => {
+    const fromEnv = Number(import.meta.env?.VITE_AGGREGATED_FETCH_CONCURRENCY)
+    return Number.isFinite(fromEnv) && fromEnv >= 1 ? fromEnv : 4
+})()
+
 // FNV-1a 64-bit, BigInt arithmetic. Returns a hex string. Avoids holding
 // multi-MB joined-URN strings in the cache key across hundreds of entries.
 const FNV_OFFSET_64 = 0xcbf29ce484222325n
@@ -214,12 +227,17 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
                 chunks.push(sourceUrns)
             }
 
-            const settled = await Promise.allSettled(
-                chunks.map(chunk => provider.getAggregatedEdges({
+            // Bound parallel chunks so a 200-chunk fan-out doesn't blow
+            // up the FalkorDB Cypher thread (single-threaded — every
+            // chunk competes for the same slot).
+            const settled = await mapWithConcurrency(
+                chunks,
+                AGGREGATED_FETCH_CONCURRENCY,
+                (chunk) => provider.getAggregatedEdges({
                     sourceUrns: chunk,
                     targetUrns,
                     granularity,
-                }))
+                }),
             )
 
             const fulfilled = settled

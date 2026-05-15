@@ -1028,7 +1028,7 @@ export function ContextViewCanvas({
   }, [])
 
   // Toggle node expansion with Lazy Loading
-  const { loadChildren, searchChildren, isLoading: isLoadingChildren, loadingNodes, failedNodes } = useGraphHydration()
+  const { loadChildren, searchChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes, failedNodes } = useGraphHydration()
 
   // Floating loading toasts
   useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments')
@@ -1254,6 +1254,10 @@ export function ContextViewCanvas({
         pendingLoadRef.current.delete(nodeId)
       }
     } else if (wasExpanded) {
+      // User collapsed — drop any pending/in-flight child load so a
+      // slow response doesn't repopulate a now-collapsed subtree.
+      cancelChildLoad(nodeId)
+
       // Collapse: drop every edge with an endpoint inside the collapsed
       // subtree (the node itself + all descendants). Runs in BOTH browse
       // mode and trace mode — `loadChildren` (browse) and trace drilldowns
@@ -1289,7 +1293,7 @@ export function ContextViewCanvas({
       }
       if (subtreeUrns.size > 0) purgeAggregatedEdgesIncidentToUrns(subtreeUrns)
     }
-  }, [displayMap, loadChildren, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns, trace.isTracing, autoDrillOnExpand])
+  }, [displayMap, loadChildren, cancelChildLoad, childMap, removeEdgesByNodeIds, purgeAggregatedEdgesIncidentToUrns, trace.isTracing, autoDrillOnExpand])
 
 
 

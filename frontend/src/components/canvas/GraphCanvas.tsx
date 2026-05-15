@@ -246,7 +246,7 @@ export function GraphCanvas({ className }: { className?: string }) {
   // handles visibility by projecting to visible ancestors, not filtering.
 
   // 7. Progressive loading
-  const { loadChildren, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
+  const { loadChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
   useLoadingToast('graph-children', isLoadingChildren, 'Expanding hierarchy')
 
   // 8. Trace system (shared hook)
@@ -659,9 +659,13 @@ export function GraphCanvas({ className }: { className?: string }) {
         } finally {
           pendingLoadRef.current.delete(nodeId)
         }
+      } else if (wasExpanded) {
+        // User collapsed mid-load — drop the result so a slow response
+        // doesn't repopulate a now-collapsed subtree.
+        cancelChildLoad(nodeId)
       }
     },
-    [loadChildren, semanticZoom],
+    [loadChildren, cancelChildLoad, semanticZoom],
   )
 
   const toggleNodeRef = useRef(toggleNode)
