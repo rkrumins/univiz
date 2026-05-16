@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.db.models import ResourceGrantORM
 
 
-VALID_RESOURCE_TYPES = {"view"}
+VALID_RESOURCE_TYPES = {"view", "graph"}
 VALID_SUBJECT_TYPES = {"user", "group"}
 VALID_GRANT_ROLES = {"editor", "viewer"}
 
