@@ -315,6 +315,23 @@ export function LineageFlowOverlay({
             dynamicStrokeWidth = Math.max(1, baseStrokeWidth * 0.7)
           }
 
+          // Reverse-flow geometric reroute only — no visual styling change.
+          // The edge points back upstream (target layer < source layer);
+          // routing it through a deeper sub-row arc keeps the forward
+          // flow uncluttered (no zigzag through other rows). Visually it
+          // reads identically to forward edges: same type color, same
+          // gradient fade, same chevron animation, same arrowhead. Only
+          // the path geometry differs.
+          let isRev = false
+          if ((edge as any).isReverseFlow) {
+            isRev = true
+            const dist = Math.abs(tx - sx)
+            const arcDepth = Math.max(60, dist * 0.35)
+            const cx1 = sx + Math.max(40, dist * 0.25)
+            const cx2 = tx - Math.max(40, dist * 0.25)
+            pathD = `M ${sx} ${sy} C ${cx1} ${sy + arcDepth}, ${cx2} ${ty + arcDepth}, ${tx} ${ty}`
+          }
+
           newComputedEdges.push({
             id: edge.id,
             source: edge.source,
@@ -330,6 +347,8 @@ export function LineageFlowOverlay({
             confidence: edge.confidence || 0,
             isTraceEdge,
             isFocusIncident,
+            isReverseFlow: isRev,
+            isBrowseBundle: !!(edge as any).isBrowseBundle,
           })
         }
         return
@@ -635,6 +654,26 @@ export function LineageFlowOverlay({
     return true
   })
 
+  // ── Density-adaptive render tier ───────────────────────────────────────
+  //
+  // Premium  (≤ 200 visible)    — full treatment: per-edge gradient,
+  //                                animated chevron flow, particles, glow.
+  // Standard (201 – 800)        — drop animated chevron + particles unless
+  //                                edge is hovered or focus-incident; pool
+  //                                gradient defs by color (~10 vs N).
+  // Coalesced (> 800)           — strip everything except the core stroke +
+  //                                shared color gradient + arrowhead. Hover
+  //                                still reads through the hit layer (now
+  //                                gated to ≤1200 edges in Part 3).
+  //
+  // Premium feel concentrates on the user's focus. The hovered / focus-
+  // incident subset always gets the Premium treatment regardless of tier
+  // (`focus + context` fisheye, Part 5).
+  const renderTier: 'premium' | 'standard' | 'coalesced' =
+    visibleEdges.length <= 200 ? 'premium'
+    : visibleEdges.length <= 800 ? 'standard'
+    : 'coalesced'
+
   // ── Shared SVG defs — one marker per unique color, one gradient per color+direction ──
   // Avoids creating 500+ <marker> and 200+ <linearGradient> elements per render.
   const sharedDefs = useMemo(() => {
@@ -754,6 +793,14 @@ export function LineageFlowOverlay({
           // Per-edge gradient id — direction is encoded in the stroke itself.
           // Fades from a soft tint of the type color at the source to full
           // saturation at the target. The arrowhead is the confirming cue.
+          //
+          // Tier policy: only Premium tier (and the focus-incident /
+          // hovered subset in any tier) gets the per-edge gradient. Other
+          // edges fall back to the solid color stroke — direction is still
+          // unmistakable via the arrowhead. Eliminates N <linearGradient>
+          // defs per render at high density.
+          const isPremiumLook =
+            renderTier === 'premium' || isHighlighted || edge.isFocusIncident
           const gradId = `edge-grad-${edge.id.replace(/[^a-zA-Z0-9]/g, '')}`
           const coreOpacity = isHighlighted ? Math.min(0.95, edgeOpacity * 1.2) : edgeOpacity
 
@@ -770,20 +817,23 @@ export function LineageFlowOverlay({
                   end at the path's source/target endpoints aligns the gradient
                   vector to the actual edge direction — approximate for curves
                   but visually correct. Source stop at 35% of edge opacity gives
-                  the soft-tint start; target stop at full edge opacity. */}
-              <defs>
-                <linearGradient
-                  id={gradId}
-                  gradientUnits="userSpaceOnUse"
-                  x1={sx}
-                  y1={sy}
-                  x2={tx}
-                  y2={ty}
-                >
-                  <stop offset="0%" stopColor={color} stopOpacity={coreOpacity * 0.35} />
-                  <stop offset="100%" stopColor={color} stopOpacity={coreOpacity} />
-                </linearGradient>
-              </defs>
+                  the soft-tint start; target stop at full edge opacity.
+                  Skipped for non-premium-look edges to keep DOM count down. */}
+              {isPremiumLook && (
+                <defs>
+                  <linearGradient
+                    id={gradId}
+                    gradientUnits="userSpaceOnUse"
+                    x1={sx}
+                    y1={sy}
+                    x2={tx}
+                    y2={ty}
+                  >
+                    <stop offset="0%" stopColor={color} stopOpacity={coreOpacity * 0.35} />
+                    <stop offset="100%" stopColor={color} stopOpacity={coreOpacity} />
+                  </linearGradient>
+                </defs>
+              )}
 
               {/* SUBTLE GLOW — only on highlight, thin halo */}
               {isHighlighted && (
@@ -819,15 +869,17 @@ export function LineageFlowOverlay({
 
               {/* CORE LINE — stroke uses the per-edge gradient so direction
                   is encoded in the line itself (faded at source, full at
-                  target). strokeOpacity is intentionally 1: the gradient's
-                  stops already carry the effective opacity per endpoint. */}
+                  target). strokeOpacity is intentionally 1 when the gradient
+                  carries opacity in its stops; a fixed opacity is used when
+                  the solid-color fallback runs. Reverse-flow edges use the
+                  same styling as forward — only their path geometry differs. */}
               <path
                 d={pathD}
                 style={{
-                  stroke: `url(#${gradId})`,
+                  stroke: isPremiumLook ? `url(#${gradId})` : color,
                   strokeWidth: dynamicStrokeWidth,
                   fill: 'none',
-                  strokeOpacity: 1,
+                  strokeOpacity: isPremiumLook ? 1 : coreOpacity,
                   strokeDasharray: isGhost ? '6 4' : 'none',
                   strokeLinecap: 'round',
                   transition: 'stroke-width 0.2s ease',
@@ -837,11 +889,12 @@ export function LineageFlowOverlay({
               />
 
               {/* DIRECTION FLOW — animated chevron flowing source → target.
-                  Renders for ALL edges (including ghost edges that represent
-                  fine-grained lineage delegated up to a visible ancestor —
-                  TRANSFORMS at column level rolled up to Dataset, etc.) so
-                  flow direction is unmistakable regardless of edge type. */}
-              {showDirection && (
+                  Renders for ALL edges in Premium tier; in Standard /
+                  Coalesced tiers we limit it to the focus + context subset
+                  (hovered, focus-incident) so density doesn't melt the
+                  paint pipeline. Reverse-flow edges follow the same rules
+                  as forward — chevron animates along their downward arc. */}
+              {showDirection && isPremiumLook && (
                 <>
                   {/* White underlay — gives the colored dashes contrast against any background */}
                   <path
@@ -1094,9 +1147,23 @@ export function LineageFlowOverlay({
       )
     })()}
 
-    {/* ── HIT LAYER ─── z-20: above columns, transparent, only click/hover paths ── *
-     *  Positioned identically to the visual layer but invisible. Sits above the    *
-     *  z-10 column container so pointer events reach these paths correctly.        */}
+    {/* ── HIT LAYER ─── z-20: above columns, transparent, only click/hover paths ──
+     *  Positioned identically to the visual layer but invisible. Sits above the
+     *  z-10 column container.
+     *
+     *  Pointer-events policy: each <path> uses `pointer-events: stroke` (set via
+     *  inline style — Tailwind has no utility) so events fire only when the
+     *  pointer is on the actual stroked geometry, not the path's bounding box.
+     *  Combined with a tighter strokeWidth (6 vs the prior 14), this keeps the
+     *  whole canvas clickable at high edge density — clicks anywhere off an
+     *  edge fall through to the node layer below.
+     *
+     *  Density gate: above HIT_DENSITY_LIMIT visible edges, the per-edge hit
+     *  path overlay would still form a coverage mesh that occludes nodes. In
+     *  that regime we skip the hit layer entirely; users interact with edges
+     *  via the trace dock / EdgeLegend instead. Nodes always remain clickable.
+     */}
+    {visibleEdges.length <= 1200 && (
     <div className="absolute inset-0 pointer-events-none z-20">
       <svg className="w-full h-full overflow-visible pointer-events-none">
         {visibleEdges.map(edge => {
@@ -1107,8 +1174,8 @@ export function LineageFlowOverlay({
               d={pathD}
               fill="none"
               stroke="transparent"
-              strokeWidth={14}
-              className="pointer-events-auto cursor-pointer"
+              strokeWidth={6}
+              style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
               data-canvas-interactive
               onMouseEnter={(e) => {
                 setHoveredEdgeId(edge.id)
@@ -1136,6 +1203,7 @@ export function LineageFlowOverlay({
         })}
       </svg>
     </div>
+    )}
     </>
   )
 }

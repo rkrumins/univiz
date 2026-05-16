@@ -64,7 +64,7 @@ import { useContainmentHierarchy } from '@/hooks/useContainmentHierarchy'
 import { useCanvasTrace } from '@/hooks/useCanvasTrace'
 import { useAggregatedLineage } from '@/hooks/useAggregatedLineage'
 import { useHighlightState, useHoverHighlight, useHoveredNodeId } from '@/hooks/useHighlightState'
-import { useEdgeDetailPanel, useEdgeTypeFilters } from '@/hooks/useEdgeFilters'
+import { useEdgeDetailPanel, useEdgeTypeFilters, useEdgeFiltersStore } from '@/hooks/useEdgeFilters'
 import { useSemanticZoom } from '@/hooks/useSemanticZoom'
 import { useCanvasInteractions } from '@/hooks/useCanvasInteractions'
 import { useCanvasKeyboard } from '@/hooks/useCanvasKeyboard'
@@ -246,7 +246,7 @@ export function GraphCanvas({ className }: { className?: string }) {
   // handles visibility by projecting to visible ancestors, not filtering.
 
   // 7. Progressive loading
-  const { loadChildren, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
+  const { loadChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
   useLoadingToast('graph-children', isLoadingChildren, 'Expanding hierarchy')
 
   // 8. Trace system (shared hook)
@@ -484,6 +484,58 @@ export function GraphCanvas({ className }: { className?: string }) {
     )
   }, [rawEdges, relationshipTypes, containmentEdgeTypes, ontologyMetadata, edgeFilters])
 
+  // 13a. Wire EdgeDetailPanel's filter state into actual canvas rendering.
+  // The store has been driving the panel UI for a while — this is what makes
+  // the toggles affect the graph the user sees.
+  const directionFilter = useEdgeFiltersStore((s) => s.directionFilter)
+  const focusedFilterNodeId = useEdgeFiltersStore((s) => s.focusedNodeId)
+  const highlightedEdgeIds = useEdgeFiltersStore((s) => s.highlightedEdgeIds)
+  const isolateMode = useEdgeFiltersStore((s) => s.isolateMode)
+
+  // Set of normalized edge types the user has left enabled. `null` means "no
+  // filters configured yet" (schema not loaded / no edges discovered) and we
+  // pass everything through rather than nuking the graph.
+  const enabledEdgeTypes = useMemo<Set<string> | null>(() => {
+    if (!dynamicEdgeFilters || dynamicEdgeFilters.length === 0) return null
+    return new Set(dynamicEdgeFilters.filter((f) => f.enabled).map((f) => f.type))
+  }, [dynamicEdgeFilters])
+
+  // Direction filter — when a node is focused via the panel, restrict the
+  // displayed lineage edges to that node's incoming / outgoing / upstream /
+  // downstream set. Transitive sets are computed via iterative DFS to avoid
+  // recursion limits on large graphs.
+  const directionEdgeIds = useMemo<Set<string> | null>(() => {
+    if (!focusedFilterNodeId || directionFilter === 'all') return null
+    if (directionFilter === 'incoming') {
+      return new Set(
+        allVisibleEdges.filter((e) => e.target === focusedFilterNodeId).map((e) => e.id),
+      )
+    }
+    if (directionFilter === 'outgoing') {
+      return new Set(
+        allVisibleEdges.filter((e) => e.source === focusedFilterNodeId).map((e) => e.id),
+      )
+    }
+    const ids = new Set<string>()
+    const visited = new Set<string>()
+    const stack = [focusedFilterNodeId]
+    while (stack.length > 0) {
+      const node = stack.pop()!
+      if (visited.has(node)) continue
+      visited.add(node)
+      for (const e of allVisibleEdges) {
+        if (directionFilter === 'upstream' && e.target === node) {
+          ids.add(e.id)
+          stack.push(e.source)
+        } else if (directionFilter === 'downstream' && e.source === node) {
+          ids.add(e.id)
+          stack.push(e.target)
+        }
+      }
+    }
+    return ids
+  }, [allVisibleEdges, focusedFilterNodeId, directionFilter])
+
   // 14. ELK Layout
   const { applyLayout, isLayouting, direction, toggleDirection } = useElkLayout()
   const [layoutedNodes, setLayoutedNodes] = useState<LineageNode[]>([])
@@ -607,9 +659,13 @@ export function GraphCanvas({ className }: { className?: string }) {
         } finally {
           pendingLoadRef.current.delete(nodeId)
         }
+      } else if (wasExpanded) {
+        // User collapsed mid-load — drop the result so a slow response
+        // doesn't repopulate a now-collapsed subtree.
+        cancelChildLoad(nodeId)
       }
     },
-    [loadChildren, semanticZoom],
+    [loadChildren, cancelChildLoad, semanticZoom],
   )
 
   const toggleNodeRef = useRef(toggleNode)
@@ -630,12 +686,28 @@ export function GraphCanvas({ className }: { className?: string }) {
   // Flow is the master switch — Trace mode respects it so the canvas can be
   // dialed back to "trace highlights on nodes only" when desired.
   const displayEdges = useMemo(() => {
+    const matchesTypeFilter = (edge: typeof allVisibleEdges[number]): boolean => {
+      if (!enabledEdgeTypes) return true
+      const normalized = normalizeEdgeType(edge).toLowerCase()
+      const original = (edge.data?.edgeType || edge.data?.relationship || 'unknown').toLowerCase()
+      return enabledEdgeTypes.has(normalized) || enabledEdgeTypes.has(original)
+    }
     return allVisibleEdges
       .filter(edge => {
-        // Always show containment edges when parent is expanded
-        if (edge._isContainment) return true
+        // Containment edges are subject to the type filter (so users can hide
+        // structural edges) but ignore the lineage Flow toggle.
+        if (edge._isContainment) {
+          return matchesTypeFilter(edge)
+        }
         // Lineage edges follow the Flow toggle, regardless of trace state
-        return showLineageFlow
+        if (!showLineageFlow) return false
+        if (!matchesTypeFilter(edge)) return false
+        // Direction filter (only active when a focus node is set)
+        if (directionEdgeIds && !directionEdgeIds.has(edge.id)) return false
+        // Isolate mode — only render highlighted edges. Requires at least one
+        // highlight to avoid the surprise of "isolate mode hides everything".
+        if (isolateMode && highlightedEdgeIds.size > 0 && !highlightedEdgeIds.has(edge.id)) return false
+        return true
       })
       .map(edge => {
         if (edge._isContainment) {
@@ -683,7 +755,7 @@ export function GraphCanvas({ className }: { className?: string }) {
           },
         }
       })
-  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges])
+  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges, enabledEdgeTypes, directionEdgeIds, isolateMode, highlightedEdgeIds])
   // (trace.isTracing/trace.result kept in deps because the map step inside reads them for isTraced flagging)
 
   // 16. Display nodes with visual state — only VISIBLE nodes (expand/collapse aware)

@@ -39,6 +39,10 @@ export interface UseLayerAssignmentResult {
   displayFlat: HierarchyNode[]
   displayMap: Map<string, HierarchyNode>
   urnToIdMap: Map<string, string>
+  /** Final effective layer per node id — used by the trace merge to derive
+   *  an assignmentHint for lineage participants whose containment chain
+   *  doesn't reach an already-placed canvas anchor. */
+  nodeLayerMap: Map<string, string>
 }
 
 // ============================================
@@ -188,6 +192,17 @@ export function useLayerAssignment({
 
         // 5. inheritance (for non-containment relationships, if any)
         if (!myLayerId && inheritedLayerId) myLayerId = inheritedLayerId
+
+        // 6. assignmentHint — last-resort fallback used by the trace merge.
+        //    When /trace/v2 returns a lineage participant whose containment
+        //    chain doesn't reach a known canvas anchor, the merge stamps a
+        //    hint (typically the focus's layer) onto the node's metadata so
+        //    it lands somewhere visible instead of being silently dropped.
+        if (!myLayerId) {
+          const nodeRecord = nodeMap.get(nodeId)
+          const hint = (nodeRecord?.data?.metadata as Record<string, unknown> | undefined)?.assignmentHint
+          if (typeof hint === 'string' && hint.length > 0) myLayerId = hint
+        }
       }
 
       if (myLayerId === '__UNASSIGNED__') myLayerId = undefined
@@ -404,5 +419,21 @@ export function useLayerAssignment({
     return map
   }, [displayFlat])
 
-  return { layerRules, nodesByLayer, displayFlat, displayMap, urnToIdMap }
+  // Re-derive nodeLayerMap from the rendered hierarchy: every HierarchyNode
+  // we ended up emitting under a layer must have had a layer assignment, so
+  // we recover the map without changing the algorithm's return shape.
+  const nodeLayerMap = useMemo(() => {
+    const map = new Map<string, string>()
+    nodesByLayer.forEach((layerNodes, layerId) => {
+      const stack = [...layerNodes]
+      while (stack.length > 0) {
+        const node = stack.pop()!
+        map.set(node.id, layerId)
+        for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i])
+      }
+    })
+    return map
+  }, [nodesByLayer])
+
+  return { layerRules, nodesByLayer, displayFlat, displayMap, urnToIdMap, nodeLayerMap }
 }

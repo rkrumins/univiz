@@ -6,6 +6,14 @@ export type ThemeMode = 'light' | 'dark' | 'system'
 /** Visual density of list/grid items in the Explorer page. */
 export type ExplorerDensity = 'compact' | 'comfortable' | 'spacious'
 
+/**
+ * How lineage edges render on the canvas.
+ *  - 'stubs'  : every node with lineage shows a small stub; real edges materialize on hover/click.
+ *  - 'auto'   : nodes with ≤ a small fan-in render real edges directly; denser nodes show stubs.
+ *  - 'raw'    : every fetched edge renders as a real edge (legacy behavior). Prompts at >5,000.
+ */
+export type LineageRenderMode = 'stubs' | 'auto' | 'raw'
+
 export interface NodeStyleConfig {
   color: string
   icon?: string
@@ -52,6 +60,15 @@ interface PreferencesState {
   autoLOD: boolean
   setAutoLOD: (enabled: boolean) => void
   toggleAutoLOD: () => void
+
+  // Lineage rendering — controls stub vs raw edge rendering on the canvas.
+  // Default 'stubs' so the canvas stays GPU-stable regardless of fetched volume.
+  // Switching to 'raw' is the user's explicit opt-in to render everything.
+  lineageRenderMode: LineageRenderMode
+  setLineageRenderMode: (mode: LineageRenderMode) => void
+  /** Threshold for 'auto' mode — a node with edgeCount ≤ this in a direction renders real edges instead of a stub. */
+  lineageAutoThreshold: number
+  setLineageAutoThreshold: (n: number) => void
 
   // Pinned views (sidebar quick access)
   pinnedViewIds: string[]
@@ -131,6 +148,12 @@ export const usePreferencesStore = create<PreferencesState>()(
       autoLOD: false, // Off by default - user can enable
       setAutoLOD: (autoLOD) => set({ autoLOD }),
       toggleAutoLOD: () => set((state) => ({ autoLOD: !state.autoLOD })),
+
+      // Lineage rendering
+      lineageRenderMode: 'stubs',
+      setLineageRenderMode: (lineageRenderMode) => set({ lineageRenderMode }),
+      lineageAutoThreshold: 5,
+      setLineageAutoThreshold: (lineageAutoThreshold) => set({ lineageAutoThreshold }),
 
       // User avatar
       avatarId: null,

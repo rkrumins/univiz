@@ -5,8 +5,9 @@ Supports CRUD, filtering, favourites, and enterprise discovery.
 """
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Set
 
 from sqlalchemy import select, delete, func, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,7 +172,12 @@ async def _to_enriched_response(
     row: ViewORM,
     user_id: Optional[str] = None,
 ) -> ViewResponse:
-    """Build a ViewResponse enriched with workspace name, data source name, CM name, and favourite info."""
+    """Build a ViewResponse enriched with workspace name, data source name, CM name, and favourite info.
+
+    Single-row enrichment used by create/get/update paths where N+1 is not a concern.
+    For list paths, call :func:`_batch_enrich_rows` instead — it issues 5 batched queries
+    in parallel regardless of row count.
+    """
     ws_name = await _get_workspace_name(session, row.workspace_id)
     ds_name = await _get_data_source_name(session, row.data_source_id)
     cm_name = await _get_context_model_name(session, row.context_model_id)
@@ -188,6 +194,139 @@ async def _to_enriched_response(
         favourite_count=fav_count,
         is_favourited=fav,
     )
+
+
+# ------------------------------------------------------------------ #
+# Batched enrichment for list paths (kills N+1)                       #
+# ------------------------------------------------------------------ #
+#
+# Previously, list endpoints called _to_enriched_response per row, which
+# fanned out to 6 sequential SELECTs per row (workspace name, datasource
+# name, context-model name, creator info, favourite count, is-favourited).
+# At limit=20 this was ~121 round-trips, and under any concurrency the
+# WEB pool would saturate, ballooning per-query latency until the request
+# took multiple seconds.
+#
+# _batch_enrich_rows issues at most 5 lookups regardless of row count,
+# in parallel via asyncio.gather. _to_response remains the single
+# row→Pydantic converter so existing single-row paths are unaffected.
+
+def _batch_enrich_enabled() -> bool:
+    """Kill-switch for the batched-enrichment path.
+
+    Default ON. Set ``VIEWS_BATCH_ENRICH=false`` to fall back to the
+    legacy per-row path while we observe the new query shapes in prod.
+    Read on each call so test fixtures and runtime overrides take effect
+    without re-import. Cheap (os.getenv hits a dict).
+    """
+    return os.getenv("VIEWS_BATCH_ENRICH", "true").lower() not in ("false", "0", "no", "")
+
+
+async def _batch_enrich_rows(
+    session: AsyncSession,
+    rows: Sequence[ViewORM],
+    user_id: Optional[str] = None,
+    *,
+    fav_count_overrides: Optional[Dict[str, int]] = None,
+) -> List[ViewResponse]:
+    """Enrich a batch of view rows with name lookups + favourite info using batched queries.
+
+    Issues at most 5 SELECTs total (workspaces, datasources, context models,
+    users, favourite counts, favourites-by-user) regardless of how many
+    rows are passed — versus 6×N round-trips in the legacy per-row path.
+
+    Queries are issued sequentially because ``AsyncSession`` is not safe
+    for concurrent operations on a single session (it serialises via an
+    internal lock); the win here is the *number* of round-trips, not
+    parallelism.
+
+    ``fav_count_overrides`` lets callers that already computed the
+    favourite count (e.g. ``list_popular_views`` which JOINs an aggregated
+    subquery) skip the GROUP BY query and reuse those counts.
+    """
+    if not rows:
+        return []
+
+    workspace_ids: Set[str] = {r.workspace_id for r in rows if r.workspace_id}
+    ds_ids: Set[str] = {r.data_source_id for r in rows if r.data_source_id}
+    cm_ids: Set[str] = {r.context_model_id for r in rows if r.context_model_id}
+    creator_ids: Set[str] = {
+        r.created_by for r in rows
+        if r.created_by and r.created_by != "anonymous"
+    }
+    view_ids: List[str] = [r.id for r in rows]
+
+    ws_map: Dict[str, str] = {}
+    if workspace_ids:
+        res = await session.execute(
+            select(WorkspaceORM.id, WorkspaceORM.name)
+            .where(WorkspaceORM.id.in_(workspace_ids))
+        )
+        ws_map = {wid: name for wid, name in res.all()}
+
+    ds_map: Dict[str, str] = {}
+    if ds_ids:
+        res = await session.execute(
+            select(WorkspaceDataSourceORM.id, WorkspaceDataSourceORM.label)
+            .where(WorkspaceDataSourceORM.id.in_(ds_ids))
+        )
+        ds_map = {did: label for did, label in res.all()}
+
+    cm_map: Dict[str, str] = {}
+    if cm_ids:
+        res = await session.execute(
+            select(ContextModelORM.id, ContextModelORM.name)
+            .where(ContextModelORM.id.in_(cm_ids))
+        )
+        cm_map = {cid: name for cid, name in res.all()}
+
+    user_map: Dict[str, tuple[Optional[str], Optional[str]]] = {}
+    if creator_ids:
+        res = await session.execute(
+            select(UserORM.id, UserORM.first_name, UserORM.last_name, UserORM.email)
+            .where(UserORM.id.in_(creator_ids))
+        )
+        for uid, first, last, email in res.all():
+            display = f"{first or ''} {last or ''}".strip() or email
+            user_map[uid] = (display, email)
+
+    # Favourite counts: skip the GROUP BY when the caller already has
+    # them (popular views computes them from its JOINed subquery).
+    if fav_count_overrides is not None:
+        fav_counts: Dict[str, int] = dict(fav_count_overrides)
+    elif view_ids:
+        res = await session.execute(
+            select(ViewFavouriteORM.view_id, func.count())
+            .where(ViewFavouriteORM.view_id.in_(view_ids))
+            .group_by(ViewFavouriteORM.view_id)
+        )
+        fav_counts = {vid: cnt for vid, cnt in res.all()}
+    else:
+        fav_counts = {}
+
+    fav_set: Set[str] = set()
+    if user_id and user_id != "anonymous" and view_ids:
+        res = await session.execute(
+            select(ViewFavouriteORM.view_id)
+            .where(ViewFavouriteORM.view_id.in_(view_ids))
+            .where(ViewFavouriteORM.user_id == user_id)
+        )
+        fav_set = {vid for (vid,) in res.all()}
+
+    responses: List[ViewResponse] = []
+    for row in rows:
+        creator = user_map.get(row.created_by or "", (None, None))
+        responses.append(_to_response(
+            row,
+            workspace_name=ws_map.get(row.workspace_id) if row.workspace_id else None,
+            data_source_name=ds_map.get(row.data_source_id) if row.data_source_id else None,
+            context_model_name=cm_map.get(row.context_model_id) if row.context_model_id else None,
+            created_by_name=creator[0],
+            created_by_email=creator[1],
+            favourite_count=fav_counts.get(row.id, 0),
+            is_favourited=row.id in fav_set,
+        ))
+    return responses
 
 
 # ------------------------------------------------------------------ #
@@ -555,7 +694,10 @@ async def list_views_filtered(
     count_result = await session.execute(count_query)
     total = count_result.scalar_one() or 0
 
-    responses = [await _to_enriched_response(session, row, user_id) for row in rows]
+    if _batch_enrich_enabled():
+        responses = await _batch_enrich_rows(session, rows, user_id)
+    else:
+        responses = [await _to_enriched_response(session, row, user_id) for row in rows]
 
     has_more = (offset + len(responses)) < total
     next_offset = offset + len(responses) if has_more else None
@@ -819,8 +961,21 @@ async def list_popular_views(
     )
 
     result = await session.execute(query)
+    tuples = result.all()
+    rows = [t[0] for t in tuples]
+    # Favourite counts are already produced by the JOIN'd subquery; reuse
+    # them so the batched enricher can skip its own GROUP BY.
+    fav_count_overrides = {t[0].id: int(t[1] or 0) for t in tuples}
+
+    if _batch_enrich_enabled():
+        return await _batch_enrich_rows(
+            session, rows, user_id,
+            fav_count_overrides=fav_count_overrides,
+        )
+
+    # Legacy fallback (kill-switch path)
     responses = []
-    for row_tuple in result.all():
+    for row_tuple in tuples:
         row = row_tuple[0]
         fav_count = row_tuple[1] or 0
         ws_name = await _get_workspace_name(session, row.workspace_id)
@@ -855,6 +1010,8 @@ async def list_views_for_context_model(
     )
     result = await session.execute(query)
     rows = result.scalars().all()
+    if _batch_enrich_enabled():
+        return await _batch_enrich_rows(session, rows, user_id)
     return [await _to_enriched_response(session, row, user_id) for row in rows]
 
 

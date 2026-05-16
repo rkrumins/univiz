@@ -300,6 +300,67 @@ async def test_list_popular_views_empty(test_client: AsyncClient):
     assert resp.json() == []
 
 
+# ── GET /views/ — embedded ?include=popular (WS-5) ────────────────────
+
+async def test_list_views_include_popular_omitted_by_default(test_client: AsyncClient):
+    """Default response carries no ``popular`` payload — the field is
+    only populated when the caller opts in. Keeps the common-case
+    response small for callers that don't render a trending strip.
+    """
+    ws_id = await _create_workspace(test_client)
+    await _create_view(test_client, ws_id, "Plain List View")
+
+    resp = await test_client.get("/api/v1/views/?limit=10")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "items" in body
+    # Either absent or explicitly null; never an empty array (that would
+    # imply "we tried and found nothing" rather than "didn't ask").
+    assert body.get("popular") is None
+
+
+async def test_list_views_include_popular_returns_trending_strip(test_client: AsyncClient):
+    """``?include=popular`` folds the trending strip into the same
+    response, eliminating the Explorer's second round-trip. Visibility
+    rules apply: zero-favourite views are excluded from popular even
+    though they appear in ``items``.
+    """
+    ws_id = await _create_workspace(test_client)
+    favoured = await _create_view(test_client, ws_id, "Trending", visibility="enterprise")
+    await _create_view(test_client, ws_id, "Unloved", visibility="enterprise")
+
+    # Bookmark one of the two so it qualifies as "popular" (fav_count > 0).
+    fav_resp = await test_client.post(f"/api/v1/views/{favoured['id']}/favourite")
+    assert fav_resp.status_code == 201
+
+    resp = await test_client.get("/api/v1/views/?limit=10&include=popular&popularLimit=5")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["items"]) >= 2
+    assert isinstance(body.get("popular"), list)
+    popular_ids = {v["id"] for v in body["popular"]}
+    assert favoured["id"] in popular_ids
+
+
+async def test_list_views_include_popular_respects_popular_limit(test_client: AsyncClient):
+    """``popularLimit`` caps the embedded popular list independently of
+    the main ``limit`` (which paginates ``items``).
+    """
+    ws_id = await _create_workspace(test_client)
+    for i in range(4):
+        created = await _create_view(
+            test_client, ws_id, f"PopCap {i}", visibility="enterprise",
+        )
+        await test_client.post(f"/api/v1/views/{created['id']}/favourite")
+        # Unfavourite/refavourite is awkward across the same user; just
+        # leave each one with one favourite from the test admin user.
+
+    resp = await test_client.get("/api/v1/views/?limit=10&include=popular&popularLimit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["popular"]) <= 2
+
+
 # ── Filtering ─────────────────────────────────────────────────────────
 
 async def test_list_views_filter_by_workspace(test_client: AsyncClient):

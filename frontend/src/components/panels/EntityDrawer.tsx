@@ -1,12 +1,20 @@
 /**
  * EntityDrawer - Unified entity details and editing drawer
- * 
+ *
  * A modern slide-in drawer that appears when any entity is selected, providing:
- * - View mode: Rich entity details, properties, lineage preview, activity
- * - Edit mode: Inline property editing with validation
+ * - View mode: Rich entity details, properties (nested-JSON tree), lineage preview, activity
+ * - Edit mode: Inline property editing with PropertyEditor for nested values
  * - Raw JSON mode: Advanced editing for power users
  * - Quick actions: Trace, Pin, External links
- * - Responsive and accessible design
+ *
+ * TODO(backend): Drawer edits currently stage as `update_entity` with a no-op
+ * apply hook. To persist edits to the backend we need:
+ *   1. `PATCH /api/v1/{wsId}/graph/nodes/{urn}` route in
+ *      backend/app/api/v1/endpoints/graph.py
+ *   2. `GraphDataProvider.update_node(urn, properties)` ABC method in
+ *      backend/common/interfaces/provider.py
+ *   3. Implementations in FalkorDB / Neo4j / Spanner providers
+ * Wire the apply hook in `handleSave` once the endpoint exists.
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
@@ -17,6 +25,7 @@ import { useSchemaStore } from '@/store/schema'
 import { usePersonaStore } from '@/store/persona'
 import { useEntityColorSet } from '@/hooks/useEntityVisual'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
+import { PropertyEditor } from '@/components/panels/PropertyEditor'
 import { cn } from '@/lib/utils'
 
 // ============================================
@@ -108,6 +117,20 @@ export function EntityDrawer({
     setJsonError(null)
   }, [formData])
 
+  // Replace the entire `properties` bag — PropertyEditor emits a fresh object
+  // on every mutation (add/remove/rename/type-change/reorder). Other top-level
+  // canvas-store fields are untouched.
+  const handlePropertiesChange = useCallback(
+    (nextProperties: Record<string, any>) => {
+      const next = { ...formData, properties: nextProperties }
+      setFormData(next)
+      setRawJson(JSON.stringify(next, null, 2))
+      setHasChanges(true)
+      setJsonError(null)
+    },
+    [formData],
+  )
+
   // Handle raw JSON changes
   const handleRawJsonChange = useCallback((value: string) => {
     setRawJson(value)
@@ -121,11 +144,14 @@ export function EntityDrawer({
     }
   }, [])
 
-  // Save changes — staged, not committed to backend until user clicks Save Blueprint.
-  // Drawer edits primarily change the entity label, so we record a `rename_entity`
-  // staged change. Other field changes still update the canvas immediately for
-  // visual feedback, and the staging entry captures the full before/after diff
-  // so the review panel makes the change visible.
+  // Stage changes — recorded for review, not committed to backend until the
+  // user clicks Save Blueprint.
+  //
+  // Diff strategy: if only `label` differs, stage as `rename_entity` (existing
+  // semantics). For any other change (including nested objects like `metadata`),
+  // stage as `update_entity` carrying the full before/after diff. The canvas is
+  // mutated immediately for visual feedback; staging captures provenance so the
+  // review panel can render and discard the change.
   const handleSave = useCallback(() => {
     if (!selectedNode) return
     if (jsonError) return
@@ -140,24 +166,66 @@ export function EntityDrawer({
     setTimeout(() => setShowSaved(false), 2000)
     setRawJson(JSON.stringify(formData, null, 2))
 
-    // Stage the change so it becomes visible in the review panel + count badge.
-    // stageOrReplace coalesces consecutive edits to the same entity into one entry.
-    const isLabelChange = previousLabel !== newLabel
+    // Compute changed keys via shallow JSON-equality (handles nested objects).
+    const allKeys = new Set([
+      ...Object.keys(previousData),
+      ...Object.keys(formData),
+    ])
+    const changedKeys: string[] = []
+    for (const k of allKeys) {
+      if (JSON.stringify(previousData[k]) !== JSON.stringify(formData[k])) {
+        changedKeys.push(k)
+      }
+    }
+
+    if (changedKeys.length === 0) return
+
     const stagedChanges = useStagedChangesStore.getState()
-    const summary = isLabelChange
-      ? `Edit '${previousLabel}' → '${newLabel}'`
-      : `Edit fields on '${previousLabel || selectedNode.id}'`
+    const onlyLabel = changedKeys.length === 1 && changedKeys[0] === 'label'
+
+    if (onlyLabel) {
+      stagedChanges.stageOrReplace(
+        (c) => c.type === 'rename_entity' && c.targetId === selectedNode.id,
+        {
+          type: 'rename_entity',
+          targetId: selectedNode.id,
+          targetUrn: previousData.urn,
+          before: previousData,
+          after: { ...formData },
+          summary: `Rename '${previousLabel}' → '${newLabel}'`,
+          discard: () => {
+            useCanvasStore.getState().updateNode(selectedNode.id, previousData)
+          },
+        },
+      )
+      return
+    }
+
+    // Multi-field edit — stage as update_entity. Apply hook is a stub until
+    // the backend ships PATCH /api/v1/{wsId}/graph/nodes/{urn}; see the file
+    // header for the full backlog.
     stagedChanges.stageOrReplace(
-      (c) => c.type === 'rename_entity' && c.targetId === selectedNode.id,
+      (c) => c.type === 'update_entity' && c.targetId === selectedNode.id,
       {
-        type: 'rename_entity',
+        type: 'update_entity',
         targetId: selectedNode.id,
         targetUrn: previousData.urn,
         before: previousData,
         after: { ...formData },
-        summary,
+        summary: `Edit ${changedKeys.length} field${changedKeys.length === 1 ? '' : 's'} on '${previousLabel || selectedNode.id}'`,
         discard: () => {
           useCanvasStore.getState().updateNode(selectedNode.id, previousData)
+        },
+        apply: async () => {
+          // TODO(backend): replace with
+          //   await authFetch(`/api/v1/${wsId}/graph/nodes/${urn}`, {
+          //     method: 'PATCH', body: JSON.stringify({ properties: after })
+          //   })
+          // once the endpoint and provider methods land.
+          console.warn(
+            '[update_entity] TODO: PATCH /api/v1/{wsId}/graph/nodes/{urn} not yet implemented',
+            { targetId: selectedNode.id, urn: previousData.urn, changedKeys },
+          )
         },
       },
     )
@@ -216,11 +284,11 @@ export function EntityDrawer({
   const urn = formData.urn || selectedNode.id
   const childCount = formData.childCount || formData._collapsedChildCount || 0
 
-  // Define which fields are core vs additional
-  const coreFields = ['label', 'name', 'description', 'urn', 'type', 'businessLabel', 'technicalLabel']
-  const additionalFields = Object.keys(formData).filter(
-    k => !coreFields.includes(k) && !k.startsWith('_') && k !== 'childCount' && k !== 'classifications' && k !== 'metadata'
-  )
+  // After the converter cleanup in useGraphHydration, the editable property
+  // bag lives in a single explicit field (`properties`). PropertyEditor
+  // targets it directly; everything else on `data` is structured.
+  const propertiesBag: Record<string, any> =
+    (formData.properties as Record<string, any> | undefined) ?? {}
 
   return (
     <AnimatePresence>
@@ -410,7 +478,7 @@ export function EntityDrawer({
               childCount={childCount}
               colors={colors}
               entityType={entityType}
-              additionalFields={additionalFields}
+              propertiesBag={propertiesBag}
               onCopyUrn={handleCopyUrn}
               copiedUrn={copiedUrn}
             />
@@ -421,10 +489,10 @@ export function EntityDrawer({
               formData={formData}
               entityType={entityType}
               urn={urn}
-              additionalFields={additionalFields}
+              propertiesBag={propertiesBag}
               onChange={handleChange}
+              onPropertiesChange={handlePropertiesChange}
               onCopyUrn={handleCopyUrn}
-              onSwitchToJson={() => setViewMode('json')}
             />
           )}
 
@@ -444,6 +512,7 @@ export function EntityDrawer({
               <div className="flex items-center gap-1.5">
                 <LucideIcons.Calendar className="w-3.5 h-3.5" />
                 <span>Last synced 5 min ago</span>
+                <ComingSoonChip />
               </div>
               {externalUrl && (
                 <button
@@ -474,7 +543,7 @@ export function EntityDrawer({
                 )}
               >
                 <LucideIcons.Save className="w-4 h-4" />
-                Save Changes
+                Stage Changes
               </button>
             </div>
           )}
@@ -569,6 +638,51 @@ function Section({ title, icon: Icon, children, action }: SectionProps) {
   )
 }
 
+// Subtle "Coming soon" chip for sections that show placeholder data until
+// the backend lands (activity log, lineage counts, last-synced timestamp).
+function ComingSoonChip() {
+  return (
+    <span className="px-2 py-0.5 rounded-md text-[10px] font-medium uppercase tracking-wider bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+      Coming soon
+    </span>
+  )
+}
+
+/**
+ * Read-only display of the descriptive backend fields surfaced on
+ * `LineageNode.data` (qualifiedName, sourceSystem, layerAssignment,
+ * lastSyncedAt, childCount, description). Hidden entirely when none have
+ * values so empty entities don't show a useless section.
+ */
+function DetailsList({ formData }: { formData: Record<string, any> }) {
+  const rows: Array<{ key: string; label: string; value: React.ReactNode }> = []
+  const push = (key: string, label: string, raw: unknown) => {
+    if (raw === undefined || raw === null || raw === '') return
+    rows.push({ key, label, value: String(raw) })
+  }
+  push('qualifiedName', 'Qualified name', formData.qualifiedName)
+  push('description', 'Description', formData.description)
+  push('sourceSystem', 'Source system', formData.sourceSystem)
+  push('layerAssignment', 'Layer', formData.layerAssignment)
+  push('lastSyncedAt', 'Last synced', formData.lastSyncedAt)
+  if (typeof formData.childCount === 'number' && formData.childCount > 0) {
+    rows.push({ key: 'childCount', label: 'Children', value: String(formData.childCount) })
+  }
+  if (rows.length === 0) return null
+  return (
+    <Section title="Details" icon={LucideIcons.Info}>
+      <div className="space-y-1">
+        {rows.map((row) => (
+          <div key={row.key} className="flex items-start justify-between gap-4 py-1.5">
+            <span className="text-xs text-ink-muted min-w-[110px]">{row.label}</span>
+            <span className="text-xs text-ink text-right break-all">{row.value}</span>
+          </div>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
 // ============================================
 // View Mode Content
 // ============================================
@@ -579,7 +693,7 @@ interface ViewModeContentProps {
   childCount: number
   colors: { hex: string; bg: string; text: string; accent: string }
   entityType: any
-  additionalFields: string[]
+  propertiesBag: Record<string, any>
   onCopyUrn: () => void
   copiedUrn: boolean
 }
@@ -587,13 +701,12 @@ interface ViewModeContentProps {
 function ViewModeContent({
   formData,
   urn,
-  childCount,
   colors,
-  entityType,
-  additionalFields,
+  propertiesBag,
   onCopyUrn,
   copiedUrn,
 }: ViewModeContentProps) {
+  const hasAdditional = Object.keys(propertiesBag).length > 0
   return (
     <div className="divide-y divide-glass-border/30">
       {/* Identifier */}
@@ -616,32 +729,17 @@ function ViewModeContent({
         </div>
       </Section>
 
-      {/* Properties */}
-      {additionalFields.length > 0 && (
-        <Section title="Properties" icon={LucideIcons.FileText}>
-          <div className="space-y-1">
-            {additionalFields.slice(0, 10).map(key => {
-              const value = formData[key]
-              const displayValue = typeof value === 'object'
-                ? JSON.stringify(value)
-                : String(value ?? '—')
+      {/* Details — first-class descriptive fields carried from the backend
+          GraphNode. Only rendered when at least one has a real value. */}
+      <DetailsList formData={formData} />
 
-              return (
-                <div key={key} className="flex items-start justify-between gap-4 py-2">
-                  <span className="text-sm text-ink-muted capitalize min-w-[100px]">
-                    {key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim()}
-                  </span>
-                  <span className="text-sm text-ink text-right truncate flex-1 min-w-0" title={displayValue}>
-                    {displayValue.length > 80 ? displayValue.slice(0, 80) + '...' : displayValue}
-                  </span>
-                </div>
-              )
-            })}
-            {additionalFields.length > 10 && (
-              <p className="text-xs text-ink-muted pt-2">
-                +{additionalFields.length - 10} more properties
-              </p>
-            )}
+      {/* Properties — nested-JSON tree rendered read-only via PropertyEditor.
+          pointer-events-none keeps the recursive UI from accepting edits in
+          View mode; the same component is used (editable) in Edit mode. */}
+      {hasAdditional && (
+        <Section title="Properties" icon={LucideIcons.FileText}>
+          <div className="pointer-events-none opacity-95">
+            <PropertyEditor value={propertiesBag} onChange={() => {}} bare />
           </div>
         </Section>
       )}
@@ -664,7 +762,7 @@ function ViewModeContent({
       )}
 
       {/* Lineage Preview */}
-      <Section title="Lineage Preview" icon={LucideIcons.GitBranch}>
+      <Section title="Lineage Preview" icon={LucideIcons.GitBranch} action={<ComingSoonChip />}>
         <div className="space-y-2">
           <LineagePreviewRow direction="upstream" count={3} label="Data Sources" />
           <LineagePreviewRow direction="downstream" count={7} label="Data Consumers" />
@@ -672,7 +770,7 @@ function ViewModeContent({
       </Section>
 
       {/* Recent Activity */}
-      <Section title="Recent Activity" icon={LucideIcons.History}>
+      <Section title="Recent Activity" icon={LucideIcons.History} action={<ComingSoonChip />}>
         <div className="space-y-3">
           <ActivityRow action="Schema updated" time="2 hours ago" user="system" />
           <ActivityRow action="Classification added" time="1 day ago" user="jane.doe@company.com" />
@@ -691,20 +789,20 @@ interface EditModeContentProps {
   formData: Record<string, any>
   entityType: any
   urn: string
-  additionalFields: string[]
+  propertiesBag: Record<string, any>
   onChange: (key: string, value: any) => void
+  onPropertiesChange: (next: Record<string, any>) => void
   onCopyUrn: () => void
-  onSwitchToJson: () => void
 }
 
 function EditModeContent({
   formData,
   entityType,
   urn,
-  additionalFields,
+  propertiesBag,
   onChange,
+  onPropertiesChange,
   onCopyUrn,
-  onSwitchToJson,
 }: EditModeContentProps) {
   return (
     <div className="p-5 space-y-5">
@@ -779,6 +877,73 @@ function EditModeContent({
         </div>
       </div>
 
+      {/* Metadata — first-class descriptive fields carried from the backend
+          GraphNode. lastSyncedAt and childCount are backend-managed and
+          rendered read-only; the rest accept user edits. */}
+      <div className="pt-5 border-t border-glass-border/30">
+        <h4 className="text-xs font-semibold text-ink-muted uppercase tracking-wider mb-4">
+          Metadata
+        </h4>
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-ink-muted flex items-center gap-2">
+              <LucideIcons.AtSign className="w-3.5 h-3.5" />
+              Qualified name
+            </label>
+            <input
+              type="text"
+              value={(formData.qualifiedName as string) || ''}
+              onChange={(e) => onChange('qualifiedName', e.target.value)}
+              className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-accent-lineage/50 transition-colors duration-150 outline-none text-sm"
+              placeholder="Fully qualified name..."
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-ink-muted flex items-center gap-2">
+              <LucideIcons.Database className="w-3.5 h-3.5" />
+              Source system
+            </label>
+            <input
+              type="text"
+              value={(formData.sourceSystem as string) || ''}
+              onChange={(e) => onChange('sourceSystem', e.target.value)}
+              className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-accent-lineage/50 transition-colors duration-150 outline-none text-sm"
+              placeholder="Origin system identifier..."
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-ink-muted flex items-center gap-2">
+              <LucideIcons.Layers className="w-3.5 h-3.5" />
+              Layer
+            </label>
+            <input
+              type="text"
+              value={(formData.layerAssignment as string) || ''}
+              onChange={(e) => onChange('layerAssignment', e.target.value)}
+              className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-accent-lineage/50 transition-colors duration-150 outline-none text-sm"
+              placeholder="Layer assignment..."
+            />
+          </div>
+          {(formData.lastSyncedAt || typeof formData.childCount === 'number') && (
+            <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-xl bg-black/5 dark:bg-white/[0.03] text-xs">
+              {formData.lastSyncedAt ? (
+                <div className="flex items-center gap-2 text-ink-muted">
+                  <LucideIcons.Clock className="w-3.5 h-3.5" />
+                  <span>Last synced</span>
+                  <span className="text-ink">{String(formData.lastSyncedAt)}</span>
+                </div>
+              ) : <span />}
+              {typeof formData.childCount === 'number' && formData.childCount > 0 && (
+                <div className="flex items-center gap-2 text-ink-muted">
+                  <LucideIcons.GitBranch className="w-3.5 h-3.5" />
+                  <span>{formData.childCount} children</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Dynamic Schema Fields */}
       {entityType?.fields && entityType.fields.filter((f: any) => !['name', 'label', 'description', 'urn', 'businessLabel'].includes(f.id)).length > 0 && (
         <div className="pt-5 border-t border-glass-border/30">
@@ -810,38 +975,20 @@ function EditModeContent({
         </div>
       )}
 
-      {/* Additional Properties */}
-      {additionalFields.length > 0 && (
-        <div className="pt-5 border-t border-glass-border/30">
-          <h4 className="text-xs font-semibold text-ink-muted uppercase tracking-wider mb-4">
-            Additional Properties
-          </h4>
-          <div className="space-y-4">
-            {additionalFields.slice(0, 8).map(key => (
-              <div key={key} className="space-y-2">
-                <label className="text-xs font-medium text-ink-muted capitalize">
-                  {key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim()}
-                </label>
-                <input
-                  type="text"
-                  value={typeof formData[key] === 'object' ? JSON.stringify(formData[key]) : formData[key] || ''}
-                  onChange={(e) => onChange(key, e.target.value)}
-                  className="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 focus:border-accent-lineage/50 transition-colors duration-150 outline-none text-sm"
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Switch to JSON */}
-      <button
-        onClick={onSwitchToJson}
-        className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-ink-muted hover:text-ink text-sm font-medium transition-colors duration-150"
-      >
-        <LucideIcons.Code className="w-4 h-4" />
-        Edit as Raw JSON
-      </button>
+      {/* Properties — nested-JSON CRUD via PropertyEditor. Targets the
+          single `properties` bag on node.data (renamed from `metadata`).
+          Users can add/remove/rename keys, change value types, and
+          drag-reorder array items. */}
+      <div className="pt-5 border-t border-glass-border/30">
+        <h4 className="text-xs font-semibold text-ink-muted uppercase tracking-wider mb-4">
+          Properties
+        </h4>
+        <PropertyEditor
+          value={propertiesBag}
+          onChange={(next) => onPropertiesChange(next as Record<string, any>)}
+          bare
+        />
+      </div>
     </div>
   )
 }

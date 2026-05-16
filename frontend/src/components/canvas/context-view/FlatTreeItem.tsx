@@ -191,9 +191,17 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
       data-canvas-interactive
       data-trace-focus={isFocusNode ? 'true' : 'false'}
       className={cn(
-        "flex items-center gap-2 mx-1 rounded-xl cursor-pointer transition-all duration-200 group/item relative",
+        "flex items-center gap-2 mx-1 rounded-xl cursor-pointer transition-all duration-200 group/item relative z-[2]",
         heightClass,
         paddingClass,
+        // Subtle backdrop-blur on the card body — visually invisible
+        // (matches the glassy translucent design) but blurs anything
+        // painted behind so cross-column edges don't read as solid lines
+        // bleeding through the node. Same technique the layer header uses
+        // (`backdrop-blur-xl` at LayerColumn.tsx:508). The bg tint is kept
+        // near-zero so the airy feel of the original cards is preserved;
+        // hover / selected gradients below paint over this without conflict.
+        "bg-canvas-elevated/10 backdrop-blur-sm",
         // Base hover state with gradient
         "hover:bg-gradient-to-r hover:from-white/[0.06] hover:to-transparent",
         // Selected state with accent glow

@@ -61,6 +61,8 @@ export interface UseTraceFilteredHierarchyOptions {
   drilldowns: Map<string, TraceV2Result>
   /** Canvas containment hierarchy: child id → parent id. From useContainmentHierarchy. */
   parentMap: Map<string, string>
+  /** Canvas containment hierarchy: parent id → child ids. From useContainmentHierarchy. */
+  childMap: Map<string, string[]>
   /** Nodes the user has explicitly expanded — drives the pass-through fallback. */
   expandedNodes: Set<string>
 }
@@ -78,6 +80,9 @@ const EMPTY_CONTEXT = new Set<string>()
 export function useTraceFilteredHierarchy(
   opts: UseTraceFilteredHierarchyOptions,
 ): UseTraceFilteredHierarchyResult {
+  // childMap is intentionally accepted in the options for forward-compat
+  // (we may use it for a more targeted descent-walk in the future) but not
+  // read here — see the "intentionally do NOT walk DOWN" note below.
   const { nodesByLayer, displayFlat, displayMap, isTracing, traceNodes, drilldowns, parentMap, expandedNodes } = opts
 
   return useMemo(() => {
@@ -106,6 +111,15 @@ export function useTraceFilteredHierarchy(
     }
     traceNodes.forEach(addWithAncestors)
     drilldowns.forEach(d => d.nodes.forEach(n => addWithAncestors(n.urn)))
+
+    // Note: we intentionally do NOT walk DOWN from trace participants to
+    // include their loaded descendants. Including descendants would expose
+    // every leaf's ambient lineage in trace mode, producing edge fan-out
+    // explosions on hub-node traces. Trace-merged edges are handled by
+    // `useEdgeProjection`'s `traceAddedEdgeIds` allowlist (Change 1.2),
+    // which lets edges that came directly from /trace/v2 or /trace/expand
+    // through the gate without requiring contextSet membership of both
+    // endpoints. Browse-mode lineage of loaded children stays hidden.
 
     // 2. Recursively prune the hierarchy tree.
     //    Keep a node iff its id/urn is in the context OR any descendant is.

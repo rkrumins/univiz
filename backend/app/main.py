@@ -821,7 +821,36 @@ async def _provider_error_handler(request, exc):
 # around every graph-provider instance. Carries a retry-after hint and a
 # sanitized reason (no redis.exceptions details leak to the client). When
 # the breaker is open, this handler fires in <1ms with no network I/O.
-from backend.common.adapters import ProviderUnavailable as _ProviderUnavailable
+from backend.common.adapters import (
+    ProviderBusy as _ProviderBusy,
+    ProviderUnavailable as _ProviderUnavailable,
+)
+
+
+# ProviderBusy is a subclass of ProviderUnavailable but semantically
+# distinct: the provider is healthy, just overloaded right now. Map to
+# 429 (Too Many Requests) so clients back off instead of escalating to
+# circuit-breaker territory like they would on a 503. Registered BEFORE
+# the parent handler so FastAPI's MRO match picks this one for busy
+# instances. Retry-After hint is verbatim from the raising site.
+@app.exception_handler(_ProviderBusy)
+async def _provider_busy_handler(request, exc: _ProviderBusy):
+    logger.info(
+        "Provider busy on %s: provider=%s reason=%s retry_after=%ds",
+        request.url.path, exc.provider_name, exc.reason, exc.retry_after_seconds,
+    )
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+        content={
+            "detail": {
+                "code": "PROVIDER_BUSY",
+                "providerName": exc.provider_name,
+                "reason": exc.reason,
+                "retryAfterSeconds": exc.retry_after_seconds,
+            }
+        },
+    )
 
 
 @app.exception_handler(_ProviderUnavailable)

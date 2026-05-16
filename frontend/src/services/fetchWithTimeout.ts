@@ -38,6 +38,9 @@ const REFRESH_URL = '/api/v1/auth/refresh'
 const SESSION_LOST_EVENT = 'auth:session-lost'
 const ACCESS_DENIED_EVENT = 'auth:access-denied'
 
+/** Cap how long we'll wait when honoring a server-provided Retry-After. */
+const RETRY_AFTER_MAX_MS = 5_000
+
 function readCookie(name: string): string | null {
   if (typeof document === 'undefined') return null
   const prefix = `${name}=`
@@ -108,6 +111,34 @@ async function tryRefresh(): Promise<boolean> {
 function notifySessionLost(): void {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new CustomEvent(SESSION_LOST_EVENT))
+}
+
+/**
+ * Parse the value of an HTTP ``Retry-After`` header. Returns the wait in
+ * milliseconds, capped to {@link RETRY_AFTER_MAX_MS}. Returns ``null``
+ * when the header is missing or malformed.
+ *
+ * Supports both the integer-seconds form (most common, what FastAPI
+ * emits) and the HTTP-date form. We add 10–250 ms of jitter so a fleet
+ * of clients receiving the same Retry-After don't all retry on the same
+ * tick — the thundering herd the load-shed signal exists to prevent.
+ */
+function parseRetryAfterMs(header: string | null): number | null {
+  if (!header) return null
+  const trimmed = header.trim()
+  if (!trimmed) return null
+
+  let ms: number | null = null
+  const asNum = Number(trimmed)
+  if (Number.isFinite(asNum) && asNum >= 0) {
+    ms = Math.floor(asNum * 1000)
+  } else {
+    const ts = Date.parse(trimmed)
+    if (!Number.isNaN(ts)) ms = ts - Date.now()
+  }
+  if (ms === null || ms < 0) return null
+  const jitter = 10 + Math.floor(Math.random() * 240)
+  return Math.min(RETRY_AFTER_MAX_MS, ms + jitter)
 }
 
 
@@ -242,6 +273,25 @@ export async function fetchWithTimeout(
       }
     }
     notifySessionLost()
+  }
+
+  // Server-side backpressure: 429 (queue saturated, fair-share cap) or
+  // 503 (provider unavailable / circuit open). Both carry Retry-After.
+  // We honor it ONCE with jitter on idempotent methods only — retrying a
+  // POST/PUT/PATCH would risk duplicate side-effects.
+  if ((res.status === 429 || res.status === 503) && SAFE_METHODS.has(method)) {
+    const waitMs = parseRetryAfterMs(res.headers.get('Retry-After'))
+    if (waitMs !== null) {
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs))
+      try {
+        return await runOnce(input, fetchInit, method, timeoutMs)
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          throw new TypeError('Request timed out (backend may be unavailable)')
+        }
+        throw err
+      }
+    }
   }
 
   // 403 surfaces as a non-blocking modal mounted by AppLayout. We do

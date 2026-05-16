@@ -494,7 +494,12 @@ export const LayerColumn = React.memo(function LayerColumn({
     <motion.div
       data-layer-id={layer.id}
       className={cn(
-        "flex flex-col relative group/column transition-all duration-300",
+        // pointer-events-auto re-establishes interactivity for all descendants.
+        // The parent columns wrapper is pointer-events-none (so inter-column
+        // gaps fall through to the edge hit-test layer); pointer-events is an
+        // inherited CSS property, so without this explicit `auto` chevrons,
+        // headers, and node cards would inherit `none` and become inert.
+        "flex flex-col relative group/column transition-all duration-300 pointer-events-auto",
         isCollapsed ? "min-w-[60px] max-w-[60px]" : "flex-1 min-w-[320px] max-w-[480px]"
       )}
       layout

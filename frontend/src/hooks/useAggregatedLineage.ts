@@ -8,6 +8,8 @@
 
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { useGraphProvider } from '@/providers/GraphProviderContext'
+import { mapWithConcurrency } from '@/lib/concurrency'
+import { fnv1a64 } from './lib/lineageCache'
 import type {
     AggregatedEdgeInfo,
     AggregatedEdgeResult,
@@ -126,20 +128,21 @@ const aggregatedEdgeCache = new Map<string, CacheEntry>()
 const CACHE_MAX_ENTRIES = 200
 const AGGREGATED_FETCH_BATCH_SIZE = 500
 
-// FNV-1a 64-bit, BigInt arithmetic. Returns a hex string. Avoids holding
-// multi-MB joined-URN strings in the cache key across hundreds of entries.
-const FNV_OFFSET_64 = 0xcbf29ce484222325n
-const FNV_PRIME_64 = 0x100000001b3n
-const FNV_MASK_64 = 0xffffffffffffffffn
-function fnv1a64(input: string): string {
-    let hash = FNV_OFFSET_64
-    for (let i = 0; i < input.length; i++) {
-        hash ^= BigInt(input.charCodeAt(i))
-        hash = (hash * FNV_PRIME_64) & FNV_MASK_64
-    }
-    return hash.toString(16)
-}
+/**
+ * Cap on parallel `/edges/aggregated` chunks. Aggregation is the
+ * single most expensive endpoint — letting a 100k-URN canvas fire all
+ * 200 chunks at once is a reliable way to saturate FalkorDB's single
+ * Cypher thread. 4 concurrent chunks is the sweet spot per Phase 0 load
+ * tests; tune via VITE_AGGREGATED_FETCH_CONCURRENCY.
+ */
+const AGGREGATED_FETCH_CONCURRENCY = (() => {
+    const fromEnv = Number(import.meta.env?.VITE_AGGREGATED_FETCH_CONCURRENCY)
+    return Number.isFinite(fromEnv) && fromEnv >= 1 ? fromEnv : 4
+})()
 
+// Cache key helper. The FNV-1a hash itself lives in hooks/lib/lineageCache
+// so useLineageStubs and any future lineage hook share the same compact-key
+// implementation. The shape of the key is per-hook (this one is per-pair).
 function getCacheKey(sourceUrns: string[], targetUrns: string[] | undefined, granularity: string): string {
     const srcHash = fnv1a64([...sourceUrns].sort().join(''))
     const tgtHash = targetUrns ? fnv1a64([...targetUrns].sort().join('')) : '0'
@@ -214,12 +217,17 @@ export function useAggregatedLineage(options: UseAggregatedLineageOptions = {}):
                 chunks.push(sourceUrns)
             }
 
-            const settled = await Promise.allSettled(
-                chunks.map(chunk => provider.getAggregatedEdges({
+            // Bound parallel chunks so a 200-chunk fan-out doesn't blow
+            // up the FalkorDB Cypher thread (single-threaded — every
+            // chunk competes for the same slot).
+            const settled = await mapWithConcurrency(
+                chunks,
+                AGGREGATED_FETCH_CONCURRENCY,
+                (chunk) => provider.getAggregatedEdges({
                     sourceUrns: chunk,
                     targetUrns,
                     granularity,
-                }))
+                }),
             )
 
             const fulfilled = settled

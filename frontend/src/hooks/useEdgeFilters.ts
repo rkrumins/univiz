@@ -322,10 +322,11 @@ export function useFilteredEdges(): {
         // Get highlighted edges
         const highlighted = edges.filter(e => highlightedEdgeIds.has(e.id))
 
-        // In isolate mode, only show highlighted edges
+        // In isolate mode, only show highlighted edges — composed AFTER type +
+        // direction filters so all three stack predictably for canvas rendering.
         const finalFiltered = isolateMode && highlightedEdgeIds.size > 0
-            ? typeFiltered.filter(e => highlightedEdgeIds.has(e.id))
-            : typeFiltered
+            ? directionFiltered.filter(e => highlightedEdgeIds.has(e.id))
+            : directionFiltered
 
         return {
             allEdges: edges,

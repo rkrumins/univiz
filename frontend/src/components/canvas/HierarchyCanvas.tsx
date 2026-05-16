@@ -66,7 +66,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
   const schema = useSchemaStore((s) => s.schema)
   const containmentEdgeTypes = useViewContainmentEdgeTypes()
   const lineageEdgeTypes = useViewLineageEdgeTypes()
-  const { loadChildren, loadingNodes, isLoading: isLoadingChildren } = useGraphHydration()
+  const { loadChildren, cancelChildLoad, loadingNodes, isLoading: isLoadingChildren } = useGraphHydration()
   useLoadingToast('hier-children', isLoadingChildren, 'Expanding hierarchy')
   const relationshipTypes = useViewRelationshipTypes()
   // Search state
@@ -248,12 +248,16 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     })
 
 
-    // If we are collapsing, stop here
-    if (isCurrentlyExpanded) return
+    // If we are collapsing, abort any pending/in-flight load for this node
+    // so a slow response doesn't repopulate a collapsed subtree.
+    if (isCurrentlyExpanded) {
+      cancelChildLoad(nodeId)
+      return
+    }
 
     // 2. Load Children using Generic Hook
     await loadChildren(nodeId)
-  }, [loadChildren, expandedNodes])
+  }, [loadChildren, cancelChildLoad, expandedNodes])
 
   // Expand/collapse all
   const expandAll = useCallback(() => {

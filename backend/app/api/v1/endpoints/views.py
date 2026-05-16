@@ -244,6 +244,21 @@ async def list_views(
     include_deleted: bool = Query(False, alias="includeDeleted"),
     deleted_only: bool = Query(False, alias="deletedOnly"),
     attention_only: bool = Query(False, alias="attentionOnly"),
+    include: List[str] = Query(
+        default_factory=list,
+        description=(
+            "Optional embedded resources. ``include=popular`` folds the "
+            "Explorer's trending strip into this response (under "
+            "``popular``) so the page only makes one request instead of "
+            "two."
+        ),
+    ),
+    popular_limit: int = Query(
+        10,
+        le=100,
+        alias="popularLimit",
+        description="Cap on the embedded popular list when include=popular.",
+    ),
     user=Depends(get_optional_user),
     claims: PermissionClaims = Depends(get_permission_claims),
     session: AsyncSession = Depends(get_db_session),
@@ -290,6 +305,16 @@ async def list_views(
         deleted_only=deleted_only,
         attention_only=attention_only,
     )
+
+    # Optional ?include=popular: fold the trending strip into the same
+    # response so the Explorer only makes one round-trip instead of two.
+    # ``list_popular_views`` enforces its own visibility scoping (private
+    # views only surface to their creator), so it does not need to pass
+    # through the RBAC post-filter below — popular IS the visible set.
+    if "popular" in include:
+        response.popular = await view_repo.list_popular_views(
+            session, limit=popular_limit, user_id=_user_id(user),
+        )
 
     if not rbac_flag("RBAC_ENFORCE_VIEWS"):
         return response
