@@ -36,7 +36,7 @@ _shared_pool: "IdPool | None" = None
 
 @dataclass
 class IdPool:
-    """Discovered workspace + datasource IDs available for a Locust user."""
+    """Discovered workspace + datasource + node IDs available for a Locust user."""
 
     workspace_ids: List[str] = field(default_factory=list)
     # Maps workspace_id → list of datasource IDs in that workspace, so
@@ -44,6 +44,12 @@ class IdPool:
     # (the /admin/workspaces/{ws}/datasources/{ds}/... routes 404 when
     # the ds isn't in the workspace).
     ws_to_ds: dict[str, List[str]] = field(default_factory=dict)
+    # Maps workspace_id → list of node URNs in that workspace's graph,
+    # used by the graph stress scenarios (trace/v2, ancestors,
+    # descendants, children). Populated by best-effort discovery — when
+    # the workspace has no graph data the inner list is empty and graph
+    # scenarios emit a no-node row instead of hammering 404s.
+    ws_to_urns: dict[str, List[str]] = field(default_factory=dict)
 
     def pick_workspace(self) -> Optional[str]:
         return random.choice(self.workspace_ids) if self.workspace_ids else None
@@ -51,6 +57,13 @@ class IdPool:
     def pick_ws_ds(self) -> Optional[Tuple[str, str]]:
         """Pick a (workspace_id, datasource_id) pair where the ds is in the ws."""
         candidates = [(w, ds) for w, dss in self.ws_to_ds.items() for ds in dss]
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def pick_ws_urn(self) -> Optional[Tuple[str, str]]:
+        """Pick a (workspace_id, node_urn) pair from the discovered set."""
+        candidates = [(w, urn) for w, urns in self.ws_to_urns.items() for urn in urns]
         if not candidates:
             return None
         return random.choice(candidates)
@@ -142,10 +155,40 @@ def _discover_uncached(client) -> IdPool:
                 it.get("id") for it in ds_items if isinstance(it, dict) and it.get("id")
             ]
 
+    # Enumerate node URNs per workspace via POST /nodes/query (the
+    # canonical replacement for the deprecated GET /nodes). Cap how
+    # many workspaces we probe and how many URNs we pull per workspace
+    # so a sweep against an empty cluster doesn't waste startup time —
+    # the graph stress scenarios only need a handful of valid URNs to
+    # randomise over.
+    urn_workspaces = pool.workspace_ids[: SETTINGS.urn_pool_workspaces]
+    for ws_id in urn_workspaces:
+        with client.post(
+            f"/api/v1/{ws_id}/graph/nodes/query",
+            json={"limit": SETTINGS.urns_per_workspace},
+            name="discover:nodes",
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 200:
+                logger.warning(
+                    "Node discovery for ws=%s returned HTTP %s — graph stress will emit no-node rows for it.",
+                    ws_id, resp.status_code,
+                )
+                resp.success()
+                continue
+            resp.success()
+            n_payload = resp.json() if resp.text else []
+        n_items = n_payload.get("data") if isinstance(n_payload, dict) else n_payload
+        if isinstance(n_items, list):
+            urns = [it.get("urn") for it in n_items if isinstance(it, dict) and it.get("urn")]
+            if urns:
+                pool.ws_to_urns[ws_id] = urns
+
     total_ds = sum(len(v) for v in pool.ws_to_ds.values())
+    total_urns = sum(len(v) for v in pool.ws_to_urns.values())
     logger.info(
-        "Discovered %d workspace(s), %d datasource(s) across them.",
-        len(pool.workspace_ids), total_ds,
+        "Discovered %d workspace(s), %d datasource(s), %d node URN(s) across them.",
+        len(pool.workspace_ids), total_ds, total_urns,
     )
     if not pool.workspace_ids:
         return _env_fallback(pool)

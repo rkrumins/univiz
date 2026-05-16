@@ -50,7 +50,10 @@ from lib.auth import authenticate, AuthError  # noqa: E402
 from lib.data import discover, IdPool  # noqa: E402
 from scenarios.aggregation_jobs import AggregationJobsTasks  # noqa: E402
 from scenarios.announcements import AnnouncementsTasks  # noqa: E402
+from scenarios.graph_children import GraphChildrenTasks  # noqa: E402
+from scenarios.graph_lineage import GraphLineageTasks  # noqa: E402
 from scenarios.graph_schema import GraphSchemaTasks  # noqa: E402
+from scenarios.graph_walks import GraphWalksTasks  # noqa: E402
 from scenarios.views import ViewsTasks  # noqa: E402
 from scenarios.workspaces import CachedStatsTasks  # noqa: E402
 
@@ -58,18 +61,20 @@ logger = logging.getLogger("synodic.loadtest")
 logging.basicConfig(level=logging.INFO)
 
 
-# Locust picks each task proportional to its weight. The five entries
-# sum to 11, giving the perf plan's read-heavy mix plus two low-weight
-# heavy slots so the concurrency sweep exercises the actually-load-
-# bearing endpoints (aggregation-jobs list and graph schema) instead
-# of only the cheap reads. Keep weights small so the ratios stay
-# readable; rebalance here when adding new scenarios.
+# Locust picks each task proportional to its weight. The mix biases
+# toward read-heavy traffic from the perf plan but reserves three
+# low-weight slots for the actual graph queries (trace/v2, ancestors/
+# descendants, children) — these are the Tier-1 hot paths in the
+# backend audit and must be in the sweep at scale.
 MIXED_TASKS = {
-    ViewsTasks: 5,             # contains list (weight 4) + popular (weight 1)
+    ViewsTasks: 5,              # contains list (4) + popular (1)
     CachedStatsTasks: 3,
     AnnouncementsTasks: 1,
-    AggregationJobsTasks: 1,   # Tier-2 heavy: full-table scan against aggregation schema
-    GraphSchemaTasks: 1,       # Tier-2 heavy: workspace-scoped schema introspection
+    AggregationJobsTasks: 1,    # Tier-2 heavy: full-table scan against aggregation schema
+    GraphSchemaTasks: 1,        # Tier-2 heavy: workspace-scoped schema introspection
+    GraphLineageTasks: 1,       # Tier-1 heavy: POST /graph/trace/v2
+    GraphWalksTasks: 1,         # Tier-1 heavy: GET ancestors / descendants
+    GraphChildrenTasks: 1,      # Tier-1 heavy: GET children / children-with-edges
 }
 
 

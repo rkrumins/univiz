@@ -42,6 +42,11 @@ class Settings:
     # How many workspace/datasource IDs to discover at startup. Caps the
     # discovery cost on huge tenants; sampling is fine for load tests.
     id_pool_limit: int
+    # How many workspaces to fetch graph node URNs from. Each adds one
+    # POST /nodes/query call to startup, so keep small.
+    urn_pool_workspaces: int
+    # Per-workspace URN sample size for the graph stress scenarios.
+    urns_per_workspace: int
     # Per-task think time (seconds). Locust's ``between(min, max)`` is
     # uniform; users may override per-scenario.
     think_min: float
@@ -59,6 +64,8 @@ class Settings:
             password=_env("SYNODIC_PASSWORD") or None,
             login_path=_env("SYNODIC_LOGIN_PATH", "/api/v1/auth/login"),
             id_pool_limit=_env_int("SYNODIC_ID_POOL_LIMIT", 50),
+            urn_pool_workspaces=_env_int("SYNODIC_URN_POOL_WORKSPACES", 5),
+            urns_per_workspace=_env_int("SYNODIC_URNS_PER_WORKSPACE", 20),
             think_min=_env_float("SYNODIC_THINK_MIN", 0.5),
             think_max=_env_float("SYNODIC_THINK_MAX", 2.5),
             log_failures=_env("SYNODIC_LOG_FAILURES", "false").lower() == "true",
