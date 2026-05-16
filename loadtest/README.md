@@ -22,13 +22,21 @@ loadtest/
 │   ├── cached_stats.py      # HttpUser wrapper around CachedStatsTasks
 │   ├── announcements.py     # HttpUser wrapper around AnnouncementsTasks
 │   ├── aggregation_jobs.py  # HttpUser wrapper around AggregationJobsTasks (heavy)
-│   └── graph_schema.py      # HttpUser wrapper around GraphSchemaTasks (heavy)
+│   ├── graph_schema.py      # HttpUser wrapper around GraphSchemaTasks (heavy)
+│   ├── graph_lineage.py     # HttpUser wrapper around GraphLineageTasks (Tier-1 stress)
+│   ├── graph_walks.py       # HttpUser wrapper around GraphWalksTasks (Tier-1 stress)
+│   └── graph_children.py    # HttpUser wrapper around GraphChildrenTasks (Tier-1 stress)
 └── scenarios/
     ├── views.py             # GET /views/ + /views/popular
     ├── workspaces.py        # GET /admin/workspaces/.../cached-stats
     ├── announcements.py     # GET /announcements
-    ├── aggregation_jobs.py  # GET /admin/aggregation-jobs       (Tier-2 heavy)
-    └── graph_schema.py      # GET /{ws}/graph/metadata/schema   (Tier-2 heavy)
+    ├── aggregation_jobs.py  # GET /admin/aggregation-jobs              (Tier-2 heavy)
+    ├── graph_schema.py      # GET /{ws}/graph/metadata/schema          (Tier-2 heavy)
+    ├── graph_lineage.py     # POST /{ws}/graph/trace/v2                (Tier-1 stress)
+    ├── graph_walks.py       # GET /{ws}/graph/nodes/{urn}/ancestors    (Tier-1 stress)
+    │                        # GET /{ws}/graph/nodes/{urn}/descendants
+    └── graph_children.py    # GET /{ws}/graph/nodes/{urn}/children     (Tier-1 stress)
+                             # GET /{ws}/graph/nodes/{urn}/children-with-edges
 ```
 
 ## Install
@@ -51,6 +59,8 @@ All knobs are env vars — no config files. The full set:
 | `SYNODIC_BEARER_TOKEN` | one of | — | Pre-issued JWT/service token (sent as `Authorization: Bearer ...`) |
 | `SYNODIC_USER` + `SYNODIC_PASSWORD` | one of | — | Cookie-login credentials (calls `/api/v1/auth/login`) |
 | `SYNODIC_ID_POOL_LIMIT` | no | `50` | How many workspace IDs to discover per user |
+| `SYNODIC_URN_POOL_WORKSPACES` | no | `5` | How many workspaces to fetch node URNs from (for graph stress scenarios) |
+| `SYNODIC_URNS_PER_WORKSPACE` | no | `20` | How many node URNs to sample per workspace |
 | `SYNODIC_THINK_MIN` / `SYNODIC_THINK_MAX` | no | `0.5` / `2.5` | Per-task think time range (seconds) |
 | `SYNODIC_FALLBACK_WS_ID` / `SYNODIC_FALLBACK_DS_ID` | no | — | Static ID list when admin discovery is denied (comma-separated) |
 | `SYNODIC_LOG_FAILURES` | no | `false` | If `true`, log every non-2xx response (chatty) |
@@ -161,19 +171,43 @@ These are starting points — re-tune them once you have CSVs at each tier. To r
 python -m lib.slo --tier 500 results/sweep/tier_500/run_stats.csv
 ```
 
-### Heavy scenarios in the mix
+### Heavy + graph scenarios in the mix
 
-`make sweep` runs [locustfile.py](locustfile.py), which since the heavy-scenario addition includes:
+`make sweep` runs [locustfile.py](locustfile.py), which now includes the graph stress scenarios alongside the original read-heavy mix:
 
-| Scenario | Weight | Endpoint | Notes |
+| Scenario | Weight | Endpoint | Tier |
 |---|---|---|---|
-| `ViewsTasks` | 5 | `GET /views/` + `/views/popular` | Existing read-heavy explorer traffic |
-| `CachedStatsTasks` | 3 | `GET /admin/workspaces/.../cached-stats` | Existing admin hot endpoint |
-| `AnnouncementsTasks` | 1 | `GET /announcements` | Polling traffic |
+| `ViewsTasks` | 5 | `GET /views/` + `/views/popular` | read-heavy |
+| `CachedStatsTasks` | 3 | `GET /admin/workspaces/.../cached-stats` | read-heavy |
+| `AnnouncementsTasks` | 1 | `GET /announcements` | read-heavy |
 | `AggregationJobsTasks` | 1 | `GET /admin/aggregation-jobs` | **Tier-2 heavy** — full-table scan |
 | `GraphSchemaTasks` | 1 | `GET /{ws}/graph/metadata/schema` | **Tier-2 heavy** — graph introspection |
+| `GraphLineageTasks` | 1 | `POST /{ws}/graph/trace/v2` | **Tier-1 stress** — multi-hop traversal |
+| `GraphWalksTasks` | 1 | `GET /{ws}/graph/nodes/{urn}/ancestors` and `/descendants` | **Tier-1 stress** |
+| `GraphChildrenTasks` | 1 | `GET /{ws}/graph/nodes/{urn}/children` and `/children-with-edges` | **Tier-1 stress** |
 
-The two heavy scenarios are intentionally low-weight (≈9 % each) so at 1000 users they generate stress without dominating the mix. Re-balance `MIXED_TASKS` in [locustfile.py](locustfile.py) when investigating a specific endpoint.
+The graph scenarios pick from a per-process pool of `(workspace, urn)` pairs discovered via `POST /{ws}/graph/nodes/query` (tunable via `SYNODIC_URN_POOL_WORKSPACES` and `SYNODIC_URNS_PER_WORKSPACE`). When the pool is empty — i.e. no graph data is seeded for any workspace — the scenarios emit a single `graph-*:no-node` stat row per call instead of 404-storming the backend, so a `make sweep` against an empty cluster still completes (and `lib.slo --tier N` will flag the missing graph rows under non-smoke gating).
+
+## Per-graph-endpoint stress
+
+When the mixed sweep shows a graph regression, isolate it with `make stress-*`. Each target re-uses the sweep tier list but hammers exactly one graph endpoint shape:
+
+```bash
+make stress-trace         # POST /graph/trace/v2 only, at 10 → 1000 users
+make stress-walks         # ancestors + descendants only
+make stress-children      # children + children-with-edges only
+make stress               # all three sequentially
+```
+
+Stress runs reuse `SWEEP_TIERS` / `SWEEP_RUN_TIME` / `SWEEP_SPAWN_RATE` by default; override with `STRESS_*` to vary independently of the mixed sweep:
+
+```bash
+STRESS_TIERS='100 500' STRESS_RUN_TIME=2m make stress-trace
+```
+
+CSVs land under `results/stress/<endpoint>/tier_<N>/`. Each tier is gated by the same `TIER_SLOS` table as the mixed sweep — the per-endpoint p95 entries (`graph-trace:v2`, `graph-ancestors:get`, `graph-descendants:get`, `graph-children:get`, `graph-children-edges:get`) carry deliberately loose ceilings at the 500 / 1000 tiers (these endpoints are FalkorDB-bound and high tail variance is expected). Re-tune the per-tier thresholds in [lib/slo.py](lib/slo.py) once you have a real baseline.
+
+`make stress-clean` removes `results/stress/`.
 
 ### Troubleshooting: 429 / 500 from `/auth/login`
 

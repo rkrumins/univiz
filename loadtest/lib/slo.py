@@ -75,6 +75,14 @@ SMOKE_SLOS: List[SLO] = [
     SLO(name="announcements:list", p95_ms_max=1000.0, min_request_count=1, failure_rate_max=0.05),
     SLO(name="aggregation-jobs:list", p95_ms_max=2000.0, min_request_count=1, failure_rate_max=0.05),
     SLO(name="graph-schema:get", p95_ms_max=2000.0, min_request_count=1, failure_rate_max=0.05),
+    # Graph traversal endpoints — FalkorDB-bound, more variance than the
+    # PG-bound endpoints above. p95 ceilings are deliberately loose for
+    # smoke runs; the tiered SLOs are where real gating happens.
+    SLO(name="graph-trace:v2", p95_ms_max=5000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="graph-ancestors:get", p95_ms_max=3000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="graph-descendants:get", p95_ms_max=3000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="graph-children:get", p95_ms_max=2000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="graph-children-edges:get", p95_ms_max=3000.0, min_request_count=1, failure_rate_max=0.05),
 ]
 
 # Tier-aware SLOs for the concurrency sweep (`make sweep`). The
@@ -96,6 +104,11 @@ TIER_SLOS: Dict[int, List[SLO]] = {
         SLO(name="announcements:list", p95_ms_max=100.0, failure_rate_max=0.01),
         SLO(name="aggregation-jobs:list", p95_ms_max=500.0, failure_rate_max=0.01),
         SLO(name="graph-schema:get", p95_ms_max=500.0, failure_rate_max=0.01),
+        SLO(name="graph-trace:v2", p95_ms_max=1500.0, failure_rate_max=0.01),
+        SLO(name="graph-ancestors:get", p95_ms_max=800.0, failure_rate_max=0.01),
+        SLO(name="graph-descendants:get", p95_ms_max=800.0, failure_rate_max=0.01),
+        SLO(name="graph-children:get", p95_ms_max=400.0, failure_rate_max=0.01),
+        SLO(name="graph-children-edges:get", p95_ms_max=600.0, failure_rate_max=0.01),
     ],
     100: [
         SLO(name="Aggregated", p95_ms_max=800.0, failure_rate_max=0.005),
@@ -105,6 +118,11 @@ TIER_SLOS: Dict[int, List[SLO]] = {
         SLO(name="announcements:list", p95_ms_max=200.0, failure_rate_max=0.01),
         SLO(name="aggregation-jobs:list", p95_ms_max=1000.0, failure_rate_max=0.01),
         SLO(name="graph-schema:get", p95_ms_max=1000.0, failure_rate_max=0.01),
+        SLO(name="graph-trace:v2", p95_ms_max=3000.0, failure_rate_max=0.01),
+        SLO(name="graph-ancestors:get", p95_ms_max=1500.0, failure_rate_max=0.01),
+        SLO(name="graph-descendants:get", p95_ms_max=1500.0, failure_rate_max=0.01),
+        SLO(name="graph-children:get", p95_ms_max=800.0, failure_rate_max=0.01),
+        SLO(name="graph-children-edges:get", p95_ms_max=1200.0, failure_rate_max=0.01),
     ],
     500: [
         SLO(name="Aggregated", p95_ms_max=1500.0, failure_rate_max=0.01),
@@ -114,6 +132,11 @@ TIER_SLOS: Dict[int, List[SLO]] = {
         SLO(name="announcements:list", p95_ms_max=400.0, failure_rate_max=0.02),
         SLO(name="aggregation-jobs:list", p95_ms_max=2500.0, failure_rate_max=0.02),
         SLO(name="graph-schema:get", p95_ms_max=2500.0, failure_rate_max=0.02),
+        SLO(name="graph-trace:v2", p95_ms_max=6000.0, failure_rate_max=0.02),
+        SLO(name="graph-ancestors:get", p95_ms_max=3000.0, failure_rate_max=0.02),
+        SLO(name="graph-descendants:get", p95_ms_max=3000.0, failure_rate_max=0.02),
+        SLO(name="graph-children:get", p95_ms_max=1500.0, failure_rate_max=0.02),
+        SLO(name="graph-children-edges:get", p95_ms_max=2500.0, failure_rate_max=0.02),
     ],
     1000: [
         SLO(name="Aggregated", p95_ms_max=3000.0, failure_rate_max=0.02),
@@ -123,6 +146,11 @@ TIER_SLOS: Dict[int, List[SLO]] = {
         SLO(name="announcements:list", p95_ms_max=800.0, failure_rate_max=0.03),
         SLO(name="aggregation-jobs:list", p95_ms_max=5000.0, failure_rate_max=0.03),
         SLO(name="graph-schema:get", p95_ms_max=5000.0, failure_rate_max=0.03),
+        SLO(name="graph-trace:v2", p95_ms_max=12000.0, failure_rate_max=0.03),
+        SLO(name="graph-ancestors:get", p95_ms_max=6000.0, failure_rate_max=0.03),
+        SLO(name="graph-descendants:get", p95_ms_max=6000.0, failure_rate_max=0.03),
+        SLO(name="graph-children:get", p95_ms_max=3000.0, failure_rate_max=0.03),
+        SLO(name="graph-children-edges:get", p95_ms_max=5000.0, failure_rate_max=0.03),
     ],
 }
 
