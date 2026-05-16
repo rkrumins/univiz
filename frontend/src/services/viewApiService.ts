@@ -108,6 +108,14 @@ export interface ViewListParams {
     deletedOnly?: boolean
     /** Return only views that need attention (stale, broken, or inactive). */
     attentionOnly?: boolean
+    /**
+     * Embedded resources the server should fold into the response.
+     * ``"popular"`` makes the response carry ``popular`` (the trending
+     * strip) so the Explorer needs one round-trip instead of two.
+     */
+    include?: ('popular')[]
+    /** Cap on the embedded ``popular`` list. Only honoured with ``include: ['popular']``. */
+    popularLimit?: number
 }
 
 /**
@@ -122,6 +130,12 @@ export interface ViewListResponse {
     total: number
     hasMore: boolean
     nextOffset: number | null
+    /**
+     * Embedded trending strip — present iff the caller passed
+     * ``include: ['popular']``. Lets the Explorer get its list + popular
+     * in one round-trip instead of two.
+     */
+    popular?: View[]
 }
 
 /** A single facet value with its row count. */
@@ -186,8 +200,19 @@ const apiFetch = authFetch
  * Returns a paginated envelope with ``items`` + ``total`` + ``hasMore`` +
  * ``nextOffset``. Callers that don't need pagination metadata should
  * read ``.items`` directly rather than guessing from array length.
+ *
+ * Pass ``include: ['popular']`` to fold the trending strip into the
+ * response (under ``popular``) so the Explorer page only makes one
+ * round-trip instead of two.
+ *
+ * ``signal`` lets callers cancel in-flight requests on rapid filter
+ * changes / unmount via a native ``AbortController`` — replaces the
+ * legacy "set a cancelled flag and ignore the response" idiom.
  */
-export async function listViews(params?: ViewListParams): Promise<ViewListResponse> {
+export async function listViews(
+    params?: ViewListParams,
+    signal?: AbortSignal,
+): Promise<ViewListResponse> {
     const sp = new URLSearchParams()
     if (params?.visibilityIn && params.visibilityIn.length > 0) {
         params.visibilityIn.forEach(v => sp.append('visibilityIn', v))
@@ -220,8 +245,13 @@ export async function listViews(params?: ViewListParams): Promise<ViewListRespon
     if (params?.includeDeleted) sp.set('includeDeleted', 'true')
     if (params?.deletedOnly) sp.set('deletedOnly', 'true')
     if (params?.attentionOnly) sp.set('attentionOnly', 'true')
+    if (params?.include) params.include.forEach(v => sp.append('include', v))
+    if (params?.popularLimit != null) sp.set('popularLimit', String(params.popularLimit))
     const qs = sp.toString()
-    return apiFetch<ViewListResponse>(`/api/v1/views/${qs ? `?${qs}` : ''}`)
+    return apiFetch<ViewListResponse>(
+        `/api/v1/views/${qs ? `?${qs}` : ''}`,
+        signal ? { signal } : undefined,
+    )
 }
 
 /** List the most-favourited enterprise-visible views */

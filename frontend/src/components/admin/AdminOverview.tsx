@@ -49,35 +49,66 @@ export function AdminOverview() {
             ])
             setProviderCount(providers.length)
 
-            const results: WsInsight[] = []
-            for (const ws of workspaces) {
-                let totalNodes = 0, totalEdges = 0
-                const allTypes = new Set<string>()
-                for (const ds of ws.dataSources || []) {
-                    // Use cached-stats endpoint (DB-only) — no provider dependency.
-                    // Returns the canonical {data, meta} envelope; ``fetchEnveloped``
-                    // unwraps and integrates with the per-(ws, ds) circuit breaker.
-                    const data = await fetchEnveloped<{
-                        nodeCount?: number
-                        edgeCount?: number
-                        entityTypeCounts?: Record<string, number>
-                    }>(
-                        `/api/v1/admin/workspaces/${ws.id}/datasources/${ds.id}/cached-stats`,
-                        { circuitScope: { workspaceId: ws.id, dataSourceId: ds.id } },
-                    )
-                    if (!data) continue
-                    totalNodes += data.nodeCount ?? 0
-                    totalEdges += data.edgeCount ?? 0
-                    Object.keys(data.entityTypeCounts ?? {}).forEach(t => allTypes.add(t))
-                }
-                results.push({
-                    ws,
-                    nodes: totalNodes,
-                    edges: totalEdges,
-                    sources: ws.dataSources?.length || 0,
-                    types: allTypes,
-                })
+            // Parallel fan-out over (workspace, datasource) pairs. The
+            // previous nested ``for ... of`` issued requests one at a
+            // time, so a page with N workspaces × M datasources took
+            // N*M serialised round-trips (and was visibly the worst
+            // offender behind the "lots of cached-stats requests"
+            // symptom). ``fetchEnveloped`` retains its per-(ws, ds)
+            // circuit breaker so a slow datasource still fails-fast
+            // without dragging down the rest.
+            type DsStats = {
+                wsId: string
+                nodes: number
+                edges: number
+                types: string[]
             }
+            const tasks: Promise<DsStats | null>[] = []
+            for (const ws of workspaces) {
+                for (const ds of ws.dataSources || []) {
+                    tasks.push((async () => {
+                        const data = await fetchEnveloped<{
+                            nodeCount?: number
+                            edgeCount?: number
+                            entityTypeCounts?: Record<string, number>
+                        }>(
+                            `/api/v1/admin/workspaces/${ws.id}/datasources/${ds.id}/cached-stats`,
+                            { circuitScope: { workspaceId: ws.id, dataSourceId: ds.id } },
+                        )
+                        if (!data) return null
+                        return {
+                            wsId: ws.id,
+                            nodes: data.nodeCount ?? 0,
+                            edges: data.edgeCount ?? 0,
+                            types: Object.keys(data.entityTypeCounts ?? {}),
+                        }
+                    })())
+                }
+            }
+            const settled = await Promise.allSettled(tasks)
+
+            // Reduce flat results back into per-workspace aggregates.
+            const byWs = new Map<string, { nodes: number; edges: number; types: Set<string> }>()
+            for (const r of settled) {
+                if (r.status !== 'fulfilled' || r.value === null) continue
+                const { wsId, nodes, edges, types } = r.value
+                const agg = byWs.get(wsId) ?? { nodes: 0, edges: 0, types: new Set<string>() }
+                agg.nodes += nodes
+                agg.edges += edges
+                for (const t of types) agg.types.add(t)
+                byWs.set(wsId, agg)
+            }
+
+            const results: WsInsight[] = workspaces.map(ws => {
+                const agg = byWs.get(ws.id) ?? { nodes: 0, edges: 0, types: new Set<string>() }
+                return {
+                    ws,
+                    nodes: agg.nodes,
+                    edges: agg.edges,
+                    sources: ws.dataSources?.length || 0,
+                    types: agg.types,
+                }
+            })
             setInsights(results)
         } catch (err) {
             console.error('Failed to load insights', err)
