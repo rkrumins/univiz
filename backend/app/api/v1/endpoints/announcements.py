@@ -13,10 +13,11 @@ Admin:
     GET    /api/v1/admin/announcements/config   — read config
     PUT    /api/v1/admin/announcements/config   — update config
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.auth.dependencies import require_admin
+from backend.app.common.http_caching import make_etag, maybe_not_modified
 from backend.app.db.engine import get_db_session
 from backend.app.db.repositories import announcement_repo, feature_flags_repo
 from backend.common.models.management import (
@@ -36,14 +37,41 @@ router = APIRouter()
 
 @router.get("", response_model=list[AnnouncementResponse])
 async def get_active_announcements(
+    request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_db_session),
 ):
     """Return all active announcements for banner display.
-    Returns empty list if 'announcementsEnabled' feature flag is off."""
+
+    Returns empty list if 'announcementsEnabled' feature flag is off.
+
+    ETag/304 — this endpoint is polled every 15s × every user, so the
+    response body is the same on the vast majority of requests. We
+    emit a strong ETag derived from the active-set's count + max
+    ``updated_at``: any add/edit/delete flips the tag; anything else
+    matches and we return 304 with no body. At 1000 users that turns
+    ~67 req/s of JSON serialisation into ~67 req/s of header-only
+    revalidation. The DB roundtrip stays — it's a single-table indexed
+    scan; the savings are body serialisation + bandwidth.
+    """
     values, _, _ = await feature_flags_repo.get_feature_flags(session)
-    if not values.get("announcementsEnabled", True):
-        return []
-    return await announcement_repo.get_active_announcements(session)
+    enabled = values.get("announcementsEnabled", True)
+    items = await announcement_repo.get_active_announcements(session) if enabled else []
+
+    # Composite tag: count guards against deletes (max updated_at alone
+    # would miss "one row removed but surviving rows are older"); max
+    # updated_at guards against in-place edits. The "enabled" bit means
+    # toggling the flag also flips the tag so clients revalidate.
+    max_updated = max((a.updated_at for a in items), default="")
+    etag = make_etag("announcements", enabled, len(items), max_updated)
+
+    not_modified = maybe_not_modified(request, etag)
+    if not_modified is not None:
+        return not_modified
+
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
+    return items
 
 
 @router.get("/config", response_model=AnnouncementConfigResponse)
