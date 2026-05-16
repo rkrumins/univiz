@@ -20,11 +20,15 @@ loadtest/
 ├── runners/
 │   ├── views.py             # HttpUser wrapper around ViewsTasks (for `-f`)
 │   ├── cached_stats.py      # HttpUser wrapper around CachedStatsTasks
-│   └── announcements.py     # HttpUser wrapper around AnnouncementsTasks
+│   ├── announcements.py     # HttpUser wrapper around AnnouncementsTasks
+│   ├── aggregation_jobs.py  # HttpUser wrapper around AggregationJobsTasks (heavy)
+│   └── graph_schema.py      # HttpUser wrapper around GraphSchemaTasks (heavy)
 └── scenarios/
     ├── views.py             # GET /views/ + /views/popular
     ├── workspaces.py        # GET /admin/workspaces/.../cached-stats
-    └── announcements.py     # GET /announcements
+    ├── announcements.py     # GET /announcements
+    ├── aggregation_jobs.py  # GET /admin/aggregation-jobs       (Tier-2 heavy)
+    └── graph_schema.py      # GET /{ws}/graph/metadata/schema   (Tier-2 heavy)
 ```
 
 ## Install
@@ -116,7 +120,9 @@ Run a single scenario:
 ```bash
 make smoke-announcements
 make smoke-views
-make smoke-cached-stats   # will surface as failed SLO if no workspaces are seeded
+make smoke-cached-stats        # will surface as failed SLO if no workspaces are seeded
+make smoke-aggregation-jobs    # Tier-2 heavy: admin jobs list (full-table scan)
+make smoke-graph-schema        # Tier-2 heavy: workspace schema introspection
 make smoke-mixed
 ```
 
@@ -131,6 +137,43 @@ PYTHON=.venv/bin/python LOCUST=.venv/bin/locust make smoke   # if using the venv
 CSVs land under `results/smoke/<scenario>/` so you can inspect a run after the fact. `make smoke-clean` wipes the directory.
 
 Smoke mode uses the relaxed `SMOKE_SLOS` from [lib/slo.py](lib/slo.py): per-endpoint `p95 < 1000–1500 ms`, aggregate failure rate `< 5%`, and `min_request_count = 1` (we just want to confirm the endpoint was actually hit). The full production SLOs in `DEFAULT_SLOS` are used by the unflagged `python -m lib.slo` invocation below.
+
+## Concurrency sweep
+
+For "how does the backend scale?" runs, `make sweep` walks the production traffic mix through a configurable list of user counts and gates each tier on its own SLO thresholds (`TIER_SLOS` in [lib/slo.py](lib/slo.py)). Defaults run 10 → 100 → 500 → 1000 users at 60 s per tier; total wall time ≈ 6 minutes plus ramp.
+
+```bash
+cd loadtest
+make sweep                                          # default tiers [10, 100, 500, 1000]
+SWEEP_TIERS='10 50 200' make sweep                  # custom tiers
+SWEEP_RUN_TIME=3m SWEEP_SPAWN_RATE=200 make sweep   # longer, faster ramp
+```
+
+Per-tier CSVs land at `results/sweep/tier_<N>/run_stats.csv`. The sweep stops at the first tier whose SLO check fails (so you find the breaking point without burning the rest of the budget). `make sweep-clean` removes the directory.
+
+### Tier-aware SLOs
+
+`TIER_SLOS` in [lib/slo.py](lib/slo.py) encodes a degradation curve: the same `views:list` endpoint is gated at `p95 < 150 ms` at 10 users, `< 300 ms` at 100, `< 600 ms` at 500, `< 1200 ms` at 1000. Failure rate is allowed to rise from 0.1 % to 3 % over the same range. Tiers not in the table fall back to the next-lower tier (so `--tier 250` uses the 100-user thresholds).
+
+These are starting points — re-tune them once you have CSVs at each tier. To run the SLO check on a CSV after the fact:
+
+```bash
+python -m lib.slo --tier 500 results/sweep/tier_500/run_stats.csv
+```
+
+### Heavy scenarios in the mix
+
+`make sweep` runs [locustfile.py](locustfile.py), which since the heavy-scenario addition includes:
+
+| Scenario | Weight | Endpoint | Notes |
+|---|---|---|---|
+| `ViewsTasks` | 5 | `GET /views/` + `/views/popular` | Existing read-heavy explorer traffic |
+| `CachedStatsTasks` | 3 | `GET /admin/workspaces/.../cached-stats` | Existing admin hot endpoint |
+| `AnnouncementsTasks` | 1 | `GET /announcements` | Polling traffic |
+| `AggregationJobsTasks` | 1 | `GET /admin/aggregation-jobs` | **Tier-2 heavy** — full-table scan |
+| `GraphSchemaTasks` | 1 | `GET /{ws}/graph/metadata/schema` | **Tier-2 heavy** — graph introspection |
+
+The two heavy scenarios are intentionally low-weight (≈9 % each) so at 1000 users they generate stress without dominating the mix. Re-balance `MIXED_TASKS` in [locustfile.py](locustfile.py) when investigating a specific endpoint.
 
 ### Troubleshooting: 429 / 500 from `/auth/login`
 

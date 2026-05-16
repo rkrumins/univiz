@@ -16,12 +16,22 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from config import SETTINGS  # loadtest/ is on sys.path via locustfile.py
 
 logger = logging.getLogger(__name__)
+
+# Process-wide shared discovery state. At 1000 concurrent users each
+# spawning would otherwise hit the admin workspaces endpoint 1000 times
+# during ramp-up, plus N×workspaces datasource-list calls — easily
+# saturating the admin tier before scenario traffic even starts.
+# Compute once per Locust process and reuse.
+_pool_lock = threading.Lock()
+_pool_done = False
+_shared_pool: "IdPool | None" = None
 
 
 @dataclass
@@ -51,14 +61,26 @@ def discover(client) -> IdPool:
 
     Calls ``GET /api/v1/admin/workspaces/`` and, for the first
     ``SETTINGS.id_pool_limit`` workspaces, ``GET /api/v1/admin/workspaces/
-    {ws_id}/datasources/`` to enumerate datasources. Errors are logged
+    {ws_id}/data-sources`` to enumerate datasources. Errors are logged
     and absorbed; the resulting :class:`IdPool` may be empty, in which
     case scenarios fall back to the env-configured static IDs.
 
-    The discovery itself counts as load — but Locust's stats panel
-    groups these under stable names so they don't pollute the
-    user-traffic percentiles.
+    Only the first user per Locust process actually hits the backend;
+    subsequent users get the cached pool. Keeps a 1000-user swarm from
+    pummeling the admin tier with redundant discovery calls during the
+    spawn-up window.
     """
+    global _pool_done, _shared_pool
+    with _pool_lock:
+        if _pool_done and _shared_pool is not None:
+            return _shared_pool
+        pool = _discover_uncached(client)
+        _shared_pool = pool
+        _pool_done = True
+        return pool
+
+
+def _discover_uncached(client) -> IdPool:
     pool = IdPool()
 
     with client.get(
@@ -90,13 +112,26 @@ def discover(client) -> IdPool:
 
     # Enumerate datasources per workspace. Cap the per-ws fetches; the
     # full Cartesian product is irrelevant for representative load.
+    #
+    # Path is `/data-sources` (with hyphen, no trailing slash) to match
+    # backend/app/api/v1/endpoints/workspaces.py:193 — the cached-stats
+    # endpoint at workspaces.py:393 uses `/datasources/{ds_id}` (no
+    # hyphen) which is a confusing inconsistency in the backend itself.
     for ws_id in pool.workspace_ids:
         with client.get(
-            f"/api/v1/admin/workspaces/{ws_id}/datasources/",
+            f"/api/v1/admin/workspaces/{ws_id}/data-sources",
             name="discover:datasources",
             catch_response=True,
         ) as resp:
             if resp.status_code != 200:
+                # Log loudly — silent suppression here hid a 404 caused
+                # by a path mismatch and left ws_to_ds empty, which then
+                # made the cached-stats scenario fire /__no_target__
+                # rows instead of real traffic.
+                logger.warning(
+                    "Datasource discovery for ws=%s returned HTTP %s — ws_to_ds will be empty for it.",
+                    ws_id, resp.status_code,
+                )
                 resp.success()
                 continue
             resp.success()
@@ -107,6 +142,11 @@ def discover(client) -> IdPool:
                 it.get("id") for it in ds_items if isinstance(it, dict) and it.get("id")
             ]
 
+    total_ds = sum(len(v) for v in pool.ws_to_ds.values())
+    logger.info(
+        "Discovered %d workspace(s), %d datasource(s) across them.",
+        len(pool.workspace_ids), total_ds,
+    )
     if not pool.workspace_ids:
         return _env_fallback(pool)
     return pool

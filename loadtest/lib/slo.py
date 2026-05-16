@@ -73,7 +73,73 @@ SMOKE_SLOS: List[SLO] = [
     SLO(name="views:popular", p95_ms_max=1000.0, min_request_count=1, failure_rate_max=0.05),
     SLO(name="cached-stats:get", p95_ms_max=1500.0, min_request_count=1, failure_rate_max=0.05),
     SLO(name="announcements:list", p95_ms_max=1000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="aggregation-jobs:list", p95_ms_max=2000.0, min_request_count=1, failure_rate_max=0.05),
+    SLO(name="graph-schema:get", p95_ms_max=2000.0, min_request_count=1, failure_rate_max=0.05),
 ]
+
+# Tier-aware SLOs for the concurrency sweep (`make sweep`). The
+# thresholds scale with user count so the gate encodes a realistic
+# degradation curve: the same endpoint can be 150 ms at 10 users and
+# 800 ms at 1000 users and still be considered "scaling acceptably".
+# Failure-rate ceiling rises gently — a 0.1% rate at 10 users is the
+# perf plan's target, but at 1000 users a 1% rate is more honest about
+# the long tail of pool exhaustion / transient backpressure.
+#
+# These are STARTING POINTS, not gospel. Re-tune from your own
+# baseline once you have CSVs at each tier.
+TIER_SLOS: Dict[int, List[SLO]] = {
+    10: [
+        SLO(name="Aggregated", p95_ms_max=500.0, failure_rate_max=0.001),
+        SLO(name="views:list", p95_ms_max=150.0, failure_rate_max=0.01),
+        SLO(name="views:popular", p95_ms_max=150.0, failure_rate_max=0.01),
+        SLO(name="cached-stats:get", p95_ms_max=300.0, failure_rate_max=0.01),
+        SLO(name="announcements:list", p95_ms_max=100.0, failure_rate_max=0.01),
+        SLO(name="aggregation-jobs:list", p95_ms_max=500.0, failure_rate_max=0.01),
+        SLO(name="graph-schema:get", p95_ms_max=500.0, failure_rate_max=0.01),
+    ],
+    100: [
+        SLO(name="Aggregated", p95_ms_max=800.0, failure_rate_max=0.005),
+        SLO(name="views:list", p95_ms_max=300.0, failure_rate_max=0.01),
+        SLO(name="views:popular", p95_ms_max=300.0, failure_rate_max=0.01),
+        SLO(name="cached-stats:get", p95_ms_max=500.0, failure_rate_max=0.01),
+        SLO(name="announcements:list", p95_ms_max=200.0, failure_rate_max=0.01),
+        SLO(name="aggregation-jobs:list", p95_ms_max=1000.0, failure_rate_max=0.01),
+        SLO(name="graph-schema:get", p95_ms_max=1000.0, failure_rate_max=0.01),
+    ],
+    500: [
+        SLO(name="Aggregated", p95_ms_max=1500.0, failure_rate_max=0.01),
+        SLO(name="views:list", p95_ms_max=600.0, failure_rate_max=0.02),
+        SLO(name="views:popular", p95_ms_max=600.0, failure_rate_max=0.02),
+        SLO(name="cached-stats:get", p95_ms_max=1000.0, failure_rate_max=0.02),
+        SLO(name="announcements:list", p95_ms_max=400.0, failure_rate_max=0.02),
+        SLO(name="aggregation-jobs:list", p95_ms_max=2500.0, failure_rate_max=0.02),
+        SLO(name="graph-schema:get", p95_ms_max=2500.0, failure_rate_max=0.02),
+    ],
+    1000: [
+        SLO(name="Aggregated", p95_ms_max=3000.0, failure_rate_max=0.02),
+        SLO(name="views:list", p95_ms_max=1200.0, failure_rate_max=0.03),
+        SLO(name="views:popular", p95_ms_max=1200.0, failure_rate_max=0.03),
+        SLO(name="cached-stats:get", p95_ms_max=2000.0, failure_rate_max=0.03),
+        SLO(name="announcements:list", p95_ms_max=800.0, failure_rate_max=0.03),
+        SLO(name="aggregation-jobs:list", p95_ms_max=5000.0, failure_rate_max=0.03),
+        SLO(name="graph-schema:get", p95_ms_max=5000.0, failure_rate_max=0.03),
+    ],
+}
+
+
+def slos_for_tier(n_users: int) -> List[SLO]:
+    """Pick the SLO list for a given concurrency tier.
+
+    Falls back to the next-lower tier if ``n_users`` isn't an exact
+    match (e.g. ``--tier 200`` uses the 100-user thresholds — the
+    next-higher tier would be too lax and hide regressions).
+    """
+    available = sorted(TIER_SLOS.keys())
+    chosen = available[0]
+    for t in available:
+        if t <= n_users:
+            chosen = t
+    return TIER_SLOS[chosen]
 
 
 def _parse_stats_csv(path: str) -> Dict[str, Dict[str, str]]:
@@ -161,19 +227,60 @@ def assert_slos(
 
 
 def main(argv: List[str]) -> int:
-    flags = [a for a in argv[1:] if a.startswith("--")]
-    positional = [a for a in argv[1:] if not a.startswith("--")]
+    args = argv[1:]
+    smoke = False
+    tier: Optional[int] = None
+    positional: List[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--smoke":
+            smoke = True
+        elif a == "--tier":
+            i += 1
+            if i >= len(args):
+                print("Usage: python -m lib.slo [--smoke | --tier N] <stats.csv>", file=sys.stderr)
+                return 2
+            try:
+                tier = int(args[i])
+            except ValueError:
+                print(f"--tier expects an integer, got {args[i]!r}", file=sys.stderr)
+                return 2
+        elif a.startswith("--tier="):
+            try:
+                tier = int(a.split("=", 1)[1])
+            except ValueError:
+                print(f"--tier expects an integer, got {a!r}", file=sys.stderr)
+                return 2
+        elif a.startswith("--"):
+            print(f"Unknown flag: {a}", file=sys.stderr)
+            return 2
+        else:
+            positional.append(a)
+        i += 1
+
     if len(positional) != 1:
-        print("Usage: python -m lib.slo [--smoke] <stats.csv>", file=sys.stderr)
+        print("Usage: python -m lib.slo [--smoke | --tier N] <stats.csv>", file=sys.stderr)
         return 2
-    smoke = "--smoke" in flags
+    if smoke and tier is not None:
+        print("--smoke and --tier are mutually exclusive", file=sys.stderr)
+        return 2
+
     csv_path = positional[0]
-    violations = assert_slos(
-        csv_path,
-        slos=SMOKE_SLOS if smoke else DEFAULT_SLOS,
-        skip_missing=smoke,
-    )
-    mode = "smoke" if smoke else "production"
+    if tier is not None:
+        slos = slos_for_tier(tier)
+        mode = f"tier-{tier}"
+        skip_missing = True  # heavy scenarios may not run at every tier
+    elif smoke:
+        slos = SMOKE_SLOS
+        mode = "smoke"
+        skip_missing = True
+    else:
+        slos = DEFAULT_SLOS
+        mode = "production"
+        skip_missing = False
+
+    violations = assert_slos(csv_path, slos=slos, skip_missing=skip_missing)
     if not violations:
         print(f"SLO check passed against {csv_path} ({mode} thresholds)")
         return 0

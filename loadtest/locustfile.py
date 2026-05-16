@@ -48,7 +48,9 @@ from locust import HttpUser, between, events  # noqa: E402
 from config import SETTINGS  # noqa: E402
 from lib.auth import authenticate, AuthError  # noqa: E402
 from lib.data import discover, IdPool  # noqa: E402
+from scenarios.aggregation_jobs import AggregationJobsTasks  # noqa: E402
 from scenarios.announcements import AnnouncementsTasks  # noqa: E402
+from scenarios.graph_schema import GraphSchemaTasks  # noqa: E402
 from scenarios.views import ViewsTasks  # noqa: E402
 from scenarios.workspaces import CachedStatsTasks  # noqa: E402
 
@@ -56,15 +58,18 @@ logger = logging.getLogger("synodic.loadtest")
 logging.basicConfig(level=logging.INFO)
 
 
-# The mix from the perf plan, expressed as Locust task weights. Locust
-# picks each task proportional to its weight, so 4:1:3:1 ≈ 44/11/33/11.
-# Close enough to the plan's 40/10/30/10; the remaining 10% slot is
-# left for the operator to add scenarios without re-balancing the
-# others. Keep weights small so the ratios stay readable.
+# Locust picks each task proportional to its weight. The five entries
+# sum to 11, giving the perf plan's read-heavy mix plus two low-weight
+# heavy slots so the concurrency sweep exercises the actually-load-
+# bearing endpoints (aggregation-jobs list and graph schema) instead
+# of only the cheap reads. Keep weights small so the ratios stay
+# readable; rebalance here when adding new scenarios.
 MIXED_TASKS = {
-    ViewsTasks: 5,            # contains list (weight 4) + popular (weight 1) — see ViewsTasks
+    ViewsTasks: 5,             # contains list (weight 4) + popular (weight 1)
     CachedStatsTasks: 3,
     AnnouncementsTasks: 1,
+    AggregationJobsTasks: 1,   # Tier-2 heavy: full-table scan against aggregation schema
+    GraphSchemaTasks: 1,       # Tier-2 heavy: workspace-scoped schema introspection
 }
 
 
