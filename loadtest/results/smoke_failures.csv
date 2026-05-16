@@ -1,3 +1,0 @@
-Method,Name,Error,Occurrences,First Seen,Last Seen
-GET,cached-stats:no-target,HTTPError('404 Client Error: Not Found for url: cached-stats:no-target'),36,2026-05-16T15:21:04Z,2026-05-16T15:21:21Z
-GET,views:list,HTTPError('401 Client Error: Unauthorized for url: views:list'),11,2026-05-16T15:21:04Z,2026-05-16T15:21:20Z
