@@ -48,6 +48,7 @@ from backend.app.db.repositories import (
 _WILDCARD_PREFIXES = (
     "workspace:view",
     "workspace:datasource",
+    "workspace:graph",
 )
 
 
@@ -183,6 +184,15 @@ _SEED_LEAVES: dict[str, frozenset[str]] = {
     "workspace:datasource": frozenset({
         "workspace:datasource:manage",
         "workspace:datasource:read",
+    }),
+    "workspace:graph": frozenset({
+        "workspace:graph:create",
+        "workspace:graph:read",
+        "workspace:graph:edit",
+        "workspace:graph:delete",
+        "workspace:graph:commit",
+        "workspace:graph:branch",
+        "workspace:graph:merge",
     }),
 }
 
