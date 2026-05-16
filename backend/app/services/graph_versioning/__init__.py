@@ -23,6 +23,14 @@ from .manifest import (  # noqa: F401
     build_snapshot,
     diff_snapshots,
 )
+from .validation import (  # noqa: F401
+    NodeSpec,
+    EdgeSpec,
+    OntologySpec,
+    Violation,
+    GraphValidationError,
+    validate_graph_state,
+)
 
 __all__ = [
     "node_content_hash",
@@ -34,4 +42,10 @@ __all__ = [
     "partition_for",
     "build_snapshot",
     "diff_snapshots",
+    "NodeSpec",
+    "EdgeSpec",
+    "OntologySpec",
+    "Violation",
+    "GraphValidationError",
+    "validate_graph_state",
 ]
