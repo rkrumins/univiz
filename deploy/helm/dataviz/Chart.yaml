@@ -1,0 +1,12 @@
+apiVersion: v2
+name: dataviz
+description: Synodic data lineage / visualization platform for GKE behind an Nginx ingress
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - dataviz
+  - synodic
+  - lineage
+  - gke
+home: https://github.com/rkrumins/dataviz

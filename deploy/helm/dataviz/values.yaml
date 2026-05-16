@@ -1,0 +1,105 @@
+# ── Images ────────────────────────────────────────────────────────────
+# Final image = "{registry}/{org}/{name}:{tag}". Build the 6 images from the
+# repo Dockerfiles and push to Docker Hub before deploying — no CI exists.
+image:
+  registry: docker.io
+  org: synodic
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ── Ingress (ingress-nginx, plain HTTP) ───────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  host: dataviz.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+
+# ── Non-secret config (rendered into a ConfigMap) ─────────────────────
+config:
+  logLevel: INFO
+  # Keep in sync with ingress.host.
+  corsAllowedOrigins: "http://dataviz.example.com"
+  graphProvider: falkordb
+  # EXTERNAL FalkorDB endpoint (managed / VM / other cluster).
+  falkordb:
+    host: REPLACE_ME_FALKORDB_HOST
+    port: "6379"
+    graphName: nexus_lineage
+  jwt:
+    algorithm: HS256
+    expiryMinutes: "60"
+  adminEmail: admin@synodic.local
+  aggregation:
+    jobTimeoutSecs: "7200"
+    workerConcurrency: "4"
+    maxConcurrentPerGraph: "2"
+  stats:
+    schedulerTickSecs: "30"
+    workerConcurrency: "2"
+    maxConcurrentPerGraph: "1"
+    defaultIntervalSecs: "300"
+    minIntervalSecs: "60"
+    maxDeliveryAttempts: "3"
+    drainTimeoutSecs: "60"
+    pollTimeoutSecs: "30"
+    pollTimeoutLargeSecs: "600"
+    pollLargeThreshold: "100000"
+
+# ── Secrets ───────────────────────────────────────────────────────────
+# create=true renders a Secret from the values below. For production prefer
+# create=false + an existingSecret you created out-of-band (kubectl/SealedSecret).
+# Required keys: MANAGEMENT_DB_URL, REDIS_URL, JWT_SECRET_KEY, ADMIN_PASSWORD,
+# CREDENTIAL_ENCRYPTION_KEY, and (if dbInit.enabled) DB_INIT_DSN.
+secrets:
+  create: true
+  existingSecret: ""
+  managementDbUrl: "postgresql+asyncpg://synodic:REPLACE_ME@REPLACE_ME_PG_HOST:5432/synodic"
+  redisUrl: "redis://REPLACE_ME_REDIS_HOST:6379/0"
+  jwtSecretKey: "REPLACE_ME"
+  adminPassword: "REPLACE_ME"
+  credentialEncryptionKey: ""
+  # Admin libpq DSN for the db-init Job (CREATE ROLE/DATABASE needs privileges).
+  dbInitDsn: "postgresql://postgres:REPLACE_ME@REPLACE_ME_PG_HOST:5432/postgres"
+
+# ── DB bootstrap Job (applies roles + schemas to external Postgres) ───
+# Idempotent. The 'aggregation' schema MUST exist before the control plane
+# runs Alembic. Runs as a Helm pre-install/pre-upgrade hook.
+dbInit:
+  enabled: true
+  image: postgres:16.4-alpine
+
+# ── Per-workload settings ─────────────────────────────────────────────
+services:
+  viz:
+    replicas: 2
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  graph:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  controlplane:
+    replicas: 1
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  worker:
+    replicas: 2
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  stats:
+    replicas: 1
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  frontend:
+    replicas: 2
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 128Mi }

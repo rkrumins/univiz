@@ -1,0 +1,110 @@
+{{- if .Values.dbInit.enabled }}
+{{- /*
+DB bootstrap runs as a Helm pre-install/pre-upgrade hook so the 'aggregation'
+schema exists before the control plane runs Alembic. Hooks run before normal
+resources, so DB_INIT_DSN is supplied via either a hook-scoped Secret
+(secrets.create) or a pre-existing existingSecret (already in-cluster).
+*/}}
+{{- $dbInitSecretName := "" }}
+{{- if .Values.secrets.existingSecret }}
+{{- $dbInitSecretName = .Values.secrets.existingSecret }}
+{{- else }}
+{{- $dbInitSecretName = "dataviz-db-init-secret" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dataviz-db-init-secret
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  DB_INIT_DSN: {{ .Values.secrets.dbInitDsn | quote }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dataviz-db-init-sql
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  01-roles.sql: |
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'synodic') THEN
+            CREATE ROLE synodic LOGIN PASSWORD 'synodic';
+        END IF;
+    END
+    $$;
+
+    SELECT 'CREATE DATABASE synodic OWNER synodic'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'synodic')\gexec
+
+    GRANT ALL PRIVILEGES ON DATABASE synodic TO synodic;
+  02-schemas.sql: |
+    \connect synodic synodic
+
+    CREATE SCHEMA IF NOT EXISTS aggregation AUTHORIZATION synodic;
+
+    GRANT ALL ON SCHEMA public TO synodic;
+    GRANT ALL ON SCHEMA aggregation TO synodic;
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataviz-db-init
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-init
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "dataviz.labels" . | nindent 8 }}
+        app.kubernetes.io/component: db-init
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: db-init
+          image: {{ .Values.dbInit.image | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              echo "Applying 01-roles.sql ..."
+              psql -v ON_ERROR_STOP=1 -d "$DB_INIT_DSN" -f /sql/01-roles.sql
+              echo "Applying 02-schemas.sql ..."
+              psql -v ON_ERROR_STOP=1 -d "$DB_INIT_DSN" -f /sql/02-schemas.sql
+              echo "DB init complete."
+          env:
+            - name: DB_INIT_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $dbInitSecretName }}
+                  key: DB_INIT_DSN
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+      volumes:
+        - name: sql
+          configMap:
+            name: dataviz-db-init-sql
+{{- end }}
