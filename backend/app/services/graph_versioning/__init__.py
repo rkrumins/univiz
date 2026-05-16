@@ -31,6 +31,15 @@ from .validation import (  # noqa: F401
     GraphValidationError,
     validate_graph_state,
 )
+from .commit import (  # noqa: F401
+    NodeState,
+    EdgeState,
+    VersionRow,
+    ChangeEvent,
+    CommitPlan,
+    EmptyCommitError,
+    plan_commit,
+)
 
 __all__ = [
     "node_content_hash",
@@ -48,4 +57,11 @@ __all__ = [
     "Violation",
     "GraphValidationError",
     "validate_graph_state",
+    "NodeState",
+    "EdgeState",
+    "VersionRow",
+    "ChangeEvent",
+    "CommitPlan",
+    "EmptyCommitError",
+    "plan_commit",
 ]
