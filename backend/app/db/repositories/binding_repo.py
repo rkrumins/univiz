@@ -12,12 +12,37 @@ handlers in those tables, plus the consistency check constraint on
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select, delete, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db.models import RoleBindingORM
+
+
+def _is_expired(expires_at: Optional[str], *, now: datetime) -> bool:
+    """True if a time-bound binding has lapsed.
+
+    ``expires_at`` is a nullable ISO-8601 string (NULL = never expires).
+    Parsed defensively: a value we can't parse is treated as
+    non-expiring so a malformed timestamp can never silently revoke a
+    legitimate grant — the alternative (fail-closed on parse error)
+    would lock users out on a bad write, which is worse than the
+    status quo where expiry wasn't enforced at all.
+    """
+    if not expires_at:
+        return False
+    raw = expires_at.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= now
 
 
 VALID_SUBJECT_TYPES = {"user", "group"}
@@ -133,7 +158,11 @@ async def list_for_user_with_groups(
     else:
         where = direct
     result = await session.execute(select(RoleBindingORM).where(where))
-    return list(result.scalars().all())
+    now = datetime.now(timezone.utc)
+    return [
+        b for b in result.scalars().all()
+        if not _is_expired(b.expires_at, now=now)
+    ]
 
 
 async def list_for_scope(

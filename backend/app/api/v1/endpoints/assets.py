@@ -9,6 +9,7 @@ from typing import List
 from fastapi import APIRouter, Body, Depends, HTTPException, Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.auth.dependencies import requires
 from backend.app.db.engine import get_db_session
 from backend.app.db.repositories import workspace_repo, assignment_repo
 from backend.common.models.management import (
@@ -17,6 +18,11 @@ from backend.common.models.management import (
 )
 
 router = APIRouter()
+
+# The router-level dependency in api.py enforces
+# ``workspace:datasource:read`` for every assets route; mutating routes
+# additionally require ``workspace:datasource:manage``.
+require_ws_manage = requires("workspace:datasource:manage", workspace="ws_id")
 
 
 async def _require_workspace(session: AsyncSession, ws_id: str) -> None:
@@ -43,6 +49,7 @@ async def create_rule_set(
     ws_id: str = Path(...),
     req: RuleSetCreateRequest = Body(...),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Create a new assignment rule set for this workspace."""
     await _require_workspace(session, ws_id)
@@ -68,6 +75,7 @@ async def delete_rule_set(
     ws_id: str = Path(...),
     rule_set_id: str = Path(...),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Delete an assignment rule set."""
     await _require_workspace(session, ws_id)

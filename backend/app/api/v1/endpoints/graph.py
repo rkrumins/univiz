@@ -28,12 +28,19 @@ from backend.app.services.stats_cache import (
     build_computing_envelope, build_envelope, build_error_envelope, build_meta,
     build_synthetic_schema, read_stats_cache,
 )
+from backend.app.auth.dependencies import requires
 from backend.app.db.engine import get_db_session
 from backend.app.providers.manager import provider_manager
 from backend.insights_service.enqueue import enqueue_stats_job_safe
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 router = APIRouter()
+
+# Workspace-scoped mutation gate. The router-level dependency in api.py
+# already enforces ``workspace:datasource:read`` for every graph route;
+# write routes additionally require ``workspace:datasource:manage`` so a
+# read-only workspace member cannot mutate the graph.
+require_ws_manage = requires("workspace:datasource:manage", workspace="ws_id")
 
 
 # ------------------------------------------------------------------ #
@@ -673,6 +680,7 @@ class SaveGraphRequest(BaseModel):
 async def save_graph(
     request: SaveGraphRequest,
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """Save custom graph nodes and edges."""
     success = await engine.save_custom_graph(request.nodes, request.edges)
@@ -892,6 +900,7 @@ async def refresh_introspection(
     ws_id: Optional[str] = None,
     dataSourceId: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Trigger a non-blocking refresh of the schema/introspection cache.
 
@@ -1018,6 +1027,7 @@ async def get_aggregated_edges(
 async def materialize_aggregated_edges(
     engine: ContextEngine = Depends(get_context_engine),
     batch_size: int = Body(1000, embed=True),
+    _: object = Depends(require_ws_manage),
 ):
     """
     Trigger batch materialization of AGGREGATED edges.
@@ -1042,6 +1052,7 @@ async def materialize_aggregated_edges(
 async def create_node(
     request: CreateNodeRequest = Body(...),
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """
     Create a new node with optional containment edge.
@@ -1057,6 +1068,7 @@ async def create_node(
 async def create_edge(
     request: CreateEdgeRequest = Body(...),
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """
     Create a directed edge between two existing nodes.
@@ -1072,6 +1084,7 @@ async def update_edge(
     edge_id: str,
     request: UpdateEdgeRequest = Body(...),
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """Update mutable properties of an existing edge. Edge type is immutable."""
     return await engine.update_edge(edge_id, request)
@@ -1081,6 +1094,7 @@ async def update_edge(
 async def delete_edge(
     edge_id: str,
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """Delete an edge by ID."""
     success = await engine.delete_edge(edge_id)
@@ -1116,6 +1130,7 @@ class AllowedEdgeOption(BaseModel):
 async def batch_commands(
     request: BatchCommandRequest = Body(...),
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """
     Execute a batch of graph mutation commands.

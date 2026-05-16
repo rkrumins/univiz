@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from backend.app.auth.dependencies import requires
 from .endpoints import (
     graph, assignments, providers, ontologies, workspaces,
     assets, context_models, catalog, views, features,
@@ -38,12 +40,15 @@ api_router.include_router(
 # ── Admin routers (workspace-centric) ───────────────────────────────
 api_router.include_router(
     providers.router, prefix="/admin/providers", tags=["admin:providers"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 api_router.include_router(
     catalog.router, prefix="/admin/catalog", tags=["admin:catalog"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 api_router.include_router(
     ontologies.router, prefix="/admin/ontologies", tags=["admin:ontologies"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 api_router.include_router(
     workspaces.router, prefix="/admin/workspaces", tags=["admin:workspaces"],
@@ -51,9 +56,11 @@ api_router.include_router(
 api_router.include_router(
     context_models.template_router, prefix="/admin/context-model-templates",
     tags=["admin:context-model-templates"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 api_router.include_router(
     features.router, prefix="/admin/features", tags=["admin:features"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 api_router.include_router(
     announcements.admin_router, prefix="/admin/announcements", tags=["admin:announcements"],
@@ -129,6 +136,7 @@ api_router.include_router(
 # Aggregation service: /api/v1/admin/...
 api_router.include_router(
     aggregation.router, prefix="/admin", tags=["admin:aggregation"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 # Stats service: /api/v1/admin/stats-polling
 api_router.include_router(
@@ -138,6 +146,7 @@ api_router.include_router(
 # Cache-only reads for pre-registration discovery.
 api_router.include_router(
     insights.router, prefix="/admin/insights", tags=["admin:insights"],
+    dependencies=[Depends(requires("system:admin"))],
 )
 
 # ── Top-level views (first-class, cross-workspace) ─────────────────
@@ -150,16 +159,20 @@ api_router.include_router(
 # (api_router is already mounted at /api/v1, so prefix is just /{ws_id}/graph)
 api_router.include_router(
     graph.router, prefix="/{ws_id}/graph", tags=["graph:workspace"],
+    dependencies=[Depends(requires("workspace:datasource:read", workspace="ws_id"))],
 )
 # Assignment compute (workspace-scoped)
 api_router.include_router(
     assignments.router, prefix="/{ws_id}/graph/assignments", tags=["assignments:workspace"],
+    dependencies=[Depends(requires("workspace:datasource:read", workspace="ws_id"))],
 )
 # Asset endpoints: /api/v1/{ws_id}/assets/rule-sets
 api_router.include_router(
     assets.router, prefix="/{ws_id}/assets", tags=["assets:workspace"],
+    dependencies=[Depends(requires("workspace:datasource:read", workspace="ws_id"))],
 )
 # Context models: /api/v1/{ws_id}/context-models
 api_router.include_router(
     context_models.router, prefix="/{ws_id}/context-models", tags=["context-models"],
+    dependencies=[Depends(requires("workspace:datasource:read", workspace="ws_id"))],
 )

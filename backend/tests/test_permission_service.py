@@ -251,3 +251,86 @@ async def test_resolve_overlapping_roles_in_same_workspace_take_union(db_session
         "workspace:view:create", "workspace:view:edit",
         "workspace:view:delete", "workspace:view:read",
     } <= perms
+
+
+# ── time-bound bindings (expires_at enforcement) ─────────────────────
+
+
+def _iso(dt) -> str:
+    return dt.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_resolve_excludes_expired_binding(db_session):
+    """A binding whose ``expires_at`` is in the past must not grant
+    any permissions through ``resolve``."""
+    from datetime import datetime, timedelta, timezone
+
+    await _seed_full_catalogue(db_session)
+    user_id = await _seed_user(db_session)
+    past = _iso(datetime.now(timezone.utc) - timedelta(hours=1))
+    await binding_repo.create_binding(
+        db_session,
+        subject_type="user", subject_id=user_id,
+        role_name="user", scope_type="workspace", scope_id="ws_a",
+        expires_at=past,
+    )
+
+    claims = await resolve(db_session, user_id)
+    assert claims.ws_perms == {}
+    assert not has_permission(
+        claims, "workspace:view:read", workspace_id="ws_a"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_includes_unexpired_and_null_expiry_bindings(db_session):
+    """A future ``expires_at`` and a NULL ``expires_at`` both still
+    grant permissions."""
+    from datetime import datetime, timedelta, timezone
+
+    await _seed_full_catalogue(db_session)
+    user_id = await _seed_user(db_session)
+    future = _iso(datetime.now(timezone.utc) + timedelta(days=1))
+
+    await binding_repo.create_binding(
+        db_session,
+        subject_type="user", subject_id=user_id,
+        role_name="viewer", scope_type="workspace", scope_id="ws_future",
+        expires_at=future,
+    )
+    await binding_repo.create_binding(
+        db_session,
+        subject_type="user", subject_id=user_id,
+        role_name="viewer", scope_type="workspace", scope_id="ws_forever",
+        expires_at=None,
+    )
+
+    claims = await resolve(db_session, user_id)
+    assert has_permission(
+        claims, "workspace:view:read", workspace_id="ws_future"
+    )
+    assert has_permission(
+        claims, "workspace:view:read", workspace_id="ws_forever"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_expired_global_admin_loses_implicit_allow(db_session):
+    """Regression: an expired global-admin binding must not keep
+    granting the system:admin implicit-allow."""
+    from datetime import datetime, timedelta, timezone
+
+    await _seed_full_catalogue(db_session)
+    user_id = await _seed_user(db_session)
+    past = _iso(datetime.now(timezone.utc) - timedelta(seconds=1))
+    await binding_repo.create_binding(
+        db_session,
+        subject_type="user", subject_id=user_id,
+        role_name="admin", scope_type="global",
+        expires_at=past,
+    )
+
+    claims = await resolve(db_session, user_id)
+    assert "system:admin" not in claims.global_perms
+    assert not has_permission(claims, "users:manage")
