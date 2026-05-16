@@ -62,15 +62,36 @@ def _id(prefix: str):
 # ------------------------------------------------------------------ #
 
 class UserGraphORM(GraphStoreBase):
-    """A user-authored graph (the "repository"). Soft-deletable,
-    optimistic-locked. ``ontology_id`` is NULL for ``schemaless``
-    graphs (default) and set when promoted to ``strict``."""
+    """A versioned graph (the "repository"). Soft-deletable,
+    optimistic-locked.
+
+    ``origin`` makes the model work for **both** kinds of graph under
+    one identical version-control engine:
+
+    * ``authored``  — created from scratch in the editor. Default
+      ``schemaless`` (``ontology_id`` NULL).
+    * ``connected`` — adopted from an existing provider data source via
+      a one-time genesis-import (provider → first commit; the inverse of
+      materialization). ``source_data_source_id`` records which
+      management ``workspace_data_sources`` row it was adopted from;
+      typically ``strict`` with an ``ontology_id``. Subsequent upstream
+      connector/aggregation refreshes land as automated commits on the
+      reserved ``upstream`` branch; users edit ``main`` and merge
+      ``upstream → main`` via the normal three-way merge.
+
+    A data source is only adopted on an explicit opt-in action — until
+    then connected graphs keep the untouched live-provider path.
+    ``ontology_id`` is NULL for ``schemaless`` graphs (default) and set
+    when ``strict``.
+    """
 
     __tablename__ = "user_graphs"
 
     id = Column(Text, primary_key=True, default=_id("g"))
     workspace_id = Column(Text, nullable=False)          # soft ref → management.workspaces
     ontology_id = Column(Text, nullable=True)            # soft ref → management.ontologies
+    origin = Column(Text, nullable=False, default="authored")
+    source_data_source_id = Column(Text, nullable=True)  # soft ref → management.workspace_data_sources (connected only)
     name = Column(Text, nullable=False)
     description = Column(Text, nullable=True)
     schema_mode = Column(Text, nullable=False, default="schemaless")
@@ -86,9 +107,14 @@ class UserGraphORM(GraphStoreBase):
     __table_args__ = (
         Index("idx_user_graphs_workspace", "workspace_id"),
         Index("idx_user_graphs_deleted", "deleted_at"),
+        Index("idx_user_graphs_source_ds", "source_data_source_id"),
         CheckConstraint(
             "schema_mode IN ('schemaless', 'strict')",
             name="ck_user_graphs_schema_mode",
+        ),
+        CheckConstraint(
+            "origin IN ('authored', 'connected')",
+            name="ck_user_graphs_origin",
         ),
     )
 

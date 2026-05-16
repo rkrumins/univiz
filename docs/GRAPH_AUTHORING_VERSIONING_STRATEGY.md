@@ -85,6 +85,36 @@ projection** for visualization. This was designed by four independent architect 
   `ProviderManager` cache key `(provider_id, graph_name)` — per-branch circuit breakers
   and semaphores come for free.
 
+## Existing vs from-scratch graphs (one unified model)
+
+The version-control engine is **origin-agnostic**: everything is keyed
+on `node_key`/`edge_key` (= provider URN / edge id), `schema_mode`, and
+a nullable `ontology_id`, so a graph's content does not depend on
+whether a human drew it or a connector ingested it. `user_graphs.origin`
+discriminates the two, both running the *identical* commit/branch/merge/
+audit machinery:
+
+- **`authored`** (from scratch) — editor writes → Graph Store DB
+  (system-of-record) → projected to FalkorDB. Default `schemaless`.
+- **`connected`** (existing graph) — a one-time **genesis-import**
+  writes the current provider graph as the *first commit*
+  (content-addressed) into the Graph Store DB. This is the **inverse of
+  materialization** (provider → SQL) and reuses the same aggregation
+  worker/checkpoint framework that already streams million-node provider
+  graphs. `source_data_source_id` records the adopted management
+  `workspace_data_sources` row; typically `strict` with an `ontology_id`.
+- **Upstream sync as commits** — after adoption, connector/aggregation
+  refreshes land as automated commits (bot author) on a reserved
+  `upstream` branch. Users edit `main`; `upstream → main` is the normal
+  three-way merge. This *adds* change-audit/blame/diff between syncs to
+  connected graphs (a product win, not just parity).
+- **Opt-in adoption** — a data source is adopted only on an explicit
+  "Enable version history" action. Until then connected graphs use the
+  untouched live-provider path (backward-compatible, bounded blast
+  radius). Auto-adopt-all is a possible later policy, deliberately not
+  the default (avoids forcing a huge genesis import on graphs nobody
+  wants versioned).
+
 ## Data model (new — all in the dedicated Graph Store DB)
 
 All tables below live in the **Graph Store DB** (`GRAPH_STORE_DB_URL`), not the
@@ -103,6 +133,7 @@ commit sequence (not `_now` Text) for ordering columns — both are load-bearing
 diff/partition-pruning correctness.
 
 - `user_graphs` — `id(g_)`, `workspace_id` FK, `ontology_id` FK **nullable**,
+  `origin` (`authored|connected`), `source_data_source_id` (soft ref, connected only),
   `schema_mode` (`schemaless|strict`), `default_branch`, `partition_count` (frozen at
   create, default 4096), `version` (optimistic lock), soft-delete + audit cols.
 - `graph_refs` — `id(gref_)`, `graph_id` FK, `name`, `ref_type` (`branch|tag`),
@@ -247,9 +278,11 @@ Tests use existing pytest + httpx async fixtures (mirror `test_api_graph.py`,
   *Verify:* create→stage→batch→commit→history roundtrip; two concurrent PATCH → one
   `409 stale_entity`; blame correctness; graphEditorStore unit tests
   (coalesce/undo/redo/temp-ID/onRefMoved); the ELK-no-relayout perf-guard test.
-- **Phase 2 — Branching, merge, materialization, views-at-ref.** Branch CRUD; three-way
-  merge (clean + conflict + resolution + post-merge integrity/cycle pass);
-  diff; `GraphMaterializationWorker`; view `sourceRef` pinning with
+- **Phase 2 — Branching, merge, materialization, views-at-ref, adoption.** Branch CRUD;
+  three-way merge (clean + conflict + resolution + post-merge integrity/cycle pass);
+  diff; `GraphMaterializationWorker`; **genesis-import / adoption of existing connected
+  graphs (provider → first commit, inverse-materialization job) + upstream-sync-as-commits
+  on the `upstream` branch**; view `sourceRef` pinning with
   `DerivedResponse` fresh/stale/computing; SSE presence + "review & rebase".
   *Verify:* `test_graph_merge.py` (clean, conflict payload, dangling_edge never
   auto-resolved, integrity re-run after resolution); `test_graph_materialization.py`
