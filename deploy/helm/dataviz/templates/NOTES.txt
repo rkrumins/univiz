@@ -1,9 +1,17 @@
 dataviz deployed to namespace "{{ .Release.Namespace }}" (release {{ .Release.Name }}).
 
+{{- $inCluster := or .Values.stores.falkordb.enabled .Values.stores.redis.enabled .Values.stores.postgres.enabled }}
 Prerequisites (NOT managed by this chart):
   1. ingress-nginx controller installed in the cluster.
+{{- if $inCluster }}
+  2. In-cluster stores enabled: falkordb={{ .Values.stores.falkordb.enabled }}
+     redis={{ .Values.stores.redis.enabled }} postgres={{ .Values.stores.postgres.enabled }}
+     (each runs as a StatefulSet with a PVC; ensure a default StorageClass).
+     Point the app at Service DNS: falkordb / redis / postgres.
+{{- else }}
   2. External Postgres (Cloud SQL), Redis (Memorystore), and FalkorDB
      reachable from the cluster.
+{{- end }}
   3. The 6 images built from the repo Dockerfiles and pushed to Docker Hub:
        {{ .Values.image.registry }}/{{ .Values.image.org }}/<name>:{{ .Values.image.tag }}
      where <name> = viz-service, graph-service, aggregation-controlplane,

@@ -63,6 +63,40 @@ secrets:
   credentialEncryptionKey: ""
   # Admin libpq DSN for the db-init Job (CREATE ROLE/DATABASE needs privileges).
   dbInitDsn: "postgresql://postgres:REPLACE_ME@REPLACE_ME_PG_HOST:5432/postgres"
+  # Only used when stores.postgres.enabled (in-cluster Postgres). Keep in
+  # sync with the password inside managementDbUrl.
+  postgresPassword: "REPLACE_ME"
+
+# ── In-cluster stateful backing stores (OPT-IN) ───────────────────────
+# Alternative to external/managed Cloud SQL + Memorystore + FalkorDB.
+# When enabled, point the app at the in-cluster Service DNS names:
+#   config.falkordb.host: falkordb
+#   secrets.redisUrl: redis://redis:6379/0
+#   secrets.managementDbUrl: postgresql+asyncpg://synodic:<pw>@postgres:5432/synodic
+# Enabling postgres makes it self-bootstrap the schema, so set
+# dbInit.enabled: false in that case.
+stores:
+  falkordb:
+    enabled: false
+    image: falkordb/falkordb:v4.16.0
+    storage: 10Gi
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 2Gi }
+  redis:
+    enabled: false
+    image: redis:7-alpine
+    storage: 5Gi
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  postgres:
+    enabled: false
+    image: postgres:16.4-alpine
+    storage: 20Gi
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 2Gi }
 
 # ── DB bootstrap Job (applies roles + schemas to external Postgres) ───
 # Idempotent. The 'aggregation' schema MUST exist before the control plane
