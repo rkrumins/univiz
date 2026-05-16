@@ -10,7 +10,7 @@ have a binding into. The legacy "everyone sees everything" behaviour
 returns when ``RBAC_ENFORCE_WORKSPACES=false`` / ``RBAC_ENFORCE_DATASOURCES=false``.
 """
 from typing import List
-from fastapi import APIRouter, Body, Depends, HTTPException, Path
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from backend.app.auth.dependencies import (
     rbac_flag,
     requires,
 )
+from backend.app.common.http_caching import make_etag, maybe_not_modified
 from backend.app.db.engine import get_db_session
 from backend.app.db.repositories import workspace_repo, provider_repo, ontology_definition_repo, data_source_repo
 from backend.app.providers.manager import provider_manager as provider_registry  # alias during migration
@@ -392,6 +393,7 @@ async def set_projection_mode(
 
 @router.get("/{workspace_id}/datasources/{ds_id}/cached-stats")
 async def get_cached_stats(
+    request: Request,
     workspace_id: str = Path(...),
     ds_id: str = Path(...),
     _user: User = Depends(requires("workspace:datasource:read", workspace="workspace_id")),
@@ -404,6 +406,13 @@ async def get_cached_stats(
     (counts, schema_stats, ontology_metadata, graph_schema). On miss,
     enqueues a background refresh and returns ``meta.status=computing``.
     Never 404 when the data source exists.
+
+    ETag/304 — the actual cached payload only changes when the stats
+    job updates ``cache.updated_at``. We emit a strong ETag derived
+    from (ds_id, updated_at) so clients that revalidate against an
+    unchanged row get a 304 with no body. The 304 is only available
+    on the cache-hit path (cold and expired-cache responses always
+    carry a fresh "computing" envelope so polling kicks off correctly).
     """
     import json
 
@@ -431,6 +440,17 @@ async def get_cached_stats(
     if tier == "expired":
         msg_id = await enqueue_stats_job_safe(ds_id, workspace_id)
         return JSONResponse(content=build_computing_envelope(ds_id, workspace_id, msg_id))
+
+    # Cache-hit path: short-circuit with 304 if the client already has
+    # this exact (ds_id, updated_at) tuple. The composite payload is a
+    # pure function of those two, so an ETag match means "your cached
+    # body is still byte-identical to what we'd send." Time-dependent
+    # meta fields (age_seconds, ttl_seconds, refreshing) are recomputed
+    # by the client from their cached updated_at — same accuracy.
+    etag = make_etag("cached-stats", ds_id, cache.updated_at)
+    not_modified = maybe_not_modified(request, etag)
+    if not_modified is not None:
+        return not_modified
 
     refreshing = False
     if tier == "stale":
@@ -467,7 +487,13 @@ async def get_cached_stats(
         refreshing=refreshing,
         updated_at=cache.updated_at,
     )
-    return JSONResponse(content=build_envelope(composite, meta))
+    return JSONResponse(
+        content=build_envelope(composite, meta),
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=0, must-revalidate",
+        },
+    )
 
 
 # ================================================================== #

@@ -51,6 +51,73 @@ async def test_list_active_announcements_returns_active_only(test_client: AsyncC
     assert "Active Ann" in names
 
 
+# ── ETag / 304 revalidation (WS-2) ─────────────────────────────────────
+
+async def test_announcements_sets_etag_header(test_client: AsyncClient):
+    """Every 200 response from /announcements carries an ETag so polling
+    clients have something to revalidate against. Without this the
+    polling-stampede mitigation in WS-6 can't short-circuit."""
+    resp = await test_client.get("/api/v1/announcements")
+    assert resp.status_code == 200
+    assert resp.headers.get("etag"), "missing ETag header on /announcements"
+    # Quoted strong-validator form per RFC 7232.
+    assert resp.headers["etag"].startswith('"') and resp.headers["etag"].endswith('"')
+
+
+async def test_announcements_returns_304_on_matching_if_none_match(test_client: AsyncClient):
+    """A second fetch with If-None-Match equal to the previous ETag
+    must return 304 with no body. This is the bandwidth saving — at
+    1000 users polling every 15s, ~95% of requests hit this path in
+    steady state."""
+    first = await test_client.get("/api/v1/announcements")
+    assert first.status_code == 200
+    etag = first.headers["etag"]
+
+    second = await test_client.get(
+        "/api/v1/announcements",
+        headers={"If-None-Match": etag},
+    )
+    assert second.status_code == 304
+    # 304 must not include an entity body (RFC 7232 §4.1).
+    assert second.content == b""
+    # The ETag is echoed so intermediaries can cache the validator.
+    assert second.headers.get("etag") == etag
+
+
+async def test_announcements_etag_flips_on_create(test_client: AsyncClient):
+    """The ETag must change whenever the active-set materially changes.
+    Otherwise clients would keep getting 304s and never see new
+    announcements — exactly the cache-poisoning class of bug."""
+    first = await test_client.get("/api/v1/announcements")
+    first_etag = first.headers["etag"]
+
+    await _create_announcement(test_client, "Fresh Banner", isActive=True)
+
+    second = await test_client.get("/api/v1/announcements")
+    second_etag = second.headers["etag"]
+    assert second_etag != first_etag, (
+        "ETag did not change after a new active announcement was added "
+        "— clients would never revalidate to see new banners."
+    )
+
+
+async def test_announcements_304_with_stale_etag(test_client: AsyncClient):
+    """An obsolete If-None-Match must fall through to a 200 with the
+    current ETag — guarding against a 304 cache-poisoning bug where
+    we always 304 regardless of which tag the client sent."""
+    await _create_announcement(test_client, "Current", isActive=True)
+    current = await test_client.get("/api/v1/announcements")
+    current_etag = current.headers["etag"]
+
+    resp = await test_client.get(
+        "/api/v1/announcements",
+        headers={"If-None-Match": '"obviously-stale-tag"'},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["etag"] == current_etag
+    assert "Current" in [a["title"] for a in resp.json()]
+
+
 # ── Public: GET /announcements/config ─────────────────────────────────
 
 async def test_get_announcement_config_public(test_client: AsyncClient):
