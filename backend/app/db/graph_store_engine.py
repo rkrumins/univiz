@@ -365,6 +365,10 @@ async def init_graph_store_db() -> None:
             else:
                 # Fallback: create_all from the isolated metadata. No-op
                 # once every table already exists (checkfirst=True).
+                # Importing the models module is what registers the
+                # tables onto graph_store_metadata.
+                from backend.app.db import models_graph as _gs_models  # noqa: F401
+
                 engine = get_graph_store_engine(GraphStorePoolRole.ADMIN)
                 async with engine.begin() as conn:
                     await conn.run_sync(
