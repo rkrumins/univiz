@@ -113,6 +113,7 @@ export function GraphCanvas({ className }: { className?: string }) {
   const rawEdges = useCanvasStore((s) => s.edges)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
   const selectedNodeId = selectedNodeIds[0] ?? null
+  const drawerNodeId = useCanvasStore((s) => s.drawerNodeId)
   // 3. Schema / ontology
   const schema = useSchemaStore((s) => s.schema)
   const containmentEdgeTypes = useViewContainmentEdgeTypes()
@@ -643,6 +644,13 @@ export function GraphCanvas({ className }: { className?: string }) {
     async (nodeId: string) => {
       // Register manual override so semantic zoom doesn't undo this action
       semanticZoom.registerManualOverride(nodeId)
+
+      // A child load for this node is already in flight. Ignore repeat
+      // clicks until it settles: otherwise an impatient second click reads
+      // committed state as expanded, collapses the node, and cancels the
+      // in-flight fetch — forcing a third click to actually load. Collapse
+      // works normally once the load completes (finally clears pendingLoadRef).
+      if (pendingLoadRef.current.has(nodeId)) return
 
       let wasExpanded = false
       setExpandedNodes((prev) => {
@@ -1368,7 +1376,7 @@ export function GraphCanvas({ className }: { className?: string }) {
 
       {/* Panels */}
       <AnimatePresence>
-        {isEdgePanelOpen && (
+        {!drawerNodeId && isEdgePanelOpen && (
           <EdgeDetailPanel
             isOpen={isEdgePanelOpen}
             onClose={closeEdgePanel}
