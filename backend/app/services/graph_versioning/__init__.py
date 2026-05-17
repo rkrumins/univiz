@@ -40,6 +40,11 @@ from .commit import (  # noqa: F401
     EmptyCommitError,
     plan_commit,
 )
+from .snapshot_reader import (  # noqa: F401
+    rebuild_snapshot,
+    apply_changes,
+    WorkingSetError,
+)
 
 __all__ = [
     "node_content_hash",
@@ -64,4 +69,7 @@ __all__ = [
     "CommitPlan",
     "EmptyCommitError",
     "plan_commit",
+    "rebuild_snapshot",
+    "apply_changes",
+    "WorkingSetError",
 ]

@@ -112,6 +112,15 @@ def _canonical_entries_bytes(entries: Mapping[str, tuple[str, str]]) -> bytes:
     return json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def decode_partition_entries(canonical: bytes) -> dict[str, tuple[str, str]]:
+    """Inverse of :func:`_canonical_entries_bytes` — reconstruct the
+    ``key -> (kind, content_hash)`` map from the stored (un-gzipped)
+    canonical bytes. Used by the snapshot reader to rebuild a Snapshot
+    from persisted partition manifests."""
+    rows = json.loads(canonical.decode("utf-8"))
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
 def _partition_hash(entries: Mapping[str, tuple[str, str]]) -> str:
     if not entries:
         return _EMPTY_PARTITION_HASH
