@@ -192,6 +192,12 @@ export function LineageFlowOverlay({
 
           const minY = Math.min(sy, ty)
           const maxY = Math.max(sy, ty)
+          // Arc-aware bounding box. Reverse edges bow well past their
+          // anchors; the virtualization filter must keep the edge while
+          // any part of that arc is on-screen, not just the endpoints.
+          let arcMinY = minY
+          let arcMaxY = maxY
+          let isRev = false
 
           let pathD = ''
           const isSameColumn = Math.abs(sRect.left - tRect.left) < 50
@@ -206,6 +212,15 @@ export function LineageFlowOverlay({
             && !isSameColumn
             && Math.abs(sRect.top - tRect.top) < ROW_OVERLAP_PX
 
+          // Backward / upstream edge: the target sits visually left of the
+          // source (`tx < sx`) or projection flagged it. Detected from live
+          // pixel positions so it also covers ghost / bundled / delegated
+          // edges the layer-index map never flagged. The 4px slack avoids
+          // catching near-vertical pairs already owned by isSameColumn.
+          const isBackward = !isSelf
+            && !isSameColumn
+            && ((edge as any).isReverseFlow === true || tx < sx - 4)
+
           // Same-column branch — route through the LEFT gutter (instead of
           // the right-margin fan that visually collides with cross-layer
           // outgoing edges in the column gap). Every edge stays visible —
@@ -216,6 +231,31 @@ export function LineageFlowOverlay({
             tx = tRect.left - containerRect.left - 6
             const curveDist = -(24 + index * 8)  // negative = leftward
             pathD = `M ${sx} ${sy} C ${sx + curveDist} ${sy}, ${tx + curveDist} ${ty}, ${tx} ${ty}`
+          } else if (isBackward) {
+            // Reverse-flow reroute. Anchor on the INNER-facing sides so the
+            // path stays between the two nodes and never balloons past the
+            // container edges (the old override kept the right-of-source /
+            // left-of-target anchors, which clipped off-canvas whenever the
+            // source was in the rightmost layer or the target in the
+            // leftmost). Exit the source's LEFT side, enter the target's
+            // RIGHT side.
+            isRev = true
+            sx = sRect.left - containerRect.left - 6
+            tx = tRect.right - containerRect.left + 6
+            // Auto side: bow over the top when the target sits at/above the
+            // source, otherwise under the bottom — keeps the arc on the
+            // shorter side and naturally splits opposing edges into separate
+            // lanes. Per-edge stagger prevents reverse edges sharing a
+            // corridor from stacking on top of each other. Depth is keyed to
+            // the vertical gap (not horizontal distance) and clamped so long
+            // multi-layer backward edges don't dip off-canvas.
+            const goUp = ty <= sy
+            const sign = goUp ? -1 : 1
+            const lane = 24 + index * 10
+            const bow = sign * Math.min(120, Math.max(40, Math.abs(ty - sy) * 0.5) + lane)
+            pathD = `M ${sx} ${sy} C ${sx - 48} ${sy + bow}, ${tx + 48} ${ty + bow}, ${tx} ${ty}`
+            arcMinY = Math.min(minY, sy + Math.min(0, bow), ty + Math.min(0, bow))
+            arcMaxY = Math.max(maxY, sy + Math.max(0, bow), ty + Math.max(0, bow))
           } else if (isSibling) {
             // Direction: left-to-right (downstream) → route ABOVE the row band.
             // Right-to-left (upstream) → route BELOW. Separating directions
@@ -315,28 +355,11 @@ export function LineageFlowOverlay({
             dynamicStrokeWidth = Math.max(1, baseStrokeWidth * 0.7)
           }
 
-          // Reverse-flow geometric reroute only — no visual styling change.
-          // The edge points back upstream (target layer < source layer);
-          // routing it through a deeper sub-row arc keeps the forward
-          // flow uncluttered (no zigzag through other rows). Visually it
-          // reads identically to forward edges: same type color, same
-          // gradient fade, same chevron animation, same arrowhead. Only
-          // the path geometry differs.
-          let isRev = false
-          if ((edge as any).isReverseFlow) {
-            isRev = true
-            const dist = Math.abs(tx - sx)
-            const arcDepth = Math.max(60, dist * 0.35)
-            const cx1 = sx + Math.max(40, dist * 0.25)
-            const cx2 = tx - Math.max(40, dist * 0.25)
-            pathD = `M ${sx} ${sy} C ${cx1} ${sy + arcDepth}, ${cx2} ${ty + arcDepth}, ${tx} ${ty}`
-          }
-
           newComputedEdges.push({
             id: edge.id,
             source: edge.source,
             target: edge.target,
-            minY, maxY, pathD, color, dynamicStrokeWidth, edgeOpacity,
+            minY: arcMinY, maxY: arcMaxY, pathD, color, dynamicStrokeWidth, edgeOpacity,
             isGhost: edge.isGhost || false,
             isBundled: edge.isBundled || false,
             edgeCount: edge.edgeCount || 0,
@@ -771,7 +794,15 @@ export function LineageFlowOverlay({
           const isTargetHovered = hoveredEdgeId === edge.target
           // Highlight on hover OR when connected to the selected node
           const isHighlighted = isHovered || isSourceHovered || isTargetHovered || (isHighlightActive && highlightedEdges?.has(edge.id))
-          const { pathD, color, dynamicStrokeWidth, edgeOpacity, isGhost, isBundled, sx, sy, tx, ty } = edge
+          const { pathD, color, dynamicStrokeWidth, edgeOpacity, isGhost, isBundled, sx, sy, tx, ty, isReverseFlow } = edge
+          // Reverse / upstream edges get a distinct premium "return" signature:
+          // a finer dashed cadence (separate from ghost), slightly softer
+          // core, and no bundle bolding — so backward flow reads clearly as
+          // secondary to the dominant left→right flow without a new color.
+          const isReturn = !!isReverseFlow && !isGhost
+          const returnStrokeWidth = isReturn
+            ? Math.min(dynamicStrokeWidth, isBundled ? 2.2 : dynamicStrokeWidth)
+            : dynamicStrokeWidth
           // Staged-change marker — colored halo around the edge if there's a pending change.
           const stagedEdgeColor: string | undefined = stagedEdgeColorByEdgeId.get(edge.id)
 
@@ -871,16 +902,18 @@ export function LineageFlowOverlay({
                   is encoded in the line itself (faded at source, full at
                   target). strokeOpacity is intentionally 1 when the gradient
                   carries opacity in its stops; a fixed opacity is used when
-                  the solid-color fallback runs. Reverse-flow edges use the
-                  same styling as forward — only their path geometry differs. */}
+                  the solid-color fallback runs. Reverse-flow edges keep the
+                  directional gradient + arrowhead but get a distinct dashed
+                  "return" cadence and a softer core so backward flow reads
+                  as secondary to the dominant left→right flow. */}
               <path
                 d={pathD}
                 style={{
                   stroke: isPremiumLook ? `url(#${gradId})` : color,
-                  strokeWidth: dynamicStrokeWidth,
+                  strokeWidth: returnStrokeWidth,
                   fill: 'none',
-                  strokeOpacity: isPremiumLook ? 1 : coreOpacity,
-                  strokeDasharray: isGhost ? '6 4' : 'none',
+                  strokeOpacity: isPremiumLook ? (isReturn ? 0.85 : 1) : (isReturn ? coreOpacity * 0.85 : coreOpacity),
+                  strokeDasharray: isGhost ? '6 4' : (isReturn ? '7 5' : 'none'),
                   strokeLinecap: 'round',
                   transition: 'stroke-width 0.2s ease',
                 }}
