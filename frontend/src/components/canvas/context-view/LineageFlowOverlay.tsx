@@ -6,6 +6,21 @@ import { useStagedChangesStore } from '@/store/stagedChangesStore'
 // Global visibility tracker — which layer-node-* elements are currently in the viewport
 const globalVisibleNodes = new Set<string>()
 
+// Same-column edges route through a left lane. Lane `index`'s leftmost
+// control point sits at node.left - SAME_COLUMN_LANE_START - (BASE +
+// index * STEP) from the container left edge. These are exported so the
+// canvas can reserve a matching scroll-content gutter (see
+// EXTREMITY_EDGE_GUTTER_PX) and the two stay in sync.
+export const SAME_COLUMN_LANE_START = 6
+export const SAME_COLUMN_LANE_BASE = 24
+export const SAME_COLUMN_LANE_STEP = 8
+// Horizontal gutter reserved on each side of the layer columns so the
+// outermost same-column lanes (and the rightmost columns' outgoing-edge
+// starts) aren't clipped by the overflow-auto scroll container. Sized to
+// keep the first 4 lanes unclipped (≈ 62px).
+export const EXTREMITY_EDGE_GUTTER_PX =
+  SAME_COLUMN_LANE_START + SAME_COLUMN_LANE_BASE + SAME_COLUMN_LANE_STEP * 4
+
 export function LineageFlowOverlay({
   nodes,
   edges,
@@ -212,9 +227,9 @@ export function LineageFlowOverlay({
           // lineage tools must show every connection by default; rolling
           // up intra-column edges into a chip hides what the user came to see.
           if (isSameColumn && !isSelf) {
-            sx = sRect.left - containerRect.left - 6
-            tx = tRect.left - containerRect.left - 6
-            const curveDist = -(24 + index * 8)  // negative = leftward
+            sx = sRect.left - containerRect.left - SAME_COLUMN_LANE_START
+            tx = tRect.left - containerRect.left - SAME_COLUMN_LANE_START
+            const curveDist = -(SAME_COLUMN_LANE_BASE + index * SAME_COLUMN_LANE_STEP)  // negative = leftward
             pathD = `M ${sx} ${sy} C ${sx + curveDist} ${sy}, ${tx + curveDist} ${ty}, ${tx} ${ty}`
           } else if (isSibling) {
             // Direction: left-to-right (downstream) → route ABOVE the row band.

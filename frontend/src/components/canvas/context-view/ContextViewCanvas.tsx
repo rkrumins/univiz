@@ -68,7 +68,7 @@ import { useHighlightState, useHoverHighlight, useHoveredNodeId } from '@/hooks/
 import { useTraceFilteredHierarchy } from '@/hooks/useTraceFilteredHierarchy'
 import { computeTraceMergeSpine } from '@/hooks/lib/traceMergeSpine'
 import { LayerColumn } from './LayerColumn'
-import { LineageFlowOverlay } from './LineageFlowOverlay'
+import { LineageFlowOverlay, EXTREMITY_EDGE_GUTTER_PX } from './LineageFlowOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
 import { useLoadingToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
@@ -1653,15 +1653,17 @@ export function ContextViewCanvas({
               LayerColumn / FlatTreeItem elements default to pointer-events:
               auto and continue to receive their own hover/click events.
           */}
-          {/* px-[60px] reserves left/right gutters inside the scroll content
-              so edges that bow into the leftmost column (same-column lane
-              routes leftward at curveDist = -(24 + index*8) in
-              LineageFlowOverlay) or leave the rightmost column (start at
-              node.right + 6) are not clipped by the overflow-auto scroll
-              container. The overlay SVG spans the full viewport, so insetting
-              the columns keeps those curves within the visible box at the
-              scroll extremes. */}
-          <div className="flex h-full min-h-0 relative z-30 gap-12 px-[60px] pointer-events-none">
+          {/* Left/right gutters inside the scroll content so edges that bow
+              into the leftmost column or leave the rightmost column aren't
+              clipped by the overflow-auto scroll container. The width is
+              derived from LineageFlowOverlay's same-column lane math
+              (EXTREMITY_EDGE_GUTTER_PX) so the two stay in sync. The overlay
+              SVG spans the full viewport, so insetting the columns keeps
+              those curves within the visible box at the scroll extremes. */}
+          <div
+            className="flex h-full min-h-0 relative z-30 gap-12 pointer-events-none"
+            style={{ paddingLeft: EXTREMITY_EDGE_GUTTER_PX, paddingRight: EXTREMITY_EDGE_GUTTER_PX }}
+          >
             {sortedLayers.map((layer) => (
               <LayerColumn
                 key={layer.id}
