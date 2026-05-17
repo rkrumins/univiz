@@ -1419,28 +1419,31 @@ export function ContextViewCanvas({
 
   // Render-mode resolution: `raw` shows every projected edge; `stubs`
   // suppresses them in favour of per-node stub indicators; `auto` flips
-  // between the two based on `autoStubThreshold`. Trace mode bypasses
-  // the gate so an active trace always shows its edges.
+  // between the two based on `autoStubThreshold`. The mode resolves
+  // identically in trace and browse — trace mode no longer bypasses the
+  // gate. Trace's focus-incident edges stay materialized via
+  // `effectiveLineageEdges` so the anchor is always legible.
   const isStubsMode = useMemo(() => {
-    if (trace.isTracing) return false
     if (lineageRenderMode === 'raw') return false
     if (lineageRenderMode === 'stubs') return true
     return visibleLineageEdges.length > autoStubThreshold
-  }, [trace.isTracing, lineageRenderMode, visibleLineageEdges.length, autoStubThreshold])
+  }, [lineageRenderMode, visibleLineageEdges.length, autoStubThreshold])
 
-  // Effective edge set passed to the renderer. In stubs mode only edges
-  // incident to the hovered or selected node materialize (so the user
-  // can drill in by interacting); the canvas otherwise stays light.
+  // Effective edge set passed to the renderer. In stubs mode edges
+  // incident to the hovered, selected, or trace-focus node materialize
+  // (so the user can drill in by interacting and the trace anchor stays
+  // unmissable); the canvas otherwise stays light.
   const effectiveLineageEdges = useMemo(() => {
     if (!isStubsMode) return visibleLineageEdges
     const focusIds = new Set<string>()
     if (hoveredNodeId) focusIds.add(hoveredNodeId)
     if (selectedNodeId) focusIds.add(selectedNodeId)
+    if (trace.isTracing && trace.result?.focusId) focusIds.add(trace.result.focusId)
     if (focusIds.size === 0) return []
     return visibleLineageEdges.filter(e =>
       focusIds.has(e.source) || focusIds.has(e.target)
     )
-  }, [visibleLineageEdges, isStubsMode, hoveredNodeId, selectedNodeId])
+  }, [visibleLineageEdges, isStubsMode, hoveredNodeId, selectedNodeId, trace.isTracing, trace.result?.focusId])
 
   // Per-node lineage counts in stubs mode. Drives the small partial-edge
   // markers on each entity card — a quiet inbound arrow on the left when
