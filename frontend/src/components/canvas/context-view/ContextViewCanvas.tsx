@@ -1653,14 +1653,15 @@ export function ContextViewCanvas({
               LayerColumn / FlatTreeItem elements default to pointer-events:
               auto and continue to receive their own hover/click events.
           */}
-          {/* px-20 reserves left/right gutters inside the scroll content so
-              edges that bow into the leftmost column (same-column lane routes
-              leftward at curveDist = -(24 + index*8) in LineageFlowOverlay)
-              or leave the rightmost column (start at node.right + 6) are not
-              clipped by the overflow-auto scroll container. The overlay SVG
-              spans the full viewport, so insetting the columns keeps those
-              curves within the visible box at the scroll extremes. */}
-          <div className="flex h-full min-h-0 relative z-30 gap-12 px-20 pointer-events-none">
+          {/* px-[60px] reserves left/right gutters inside the scroll content
+              so edges that bow into the leftmost column (same-column lane
+              routes leftward at curveDist = -(24 + index*8) in
+              LineageFlowOverlay) or leave the rightmost column (start at
+              node.right + 6) are not clipped by the overflow-auto scroll
+              container. The overlay SVG spans the full viewport, so insetting
+              the columns keeps those curves within the visible box at the
+              scroll extremes. */}
+          <div className="flex h-full min-h-0 relative z-30 gap-12 px-[60px] pointer-events-none">
             {sortedLayers.map((layer) => (
               <LayerColumn
                 key={layer.id}
