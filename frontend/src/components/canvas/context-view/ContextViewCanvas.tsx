@@ -71,6 +71,7 @@ import { LineageFlowOverlay } from './LineageFlowOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
 import { useLoadingToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
+import { attachStagedChangesMirror } from '@/services/versionControlBridge'
 import { StagedChangesPanel } from './StagedChangesPanel'
 import { TraceBottomDock } from '../trace/TraceBottomDock'
 
@@ -311,6 +312,16 @@ export function ContextViewCanvas({
   const saveToBackend = useReferenceModelStore(s => s.saveToBackend)
   const assignEntityToLayer = useReferenceModelStore(s => s.assignEntityToLayer)
   const activeWorkspaceId = useWorkspacesStore(s => s.activeWorkspaceId)
+
+  // Additive integration: live-mirror Context View staged changes
+  // (add / update / delete) into the authored-graph version-control
+  // working set so the new versioning surface reflects them. Pure
+  // client state — no backend dependency, does NOT touch the existing
+  // applyAll provider-write path. Backend staging/commit of these is
+  // gated on the Phase-2 data-source -> versioned-graph adoption.
+  useEffect(() => {
+    return attachStagedChangesMirror(useStagedChangesStore)
+  }, [])
 
   // Step 1: Sync view layers to store when activeView changes
   useEffect(() => {
