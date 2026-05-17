@@ -105,6 +105,24 @@ dbInit:
   enabled: true
   image: postgres:16.4-alpine
 
+# ── Boot ordering ─────────────────────────────────────────────────────
+# Adds a wait-for-controlplane initContainer to viz/worker/stats so the
+# singleton control plane finishes Alembic + creates the aggregation schema
+# before they start. Disable only for single-shot dev.
+ordering:
+  enabled: true
+  image: curlimages/curl:8.10.1
+
+# ── Demo-data seed Job (OPT-IN) ───────────────────────────────────────
+# Post-install/upgrade hook that loads demo scenarios into FalkorDB.
+# Idempotent (skips if the graph already has data).
+seed:
+  enabled: false
+  scenarios: "finance,ecommerce"
+  scale: "1"
+  breadth: "1"
+  depth: "1"
+
 # ── Per-workload settings ─────────────────────────────────────────────
 services:
   viz:
@@ -124,11 +142,13 @@ services:
       limits: { cpu: "1", memory: 1Gi }
   worker:
     replicas: 2
+    terminationGracePeriodSeconds: 120
     resources:
       requests: { cpu: 250m, memory: 256Mi }
       limits: { cpu: "1", memory: 1Gi }
   stats:
     replicas: 1
+    terminationGracePeriodSeconds: 120
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits: { cpu: 500m, memory: 512Mi }

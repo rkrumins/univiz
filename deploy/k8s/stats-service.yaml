@@ -20,6 +20,17 @@ spec:
         app.kubernetes.io/name: stats-service
         app.kubernetes.io/part-of: dataviz
     spec:
+      # Drain in-flight polls on rollout/scale-down instead of SIGKILL at 30s.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # Controlplane runs Alembic — ensures polling_config / stats tables
+        # exist before this starts. Replaces compose depends_on.
+        - name: wait-for-controlplane
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - "until curl -sf http://aggregation-controlplane:8091/health; do echo waiting for controlplane; sleep 3; done"
       containers:
         - name: stats-service
           # Build backend/Dockerfile.insights and push to Docker Hub.

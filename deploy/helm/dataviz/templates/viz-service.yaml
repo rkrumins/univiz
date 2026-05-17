@@ -20,6 +20,10 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.ordering.enabled }}
+      initContainers:
+        {{- include "dataviz.waitForControlplane" . | nindent 8 }}
+      {{- end }}
       containers:
         - name: viz-service
           image: {{ include "dataviz.image" (dict "ctx" $ "name" "viz-service") | quote }}

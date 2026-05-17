@@ -19,6 +19,17 @@ spec:
         app.kubernetes.io/name: aggregation-worker
         app.kubernetes.io/part-of: dataviz
     spec:
+      # Drain in-flight jobs on rollout/scale-down instead of SIGKILL at 30s.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # Wait for the control plane (Alembic + aggregation schema owner)
+        # before consuming jobs — replaces compose depends_on.
+        - name: wait-for-controlplane
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - "until curl -sf http://aggregation-controlplane:8091/health; do echo waiting for controlplane; sleep 3; done"
       containers:
         - name: aggregation-worker
           # Build backend/Dockerfile.aggregation and push to Docker Hub.

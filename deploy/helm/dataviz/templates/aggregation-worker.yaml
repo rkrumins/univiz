@@ -16,9 +16,14 @@ spec:
         app.kubernetes.io/name: aggregation-worker
         app.kubernetes.io/part-of: dataviz
     spec:
+      terminationGracePeriodSeconds: {{ .Values.services.worker.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.ordering.enabled }}
+      initContainers:
+        {{- include "dataviz.waitForControlplane" . | nindent 8 }}
       {{- end }}
       containers:
         - name: aggregation-worker

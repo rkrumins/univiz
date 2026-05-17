@@ -1,0 +1,80 @@
+name: build-images
+
+# Builds and pushes the dataviz container images to Docker Hub.
+# Requires repo secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN.
+on:
+  push:
+    branches:
+      - claude/kubernetes-gke-helm-setup-H0dfz
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      org:
+        description: "Docker Hub org/namespace"
+        required: false
+        default: "synodic"
+      tag:
+        description: "Image tag (default: git tag on tag builds, else 'latest')"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: viz-service
+            dockerfile: backend/Dockerfile.viz
+          - name: graph-service
+            dockerfile: backend/Dockerfile.graph
+          - name: aggregation-controlplane
+            dockerfile: backend/Dockerfile.controlplane
+          - name: aggregation-worker
+            dockerfile: backend/Dockerfile.aggregation
+          - name: stats-service
+            dockerfile: backend/Dockerfile.insights
+          - name: frontend
+            dockerfile: frontend/Dockerfile
+          - name: seed
+            dockerfile: backend/Dockerfile.seed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve org and tag
+        id: meta
+        run: |
+          ORG="${{ github.event.inputs.org }}"
+          [ -z "$ORG" ] && ORG="synodic"
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              TAG="${GITHUB_REF_NAME}"
+            else
+              TAG="latest"
+            fi
+          fi
+          echo "org=$ORG" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: docker.io/${{ steps.meta.outputs.org }}/${{ matrix.name }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -17,6 +17,15 @@ spec:
         app.kubernetes.io/name: viz-service
         app.kubernetes.io/part-of: dataviz
     spec:
+      initContainers:
+        # Wait for the singleton control plane (it runs Alembic + creates the
+        # aggregation schema) before starting — replaces compose depends_on.
+        - name: wait-for-controlplane
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - "until curl -sf http://aggregation-controlplane:8091/health; do echo waiting for controlplane; sleep 3; done"
       containers:
         - name: viz-service
           # Build backend/Dockerfile.viz and push to Docker Hub. Edit as needed.
