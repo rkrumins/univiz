@@ -925,8 +925,9 @@ export function LineageFlowOverlay({
                   Renders for ALL edges in Premium tier; in Standard /
                   Coalesced tiers we limit it to the focus + context subset
                   (hovered, focus-incident) so density doesn't melt the
-                  paint pipeline. Reverse-flow edges follow the same rules
-                  as forward — chevron animates along their downward arc. */}
+                  paint pipeline. Reverse-flow edges keep the chevron but
+                  scale it to the (capped) return stroke so it never bleeds
+                  outside the thinner core line on bundled backward edges. */}
               {showDirection && isPremiumLook && (
                 <>
                   {/* White underlay — gives the colored dashes contrast against any background */}
@@ -934,7 +935,7 @@ export function LineageFlowOverlay({
                     d={pathD}
                     style={{
                       stroke: 'white',
-                      strokeWidth: Math.max(2.5, dynamicStrokeWidth * 1.2),
+                      strokeWidth: Math.max(2.5, returnStrokeWidth * 1.2),
                       fill: 'none',
                       strokeOpacity: isGhost ? 0.10 : 0.18,
                       strokeLinecap: 'round',
@@ -948,7 +949,7 @@ export function LineageFlowOverlay({
                     d={pathD}
                     style={{
                       stroke: color,
-                      strokeWidth: Math.max(2, dynamicStrokeWidth * 1.05),
+                      strokeWidth: Math.max(2, returnStrokeWidth * 1.05),
                       fill: 'none',
                       strokeOpacity: isGhost ? 0.7 : 0.95,
                       strokeLinecap: 'round',
