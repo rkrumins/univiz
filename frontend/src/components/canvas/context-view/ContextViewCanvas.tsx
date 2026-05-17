@@ -1065,12 +1065,12 @@ export function ContextViewCanvas({
   // global one has a single key that recycles between phases, so users with the
   // canvas focused want a sticky in-context indicator that the entities AND
   // edges loads both happened — even if hydration is fast.
-  useLoadingToast('ctx-hydrating-entities', hydrationPhase === 'roots', 'Loading entities…')
-  useLoadingToast('ctx-hydrating-edges', hydrationPhase === 'edges', 'Loading edges between entities…')
-  useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments')
-  useLoadingToast('ctx-agg-edges', isLoadingAggregatedEdges, 'Loading aggregated edges')
-  useLoadingToast('ctx-children', isLoadingChildren, 'Loading child entities')
-  useLoadingToast('ctx-regions', regionCount > 0, 'Loading region data')
+  useLoadingToast('ctx-hydrating-entities', hydrationPhase === 'roots', 'Loading entities…', 'Entities loaded')
+  useLoadingToast('ctx-hydrating-edges', hydrationPhase === 'edges', 'Loading edges between entities…', 'Edges loaded')
+  useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments', 'Layer assignments ready')
+  useLoadingToast('ctx-agg-edges', isLoadingAggregatedEdges, 'Loading aggregated edges', 'Aggregated edges loaded')
+  useLoadingToast('ctx-children', isLoadingChildren, 'Loading child entities', 'Child entities loaded')
+  useLoadingToast('ctx-regions', regionCount > 0, 'Loading region data', 'Region data loaded')
 
   // Warn the user once when any child fetch fails — gives them an explicit
   // signal beyond the inline error rows inside the affected parent's subtree.

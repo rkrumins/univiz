@@ -95,6 +95,22 @@ export const LayerColumn = React.memo(function LayerColumn({
   onAssignToLayer,
   isHydratingInitial = false,
 }: LayerColumnProps) {
+  // A layer that has zero entity types, rules, instance assignments, AND
+  // logical nodes is configured to receive nothing — showing ghost cards
+  // there reads as "still loading" when the truth is "nothing was ever
+  // going to land here". Detect this upfront so the empty state appears
+  // immediately rather than after hydration completes.
+  const layerHasConfiguredSources = useMemo(() => {
+    const hasEntityTypes = (layer.entityTypes?.length ?? 0) > 0
+    const hasRules = (layer.rules?.length ?? 0) > 0
+    const hasAssignments = (layer.entityAssignments?.length ?? 0) > 0
+    const hasLogicalNodes = (layer.logicalNodes?.length ?? 0) > 0
+    const acceptsUnassigned = layer.showUnassigned === true
+    return hasEntityTypes || hasRules || hasAssignments || hasLogicalNodes || acceptsUnassigned
+  }, [layer])
+
+  const shouldShowGhosts = isHydratingInitial && layerHasConfiguredSources
+
   const [localFocusId, setLocalFocusId] = useState<string | null>(null)
   const [breadcrumb, setBreadcrumb] = useState<HierarchyNode[]>([])
   const [isCollapsed, setIsCollapsed] = useState(false)
@@ -639,7 +655,7 @@ export const LayerColumn = React.memo(function LayerColumn({
                     layer is hydrating with no entities yet. Premium spinner +
                     layer-tinted background makes the loading state legible at
                     a glance from anywhere on the canvas. */}
-                {isHydratingInitial && flatTree.length === 0 ? (
+                {shouldShowGhosts && flatTree.length === 0 ? (
                   <motion.div
                     initial={{ opacity: 0, scale: 0.92 }}
                     animate={{ opacity: 1, scale: 1 }}
@@ -788,7 +804,7 @@ export const LayerColumn = React.memo(function LayerColumn({
 
           {flatTree.length === 0 ? (
             <AnimatePresence mode="wait" initial={false}>
-              {isHydratingInitial ? (
+              {shouldShowGhosts ? (
                 <motion.div
                   key="ghost-stack"
                   initial={{ opacity: 0 }}

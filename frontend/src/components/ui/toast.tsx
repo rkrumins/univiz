@@ -17,7 +17,7 @@
  *   hideLoading('assignments')
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { create } from 'zustand'
 import { AnimatePresence, motion } from 'framer-motion'
 import { CheckCircle2, AlertCircle, AlertTriangle, Info, Loader2, X } from 'lucide-react'
@@ -34,6 +34,10 @@ export interface Toast {
   /** Stable key for loading toasts — used by hideLoading() to dismiss. */
   key?: string
   action?: { label: string; onClick: () => void }
+  /** Epoch-ms at which the toast was added — drives the progress bar and
+   * dismiss timer against an immutable reference time so sibling removals
+   * never restart this toast's countdown. */
+  createdAt: number
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────
@@ -41,7 +45,7 @@ export interface Toast {
 interface ToastState {
   toasts: Toast[]
   _nextId: number
-  addToast: (toast: Omit<Toast, 'id'>) => number
+  addToast: (toast: Omit<Toast, 'id' | 'createdAt'>) => number
   removeToast: (id: number) => void
   removeByKey: (key: string) => void
 }
@@ -57,7 +61,7 @@ export const useToastStore = create<ToastState>((set, get) => ({
       _nextId: state._nextId + 1,
       toasts: [
         ...state.toasts.filter(t => !(toast.key && t.key === toast.key)),
-        { ...toast, id },
+        { ...toast, id, createdAt: Date.now() },
       ],
     }))
     return id
@@ -105,18 +109,38 @@ export function useToast() {
 /**
  * Declarative loading toast — shows while `isLoading` is true, hides when false.
  * Call at the top of a component to bind a loading operation to the toast system.
+ *
+ * If `successMessage` is provided, a green success toast fires on the
+ * `isLoading: true → false` transition (4.5s auto-dismiss). This gives the
+ * user explicit confirmation that the operation completed rather than the
+ * loading toast just silently disappearing.
  */
-export function useLoadingToast(key: string, isLoading: boolean, message: string) {
-  const { showLoading, hideLoading } = useToast()
+export function useLoadingToast(
+  key: string,
+  isLoading: boolean,
+  message: string,
+  successMessage?: string,
+) {
+  const { showLoading, hideLoading, showToast } = useToast()
+  // Tracks whether we previously showed a loading toast for this key.
+  // Needed because the effect runs on every dependency change, but we only
+  // want to fire success on a genuine true → false transition (not on the
+  // initial render where isLoading happens to be false).
+  const wasLoadingRef = useRef(false)
 
   useEffect(() => {
     if (isLoading) {
       showLoading(key, message)
+      wasLoadingRef.current = true
     } else {
       hideLoading(key)
+      if (wasLoadingRef.current && successMessage) {
+        showToast('success', successMessage)
+      }
+      wasLoadingRef.current = false
     }
     return () => hideLoading(key)
-  }, [isLoading, key, message, showLoading, hideLoading])
+  }, [isLoading, key, message, successMessage, showLoading, hideLoading, showToast])
 }
 
 // ─── Visual constants ─────────────────────────────────────────────────────
@@ -149,18 +173,34 @@ const iconComponents: Record<ToastType, React.ComponentType<{ className?: string
 
 // ─── Single Toast ─────────────────────────────────────────────────────────
 
-function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }) {
-  const [progress, setProgress] = useState(100)
+function ToastItem({ toast }: { toast: Toast }) {
+  const removeToast = useToastStore(s => s.removeToast)
   const isLoading = toast.type === 'loading'
+  const id = toast.id
+  const createdAt = toast.createdAt
+
+  // Initial progress is computed from createdAt so a remount (e.g. caused by
+  // React StrictMode double-invocation, or by the parent re-rendering for
+  // any unrelated reason) doesn't snap the bar back to 100%.
+  const [progress, setProgress] = useState(() => {
+    if (isLoading) return 100
+    const elapsed = Date.now() - createdAt
+    return Math.max(0, 100 - (elapsed / DURATION) * 100)
+  })
 
   useEffect(() => {
-    // Loading toasts don't auto-dismiss
+    // Loading toasts don't auto-dismiss.
     if (isLoading) return
 
-    const timer = setTimeout(onDismiss, DURATION)
-    const start = Date.now()
+    // Anchor both the dismiss timer and the progress bar on the immutable
+    // createdAt timestamp. Previously the timer was restarted from "now"
+    // whenever this effect re-ran (e.g. because a sibling toast dismissed
+    // and the parent's onDismiss closure changed), which gave the user the
+    // misleading impression that the remaining toasts had reset.
+    const remainingMs = Math.max(0, DURATION - (Date.now() - createdAt))
+    const timer = setTimeout(() => removeToast(id), remainingMs)
     const interval = setInterval(() => {
-      const elapsed = Date.now() - start
+      const elapsed = Date.now() - createdAt
       const remaining = Math.max(0, 100 - (elapsed / DURATION) * 100)
       setProgress(remaining)
       if (remaining <= 0) clearInterval(interval)
@@ -170,7 +210,9 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
       clearTimeout(timer)
       clearInterval(interval)
     }
-  }, [onDismiss, isLoading])
+  }, [createdAt, id, isLoading, removeToast])
+
+  const onDismiss = useCallback(() => removeToast(id), [removeToast, id])
 
   const Icon = iconComponents[toast.type]
 
@@ -247,17 +289,12 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
  */
 export function ToastContainer() {
   const toasts = useToastStore(s => s.toasts)
-  const removeToast = useToastStore(s => s.removeToast)
 
   return (
     <div className="fixed bottom-6 right-6 z-[80] flex flex-col-reverse gap-2 pointer-events-none">
       <AnimatePresence>
         {toasts.map(toast => (
-          <ToastItem
-            key={toast.id}
-            toast={toast}
-            onDismiss={() => removeToast(toast.id)}
-          />
+          <ToastItem key={toast.id} toast={toast} />
         ))}
       </AnimatePresence>
     </div>

@@ -55,6 +55,7 @@ export function CanvasRouter({ className, layoutType: layoutTypeProp }: CanvasRo
     'hydration',
     isInitialLoad && !hydrationError,
     hydrationPhase === 'roots' ? 'Loading entities' : hydrationPhase === 'edges' ? 'Loading edges' : 'Preparing view',
+    'Canvas ready',
   )
 
   // Mirror hydration phase into the canvas store so downstream components
