@@ -14,7 +14,7 @@
  */
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react'
-import { AnimatePresence } from 'framer-motion'
+import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { fetchWithTimeout } from '@/services/fetchWithTimeout'
 import {
@@ -70,8 +70,9 @@ import { useTraceFilteredHierarchy } from '@/hooks/useTraceFilteredHierarchy'
 import { computeTraceMergeSpine } from '@/hooks/lib/traceMergeSpine'
 import { LayerColumn } from './LayerColumn'
 import { LineageFlowOverlay, EXTREMITY_EDGE_GUTTER_PX } from './LineageFlowOverlay'
+import { GhostLineageOverlay } from './GhostLineageOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
-import { useLoadingToast } from '@/components/ui/toast'
+import { useLoadingToast, useToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
 import { TraceBottomDock } from '../trace/TraceBottomDock'
@@ -1041,10 +1042,47 @@ export function ContextViewCanvas({
   // Toggle node expansion with Lazy Loading
   const { loadChildren, searchChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes, failedNodes } = useGraphHydration()
 
-  // Floating loading toasts
+  // Hydration phase mirrored into the canvas store by CanvasRouter — drives
+  // the ghost-card stack in empty layers and the GhostLineageOverlay.
+  // Anything-not-complete counts as hydrating so that:
+  //   1. On the first paint (before CanvasRouter's effect has mirrored the
+  //      real 'roots'/'edges' phase) we still show ghosts, not "No entities
+  //      yet". The default store value is 'idle' which is NOT 'complete' —
+  //      so ghosts win the race.
+  //   2. As nodes stream in per-layer, layers that already have nodes show
+  //      real cards while still-empty layers keep their ghosts until phase
+  //      flips to 'complete'. (Per-layer empty check is applied at the prop
+  //      site below.) The previous `nodes.length === 0` global gate killed
+  //      ghosts in empty layers the moment any one layer received a node.
+  const hydrationPhase = useCanvasStore((s) => s.hydrationPhase)
+  const regionCount = useCanvasStore((s) => s.loadingRegions.size)
+  const isHydratingInitial = hydrationPhase !== 'complete'
+
+  // Floating loading toasts — keep the full set so every long-running operation
+  // is explicitly announced. Wording is centralised here.
+  // Two phase-explicit toasts ('ctx-hydrating-entities' / 'ctx-hydrating-edges')
+  // duplicate the global 'hydration' toast from CanvasRouter intentionally: the
+  // global one has a single key that recycles between phases, so users with the
+  // canvas focused want a sticky in-context indicator that the entities AND
+  // edges loads both happened — even if hydration is fast.
+  useLoadingToast('ctx-hydrating-entities', hydrationPhase === 'roots', 'Loading entities…')
+  useLoadingToast('ctx-hydrating-edges', hydrationPhase === 'edges', 'Loading edges between entities…')
   useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments')
   useLoadingToast('ctx-agg-edges', isLoadingAggregatedEdges, 'Loading aggregated edges')
-  useLoadingToast('ctx-children', isLoadingChildren, 'Expanding hierarchy')
+  useLoadingToast('ctx-children', isLoadingChildren, 'Loading child entities')
+  useLoadingToast('ctx-regions', regionCount > 0, 'Loading region data')
+
+  // Warn the user once when any child fetch fails — gives them an explicit
+  // signal beyond the inline error rows inside the affected parent's subtree.
+  const { showToast } = useToast()
+  const lastFailedCountRef = useRef(0)
+  useEffect(() => {
+    const count = failedNodes?.size ?? 0
+    if (count > lastFailedCountRef.current) {
+      showToast('warning', count === 1 ? '1 entity failed to load' : `${count} entities failed to load`)
+    }
+    lastFailedCountRef.current = count
+  }, [failedNodes, showToast])
 
   // Tracks nodes currently being fetched — prevents duplicate fetches on rapid clicks.
   // A ref (not state) because we need synchronous reads inside the toggle callback.
@@ -1700,6 +1738,29 @@ export function ContextViewCanvas({
             />
           )}
 
+          {/* Ghost-edge overlay — dashed pulsing connectors between ghost
+              cards in adjacent layers during initial hydration. Anchored
+              to the actual ghost-card DOM rects (via [data-canvas-ghost]),
+              so the lines land in the same vertical band where real edges
+              will appear once hydration completes. Unmounts the moment any
+              real node arrives (isHydratingInitial flips false). */}
+          <AnimatePresence>
+            {isHydratingInitial && (
+              <motion.div
+                key="ghost-lineage-overlay"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                className="absolute inset-0 pointer-events-none"
+                style={{ zIndex: 1 }}
+              >
+                <GhostLineageOverlay layers={sortedLayers} containerRef={horizontalScrollRef} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+
           {/*
             z-30 + pointer-events-none on the columns wrapper:
             - z-30 puts the columns ABOVE the hit-test layer (z-20 in
@@ -1757,6 +1818,7 @@ export function ContextViewCanvas({
                 failedNodes={failedNodes}
                 onScroll={handleLayerScroll}
                 onAssignToLayer={(entityId) => handleAssignToLayer(entityId, layer.id)}
+                isHydratingInitial={isHydratingInitial}
               />
             ))}
           </div>

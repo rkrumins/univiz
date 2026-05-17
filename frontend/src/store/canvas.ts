@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Node, Edge, Viewport } from '@xyflow/react'
+import type { HydrationPhase } from '@/hooks/useGraphHydration'
 
 export interface LineageNode extends Node {
   data: {
@@ -79,6 +80,12 @@ interface CanvasState {
   setLoading: (loading: boolean) => void
   addLoadingRegion: (region: string) => void
   removeLoadingRegion: (region: string) => void
+
+  // Hydration phase — mirrored from useGraphHydration({hydrate:true}) in
+  // CanvasRouter so downstream canvas components can drive ghost-loading UI
+  // without each owning their own hydration hook.
+  hydrationPhase: HydrationPhase
+  setHydrationPhase: (phase: HydrationPhase) => void
 
   // Active Lens
   activeLensId: string | null
@@ -262,6 +269,8 @@ export const useCanvasStore = create<CanvasState>()(
       // Loading
       isLoading: false,
       loadingRegions: new Set(),
+      hydrationPhase: 'idle',
+      setHydrationPhase: (hydrationPhase) => set({ hydrationPhase }),
       setLoading: (isLoading) => set({ isLoading }),
       addLoadingRegion: (region) => set((state) => {
         const newRegions = new Set(state.loadingRegions)

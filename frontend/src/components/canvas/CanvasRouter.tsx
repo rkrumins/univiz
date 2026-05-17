@@ -10,7 +10,7 @@
  * All data loading is handled by useGraphHydration (called here and in canvas components).
  */
 
-import { Suspense, useMemo } from 'react'
+import { Suspense, useMemo, useEffect } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AlertTriangle, Loader2, RefreshCw, WifiOff } from 'lucide-react'
@@ -19,6 +19,7 @@ import { useGraphProviderContext } from '@/providers/GraphProviderContext'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { useGraphHydration } from '@/hooks/useGraphHydration'
 import { useLoadingToast } from '@/components/ui/toast'
+import { useCanvasStore } from '@/store/canvas'
 import { GraphCanvas } from './GraphCanvas'
 import { HierarchyCanvas } from './HierarchyCanvas'
 import { ReferenceModelCanvas } from './ReferenceModelCanvas'
@@ -50,7 +51,20 @@ export function CanvasRouter({ className, layoutType: layoutTypeProp }: CanvasRo
   // without hydration (loadChildren/searchChildren only).
   const { hydrationError, hydrationPhase, isLoading: isHydrating } = useGraphHydration({ hydrate: true })
   const isInitialLoad = isHydrating && hydrationPhase !== 'complete'
-  useLoadingToast('hydration', isInitialLoad && !hydrationError, hydrationPhase === 'roots' ? 'Loading graph data' : hydrationPhase === 'edges' ? 'Loading relationships' : 'Preparing view')
+  useLoadingToast(
+    'hydration',
+    isInitialLoad && !hydrationError,
+    hydrationPhase === 'roots' ? 'Loading entities' : hydrationPhase === 'edges' ? 'Loading edges' : 'Preparing view',
+  )
+
+  // Mirror hydration phase into the canvas store so downstream components
+  // (ContextViewCanvas → LayerColumn ghost cards, GhostLineageOverlay) can
+  // drive their ghost-loading UI without each calling useGraphHydration with
+  // their own state.
+  const setHydrationPhase = useCanvasStore((s) => s.setHydrationPhase)
+  useEffect(() => {
+    setHydrationPhase(hydrationPhase)
+  }, [hydrationPhase, setHydrationPhase])
 
   // Memoize canvas selection based on view layout type
   const CanvasComponent = useMemo(() => {
