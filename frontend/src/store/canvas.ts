@@ -62,6 +62,13 @@ interface CanvasState {
   selectEdge: (id: string, multi?: boolean) => void
   clearSelection: () => void
 
+  // Sticky entity drawer — which entity the drawer currently shows.
+  // Decoupled from selection so background clicks / selection changes
+  // don't close it; only an explicit close (X) does.
+  drawerNodeId: string | null
+  openNodeDrawer: (id: string) => void
+  closeNodeDrawer: () => void
+
   // Viewport
   viewport: Viewport
   setViewport: (viewport: Viewport) => void
@@ -225,6 +232,10 @@ export const useCanvasStore = create<CanvasState>()(
             ? [] // Toggle off: clicking the already-selected node deselects it
             : [id],
         selectedEdgeIds: multi ? state.selectedEdgeIds : [],
+        // Single-select of a real entity opens (or swaps) the sticky drawer.
+        // Toggle-off keeps it open — only the X button closes it. Logical
+        // groupings and multi-select never touch the drawer.
+        ...(!multi && !id.startsWith('logical:') ? { drawerNodeId: id } : {}),
       })),
       selectEdge: (id, multi = false) => set((state) => ({
         selectedEdgeIds: multi
@@ -233,8 +244,16 @@ export const useCanvasStore = create<CanvasState>()(
             : [...state.selectedEdgeIds, id]
           : [id],
         selectedNodeIds: multi ? state.selectedNodeIds : [],
+        // Mutual exclusion: selecting an edge swaps the right rail to the
+        // edge drawer.
+        drawerNodeId: null,
       })),
       clearSelection: () => set({ selectedNodeIds: [], selectedEdgeIds: [] }),
+
+      // Sticky entity drawer
+      drawerNodeId: null,
+      openNodeDrawer: (id) => set({ drawerNodeId: id }),
+      closeNodeDrawer: () => set({ drawerNodeId: null }),
 
       // Viewport
       viewport: { x: 0, y: 0, zoom: 1 },

@@ -55,14 +55,16 @@ export function EntityDrawer({
   onFullTrace,
   getExternalUrl,
 }: EntityDrawerProps) {
-  const { selectedNodeIds, nodes, updateNode, clearSelection } = useCanvasStore()
+  const { drawerNodeId, nodes, updateNode, clearSelection, closeNodeDrawer } = useCanvasStore()
   const { schema } = useSchemaStore()
   const mode = usePersonaStore((s) => s.mode)
 
-  // Only show if exactly one non-logical node is selected.
+  // The drawer is sticky: it shows whichever entity it was last opened on
+  // (drawerNodeId), independent of canvas highlight selection. It stays open
+  // until explicitly closed via the X button.
   // Logical nodes (id starts with "logical:") are virtual groupings, not physical entities.
-  const selectedNode = selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')
-    ? nodes.find(n => n.id === selectedNodeIds[0])
+  const selectedNode = drawerNodeId && !drawerNodeId.startsWith('logical:')
+    ? nodes.find(n => n.id === drawerNodeId)
     : null
 
   const isOpen = !!selectedNode
@@ -253,24 +255,15 @@ export function EntityDrawer({
     }
   }, [formData.urn, selectedNode?.id])
 
-  // Close drawer
+  // Close drawer — the X button is the only close path. The drawer is
+  // sticky: clicking other entities or the canvas background never closes
+  // it, it only swaps the data shown inside.
   const handleClose = useCallback(() => {
     if (!isPinned) {
+      closeNodeDrawer()
       clearSelection()
     }
-  }, [clearSelection, isPinned])
-
-  // Click-outside to close drawer (respects pin state)
-  useEffect(() => {
-    if (!isOpen || isPinned) return
-    const handleMouseDown = (e: MouseEvent) => {
-      if (drawerRef.current && !drawerRef.current.contains(e.target as Node)) {
-        clearSelection()
-      }
-    }
-    document.addEventListener('mousedown', handleMouseDown)
-    return () => document.removeEventListener('mousedown', handleMouseDown)
-  }, [isOpen, isPinned, clearSelection])
+  }, [closeNodeDrawer, clearSelection, isPinned])
 
   // Get external URL
   const externalUrl = useMemo(() => {

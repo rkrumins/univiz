@@ -74,6 +74,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
   const [searchResults, setSearchResults] = useState<string[]>([])
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const pendingLoadRef = useRef<Set<string>>(new Set())
 
   // Edit Mode State (shared across canvases)
   const [isPaletteOpen, setPaletteOpen] = useState(false)
@@ -233,6 +234,12 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
 
   // Toggle node expansion with lazy loading
   const toggleNode = useCallback(async (nodeId: string) => {
+    // A child load for this node is already in flight. Ignore repeat clicks
+    // until it settles: otherwise an impatient second click reads the node
+    // as expanded, collapses it, and cancels the in-flight fetch — forcing a
+    // third click to actually load. Collapse works once the load completes.
+    if (pendingLoadRef.current.has(nodeId)) return
+
     // 1. Determine local expansion state
     const isCurrentlyExpanded = expandedNodes.has(nodeId)
 
@@ -256,7 +263,12 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     }
 
     // 2. Load Children using Generic Hook
-    await loadChildren(nodeId)
+    pendingLoadRef.current.add(nodeId)
+    try {
+      await loadChildren(nodeId)
+    } finally {
+      pendingLoadRef.current.delete(nodeId)
+    }
   }, [loadChildren, cancelChildLoad, expandedNodes])
 
   // Expand/collapse all

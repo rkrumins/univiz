@@ -9,7 +9,7 @@
  * - Node-centric edge exploration
  */
 
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
+import { useState, useMemo, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
     X,
@@ -119,17 +119,9 @@ export function EdgeDetailPanel({
     const ontologyMetadata = useMemo(() => ({ edgeTypeMetadata }), [edgeTypeMetadata])
     const panelRef = useRef<HTMLDivElement>(null)
 
-    // Click-outside to close panel
-    useEffect(() => {
-        if (!isOpen) return
-        const handleMouseDown = (e: MouseEvent) => {
-            if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-                onClose()
-            }
-        }
-        document.addEventListener('mousedown', handleMouseDown)
-        return () => document.removeEventListener('mousedown', handleMouseDown)
-    }, [isOpen, onClose])
+    // Sticky: the X button is the only close path. Clicking other edges or
+    // the canvas background never closes the panel, it only swaps the data
+    // shown inside.
 
     // Generate filters dynamically if not provided
     const edgeFilters = useMemo(() => {

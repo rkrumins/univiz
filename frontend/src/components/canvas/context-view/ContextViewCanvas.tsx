@@ -98,6 +98,8 @@ export function ContextViewCanvas({
   const selectNode = useCanvasStore((s) => s.selectNode)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
   const selectedNodeId = selectedNodeIds[0] ?? null
+  const drawerNodeId = useCanvasStore((s) => s.drawerNodeId)
+  const closeNodeDrawer = useCanvasStore((s) => s.closeNodeDrawer)
   const schema = useSchemaStore((s) => s.schema)
   const activeView = useSchemaStore((s) => s.getActiveView())
   const provider = useGraphProvider()
@@ -300,7 +302,7 @@ export function ContextViewCanvas({
     },
     onCloseEntityDrawer: () => {
       if (isStagedPanelOpen) { closeStagedChangesPanel(); return true }
-      if (selectedNodeId) { clearSelection(); return true }
+      if (drawerNodeId) { closeNodeDrawer(); clearSelection(); return true }
       return false
     },
     // ESC exits an active trace before any other panel close — gives the
@@ -1221,6 +1223,15 @@ export function ContextViewCanvas({
       return
     }
 
+    // A child load for this node is already in flight (expand started by an
+    // earlier click). Ignore repeat clicks until it settles: without this,
+    // an impatient second click would read committed state as expanded,
+    // collapse the node, and cancelChildLoad() the in-flight fetch — forcing
+    // a third click to actually load. The loading spinner provides feedback
+    // meanwhile; collapse works normally once the load completes (finally
+    // clears pendingLoadRef).
+    if (pendingLoadRef.current.has(nodeId)) return
+
     // Determine action from committed state via updater function — avoids stale closure read.
     let wasExpanded = false
     setExpandedNodes((prev) => {
@@ -1691,7 +1702,7 @@ export function ContextViewCanvas({
           ever mounted at a time, so the canvas shrinks by exactly one
           panel's width whenever any of them opens. */}
       <AnimatePresence>
-        {selectedNodeId && (
+        {drawerNodeId && (
           <EntityDrawer
             key="entity-drawer"
             onTraceUp={(nodeId) => traceUpstreamWithSmartLevel(nodeId)}
@@ -1699,7 +1710,7 @@ export function ContextViewCanvas({
             onFullTrace={(nodeId) => traceFullLineageWithSmartLevel(nodeId)}
           />
         )}
-        {!selectedNodeId && isEdgePanelOpen && (
+        {!drawerNodeId && isEdgePanelOpen && (
           <EdgeDetailPanel
             key="edge-detail-panel"
             isOpen={isEdgePanelOpen}
@@ -1708,7 +1719,7 @@ export function ContextViewCanvas({
             onToggleFilter={toggleEdgeFilter}
           />
         )}
-        {!selectedNodeId && !isEdgePanelOpen && isCreatingEntity && (
+        {!drawerNodeId && !isEdgePanelOpen && isCreatingEntity && (
           <EntityCreationPanel
             key="entity-creation-panel"
             isOpen={isCreatingEntity}
