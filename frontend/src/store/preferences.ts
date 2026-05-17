@@ -69,6 +69,21 @@ interface PreferencesState {
   /** Threshold for 'auto' mode — a node with edgeCount ≤ this in a direction renders real edges instead of a stub. */
   lineageAutoThreshold: number
   setLineageAutoThreshold: (n: number) => void
+  /**
+   * Global edge-count threshold for `auto` mode. When the projected edge
+   * count exceeds this, the canvas falls back to stub rendering even if
+   * per-node fan-in is low. Distinct from `lineageAutoThreshold` (per-node).
+   */
+  autoStubThreshold: number
+  setAutoStubThreshold: (n: number) => void
+  /**
+   * Browse-mode parent-pair fan-in threshold. Any collapsed-parent pair with
+   * more than this many leaf edges between its descendants collapses into
+   * one bundle. Default 1 — every multi-edge pair bundles immediately.
+   * Raise to 2/3 to keep small pairs un-bundled while still collapsing hubs.
+   */
+  lineageBundleFanIn: number
+  setLineageBundleFanIn: (n: number) => void
 
   // Pinned views (sidebar quick access)
   pinnedViewIds: string[]
@@ -154,6 +169,10 @@ export const usePreferencesStore = create<PreferencesState>()(
       setLineageRenderMode: (lineageRenderMode) => set({ lineageRenderMode }),
       lineageAutoThreshold: 5,
       setLineageAutoThreshold: (lineageAutoThreshold) => set({ lineageAutoThreshold }),
+      autoStubThreshold: 500,
+      setAutoStubThreshold: (autoStubThreshold) => set({ autoStubThreshold }),
+      lineageBundleFanIn: 1,
+      setLineageBundleFanIn: (lineageBundleFanIn) => set({ lineageBundleFanIn }),
 
       // User avatar
       avatarId: null,

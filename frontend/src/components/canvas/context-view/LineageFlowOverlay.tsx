@@ -24,6 +24,8 @@ export const EXTREMITY_EDGE_GUTTER_PX =
 export function LineageFlowOverlay({
   nodes,
   edges,
+  nodeStubCounts,
+  showStubs = false,
   expandedNodes,
   selectEdge,
   isEdgePanelOpen,
@@ -39,6 +41,17 @@ export function LineageFlowOverlay({
 }: {
   nodes: any[],
   edges: any[],
+  /**
+   * Per-node lineage counts for the stub indicators. Drives a short
+   * partial-edge marker on each entity card: a quiet inbound arrow on
+   * the left if `in > 0`, a quiet outbound arrow on the right if
+   * `out > 0`. The stubs are entity-anchored decorations — they never
+   * attempt to span across to a partner node. Hover/select on an entity
+   * materializes the real edges over these markers.
+   */
+  nodeStubCounts?: Map<string, { in: number; out: number }>,
+  /** When true, render the per-node stub indicators. */
+  showStubs?: boolean,
   expandedNodes: Set<string>,
   selectEdge: (id: string) => void,
   isEdgePanelOpen: boolean,
@@ -60,6 +73,19 @@ export function LineageFlowOverlay({
   const [overflowBadges, setOverflowBadges] = useState<OverflowBadge[]>([])
   // Trailing edge stubs — partial curves from visible nodes toward container boundary
   const [overflowEdges, setOverflowEdges] = useState<OverflowEdge[]>([])
+  // Per-node lineage indicators — tight indigo ribbons that "peek out"
+  // from behind each entity card on the side(s) with lineage. The
+  // ribbon is rendered in the overlay's lower z-index so the card
+  // chrome hides the inboard portion — visually it reads as a soft
+  // glow tab integrated into the card design rather than a separate
+  // decoration. Stroke width / opacity scale with the lineage count.
+  const [computedStubs, setComputedStubs] = useState<Array<{
+    nodeId: string
+    side: 'in' | 'out'
+    count: number
+    cx: number; cy: number  // ribbon center
+    width: number; height: number
+  }>>([])
 
   // Viewport tracking for virtualization
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: typeof window !== 'undefined' ? window.innerHeight : 1000 })
@@ -111,6 +137,7 @@ export function LineageFlowOverlay({
     }
     return { bySource, byTarget }
   }, [edges])
+
 
   // Debounced update function using requestAnimationFrame
   const scheduleUpdate = useCallback(() => {
@@ -364,6 +391,7 @@ export function LineageFlowOverlay({
             isFocusIncident,
             isReverseFlow: isRev,
             isBrowseBundle: !!(edge as any).isBrowseBundle,
+            isBidirectional: !!(edge as any).isBidirectional,
           })
         }
         return
@@ -432,6 +460,67 @@ export function LineageFlowOverlay({
 
     setComputedEdges(newComputedEdges)
 
+    // ── Per-node lineage ribbons ────────────────────────────────────────
+    //
+    // For every visible entity that has lineage on either side, emit a
+    // tight indigo ribbon that PEEKS OUT from behind the card's edge.
+    // The overlay sits at z-[5] and the card chrome at z-[10]+, so the
+    // inboard portion of the ribbon is hidden naturally by the card —
+    // the visible result is a soft glow tab attached to the card edge.
+    // No external spacing, no floating decorations, no arrows trying to
+    // bridge gaps. Just a quiet "this side has lineage" indicator that
+    // reads as part of the card design.
+    //
+    // The ribbon vertical extent is sized to the card's own height
+    // (45%) so it always feels proportional, whether the entity is a
+    // tall layer card or a tight leaf row.
+    if (showStubs && nodeStubCounts && nodeStubCounts.size > 0) {
+      // Sized to be confidently visible without dominating the card.
+      // 7px core + 4px halo around it gives a soft glow tab that reads
+      // at a glance. ~5.5px peeks out beyond the card edge (1.5px overlap
+      // hides any hard inboard edge behind the card chrome).
+      const RIBBON_W = 7
+      const RIBBON_HEIGHT_RATIO = 0.55
+      const RIBBON_INSET = 1.5
+      const newStubs: typeof computedStubs = []
+      globalVisibleNodes.forEach(domId => {
+        const nodeId = domId.startsWith('layer-node-') ? domId.slice('layer-node-'.length) : domId
+        const counts = nodeStubCounts.get(nodeId)
+        if (!counts) return
+        const el = getEl(domId)
+        if (!el) return
+        const rect = el.getBoundingClientRect()
+        const midY = rect.top + rect.height / 2 - containerRect.top
+        const height = Math.max(18, rect.height * RIBBON_HEIGHT_RATIO)
+        if (counts.in > 0) {
+          // Inbound ribbon center sits `(RIBBON_W/2 - RIBBON_INSET)` to
+          // the left of the card-left edge — so part of the pill peeks
+          // out, the rest is hidden by the card chrome.
+          const cardLeft = rect.left - containerRect.left
+          newStubs.push({
+            nodeId, side: 'in', count: counts.in,
+            cx: cardLeft - (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+        if (counts.out > 0) {
+          const cardRight = rect.right - containerRect.left
+          newStubs.push({
+            nodeId, side: 'out', count: counts.out,
+            cx: cardRight + (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+      })
+      setComputedStubs(newStubs)
+    } else if (computedStubs.length > 0) {
+      setComputedStubs([])
+    }
+
     const badges: OverflowBadge[] = []
     buckets.forEach((bucket) => {
       const avgX = bucket.gutterXs.reduce((a, b) => a + b, 0) / bucket.gutterXs.length
@@ -444,7 +533,8 @@ export function LineageFlowOverlay({
     })
     setOverflowBadges(badges)
     setOverflowEdges(trailingEdges)
-  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId, showStubs, nodeStubCounts])
 
   // Store updateFlow in ref for ResizeObserver access and expose to parent
   useEffect(() => {
@@ -453,6 +543,15 @@ export function LineageFlowOverlay({
       triggerRedrawRef.current = scheduleUpdate
     }
   }, [updateFlow, scheduleUpdate, triggerRedrawRef])
+
+  // Stubs mode toggles + stub-count changes need a redraw because
+  // updateFlow's identity changes but the observers above don't refire —
+  // without this, switching to stubs (or swapping the per-node counts)
+  // leaves the canvas showing the previous geometry until the next
+  // scroll / resize / hover.
+  useEffect(() => {
+    scheduleUpdate()
+  }, [showStubs, nodeStubCounts, scheduleUpdate])
 
   // ResizeObserver + IntersectionObserver for node elements.
   // Uses MutationObserver to dynamically track layer-node-* elements as they're
@@ -729,8 +828,17 @@ export function LineageFlowOverlay({
               .edge-direction-flow {
                 animation: edgeFlow 1.4s linear infinite;
               }
+              @keyframes lineageStubFlow {
+                to { stroke-dashoffset: -14; }
+              }
+              .lineage-stub-flow {
+                animation: lineageStubFlow 1.6s linear infinite;
+              }
+              .lineage-stub-group {
+                transition: opacity 220ms ease;
+              }
               @media (prefers-reduced-motion: reduce) {
-                .flow-particles, .flow-particles-ghost, .edge-direction-flow {
+                .flow-particles, .flow-particles-ghost, .edge-direction-flow, .lineage-stub-flow {
                   animation: none;
                 }
               }
@@ -757,7 +865,11 @@ export function LineageFlowOverlay({
                 markerHeight="10"
                 refX="11"
                 refY="5"
-                orient="auto"
+                // auto-start-reverse lets the same marker serve markerEnd
+                // (forward arrowhead) AND markerStart (reversed at the
+                // source end) for bidirectional edges — one marker def per
+                // color instead of two.
+                orient="auto-start-reverse"
                 markerUnits="userSpaceOnUse"
               >
                 <polygon points="0 0, 12 5, 0 10, 2 5" fill={c} stroke={c} strokeWidth="0.5" />
@@ -900,6 +1012,7 @@ export function LineageFlowOverlay({
                   transition: 'stroke-width 0.2s ease',
                 }}
                 markerEnd={showDirection ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
+                markerStart={showDirection && edge.isBidirectional ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
                 className="pointer-events-none"
               />
 
@@ -1001,6 +1114,110 @@ export function LineageFlowOverlay({
             </g>
           )
         })}
+
+        {/* ── Per-node lineage ribbons ────────────────────────────────────
+            Indigo accents that peek out from behind each entity card on
+            the side(s) with lineage. Three layers compose the premium
+            look without external decoration:
+
+              1. Halo  — wider, blurry-tinted pill behind the core, gives
+                         the ribbon a soft glow against the card edge.
+              2. Core  — narrower pill with a vertical fade gradient.
+              3. Sheen — thin highlight stripe inside the core, lifts the
+                         ribbon off the canvas (faux specular).
+
+            The overlay sits at z-[5] beneath the card chrome (z-[10+])
+            so the inboard half of every layer is hidden by the card.
+            Native SVG <title> on each group provides the hover tooltip
+            ("8 incoming connections" / etc.) so the user can confirm
+            meaning. Hover/select the entity materializes the real edges
+            and these indicators recede behind them. ─────────────────── */}
+        {computedStubs.length > 0 && (
+          <>
+            <defs>
+              {/* Halo: wider gradient, lighter tones, generous fade.
+                  Sits behind the core to create a soft glow without
+                  needing an expensive SVG filter. */}
+              <linearGradient id="lineage-ribbon-halo" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
+                <stop offset="50%" stopColor="rgb(129, 140, 248)" stopOpacity="0.55" />
+                <stop offset="100%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
+              </linearGradient>
+              {/* Core: vertical fade with full saturation in the middle.
+                  rgb(79, 70, 229) is indigo-600 — slightly deeper than the
+                  accent-lineage indigo-500 so the ribbon reads as a
+                  punctuated accent against the card. */}
+              <linearGradient id="lineage-ribbon-core" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+                <stop offset="18%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="50%" stopColor="rgb(79, 70, 229)" stopOpacity="1" />
+                <stop offset="82%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="100%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+              </linearGradient>
+              {/* Sheen: a thin highlight stripe running down one side of
+                  the core. Adds a subtle "glass" depth so the ribbon
+                  doesn't read as flat fill. */}
+              <linearGradient id="lineage-ribbon-sheen" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgba(255, 255, 255, 0)" />
+                <stop offset="45%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="55%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="100%" stopColor="rgba(255, 255, 255, 0)" />
+              </linearGradient>
+            </defs>
+            {computedStubs.map(stub => {
+              const key = `ribbon-${stub.nodeId}-${stub.side}`
+              // Opacity scales subtly with lineage volume — light pairs
+              // get a quieter ribbon, heavy fan-in nodes get a stronger
+              // accent. log2 cap keeps the difference perceptible
+              // without making heavy-traffic nodes shout.
+              const intensity = Math.min(0.75 + Math.log2(Math.max(1, stub.count)) * 0.06, 1)
+              const haloW = stub.width + 6
+              const haloH = stub.height + 4
+              const sheenW = Math.max(1.4, stub.width * 0.38)
+              const sheenInset = stub.side === 'in'
+                ? stub.width * 0.18   // sheen toward the card-facing side
+                : -stub.width * 0.18
+              const label = stub.count > 1
+                ? `${stub.count.toLocaleString()} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connections`
+                : `${stub.count} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connection`
+              return (
+                <g key={key} className="pointer-events-none" opacity={intensity}>
+                  {/* Halo */}
+                  <rect
+                    x={stub.cx - haloW / 2}
+                    y={stub.cy - haloH / 2}
+                    width={haloW}
+                    height={haloH}
+                    rx={haloW / 2}
+                    ry={haloW / 2}
+                    fill="url(#lineage-ribbon-halo)"
+                  />
+                  {/* Core */}
+                  <rect
+                    x={stub.cx - stub.width / 2}
+                    y={stub.cy - stub.height / 2}
+                    width={stub.width}
+                    height={stub.height}
+                    rx={stub.width / 2}
+                    ry={stub.width / 2}
+                    fill="url(#lineage-ribbon-core)"
+                  />
+                  {/* Sheen */}
+                  <rect
+                    x={stub.cx - sheenW / 2 + sheenInset}
+                    y={stub.cy - stub.height / 2 + 2}
+                    width={sheenW}
+                    height={stub.height - 4}
+                    rx={sheenW / 2}
+                    ry={sheenW / 2}
+                    fill="url(#lineage-ribbon-sheen)"
+                  />
+                  <title>{label}</title>
+                </g>
+              )
+            })}
+          </>
+        )}
 
         {/* ── Trailing overflow edges — partial S-curves fading toward container edge ── */}
         {overflowEdges.map(oe => (
@@ -1121,6 +1338,15 @@ export function LineageFlowOverlay({
               {edge.edgeCount > 1 && (
                 <span className="text-[10px] text-white/50 tabular-nums">
                   ×{edge.edgeCount.toLocaleString()} bundled
+                </span>
+              )}
+              {edge.isBidirectional && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                  style={{ background: `${edge.color}1a`, color: edge.color, border: `1px solid ${edge.color}33` }}
+                  title="Flow exists in both directions between these endpoints"
+                >
+                  Two-way
                 </span>
               )}
             </div>

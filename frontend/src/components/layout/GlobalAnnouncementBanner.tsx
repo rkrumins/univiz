@@ -6,9 +6,10 @@
  * - Users CANNOT permanently dismiss — only snooze for admin-configured duration.
  * - After snooze expires, the banner automatically reappears.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AlertTriangle, CheckCircle, ArrowRight, Sparkles, PauseCircle } from 'lucide-react'
+import { usePolling } from '@/hooks/usePolling'
 import { useAnnouncementStore } from '@/store/announcements'
 
 const SNOOZE_TICK = 1000 // re-check snooze expiry every second
@@ -55,22 +56,18 @@ function formatSnoozeLabel(minutes: number): string {
 export function GlobalAnnouncementBanner() {
   const { announcements, snoozedUntil, pollIntervalSeconds, fetchActive, fetchConfig, snooze } = useAnnouncementStore()
   const [, setTick] = useState(0) // force re-render to check snooze expiry
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Fetch config on mount (polling interval, default snooze)
   useEffect(() => {
     fetchConfig()
   }, [fetchConfig])
 
-  // Poll for announcements — interval is dynamic from backend config
-  useEffect(() => {
-    fetchActive()
-    if (intervalRef.current) clearInterval(intervalRef.current)
-    intervalRef.current = setInterval(fetchActive, pollIntervalSeconds * 1000)
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current)
-    }
-  }, [fetchActive, pollIntervalSeconds])
+  // Poll for announcements with jitter + Page Visibility pause via the
+  // shared hook. ``pollIntervalSeconds`` comes from the admin config
+  // and changes when ops dials it remotely; usePolling re-arms its
+  // timer on dep change. WS-2's ETag headers mean ~95% of these
+  // poll requests become 304 No-Body in steady state.
+  usePolling(fetchActive, pollIntervalSeconds * 1000)
 
   // Tick every second to re-evaluate snooze expiry
   useEffect(() => {

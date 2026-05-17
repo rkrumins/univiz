@@ -14,7 +14,7 @@
  */
 
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react'
-import { AnimatePresence } from 'framer-motion'
+import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { fetchWithTimeout } from '@/services/fetchWithTimeout'
 import {
@@ -32,6 +32,7 @@ import {
 import { useCanvasStore, useCanvasVersion } from '@/store/canvas'
 import { useInstanceAssignments, useReferenceModelStore } from '@/store/referenceModelStore'
 import { useWorkspacesStore } from '@/store/workspaces'
+import { usePreferencesStore } from '@/store/preferences'
 import { useGraphProvider } from '@/providers'
 import type { TraceV2Result } from '@/providers/GraphDataProvider'
 import { useGraphHydration } from '@/hooks/useGraphHydration'
@@ -69,8 +70,9 @@ import { useTraceFilteredHierarchy } from '@/hooks/useTraceFilteredHierarchy'
 import { computeTraceMergeSpine } from '@/hooks/lib/traceMergeSpine'
 import { LayerColumn } from './LayerColumn'
 import { LineageFlowOverlay, EXTREMITY_EDGE_GUTTER_PX } from './LineageFlowOverlay'
+import { GhostLineageOverlay } from './GhostLineageOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
-import { useLoadingToast } from '@/components/ui/toast'
+import { useLoadingToast, useToast } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
 import { TraceBottomDock } from '../trace/TraceBottomDock'
@@ -107,6 +109,14 @@ export function ContextViewCanvas({
   const lineageEdgeTypes = useViewLineageEdgeTypes()
   const isContainmentEdge = useViewIsContainmentEdge()
   const edgeTypeMetadata = useEdgeTypeMetadataMap()
+
+  // Lineage rendering preferences — drive the Stubs/Auto/Raw mode, the
+  // auto-mode size cutover, and the bundle fan-in threshold. Read with
+  // separate selectors so unrelated preference changes don't re-render.
+  const lineageRenderMode = usePreferencesStore((s) => s.lineageRenderMode)
+  const setLineageRenderMode = usePreferencesStore((s) => s.setLineageRenderMode)
+  const autoStubThreshold = usePreferencesStore((s) => s.autoStubThreshold)
+  const lineageBundleFanIn = usePreferencesStore((s) => s.lineageBundleFanIn)
 
   // URN resolver for trace
   const urnResolver = useCallback((nodeId: string) => {
@@ -1032,10 +1042,47 @@ export function ContextViewCanvas({
   // Toggle node expansion with Lazy Loading
   const { loadChildren, searchChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes, failedNodes } = useGraphHydration()
 
-  // Floating loading toasts
-  useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments')
-  useLoadingToast('ctx-agg-edges', isLoadingAggregatedEdges, 'Loading aggregated edges')
-  useLoadingToast('ctx-children', isLoadingChildren, 'Expanding hierarchy')
+  // Hydration phase mirrored into the canvas store by CanvasRouter — drives
+  // the ghost-card stack in empty layers and the GhostLineageOverlay.
+  // Anything-not-complete counts as hydrating so that:
+  //   1. On the first paint (before CanvasRouter's effect has mirrored the
+  //      real 'roots'/'edges' phase) we still show ghosts, not "No entities
+  //      yet". The default store value is 'idle' which is NOT 'complete' —
+  //      so ghosts win the race.
+  //   2. As nodes stream in per-layer, layers that already have nodes show
+  //      real cards while still-empty layers keep their ghosts until phase
+  //      flips to 'complete'. (Per-layer empty check is applied at the prop
+  //      site below.) The previous `nodes.length === 0` global gate killed
+  //      ghosts in empty layers the moment any one layer received a node.
+  const hydrationPhase = useCanvasStore((s) => s.hydrationPhase)
+  const regionCount = useCanvasStore((s) => s.loadingRegions.size)
+  const isHydratingInitial = hydrationPhase !== 'complete'
+
+  // Floating loading toasts — keep the full set so every long-running operation
+  // is explicitly announced. Wording is centralised here.
+  // Two phase-explicit toasts ('ctx-hydrating-entities' / 'ctx-hydrating-edges')
+  // duplicate the global 'hydration' toast from CanvasRouter intentionally: the
+  // global one has a single key that recycles between phases, so users with the
+  // canvas focused want a sticky in-context indicator that the entities AND
+  // edges loads both happened — even if hydration is fast.
+  useLoadingToast('ctx-hydrating-entities', hydrationPhase === 'roots', 'Loading entities…', 'Entities loaded')
+  useLoadingToast('ctx-hydrating-edges', hydrationPhase === 'edges', 'Loading edges between entities…', 'Edges loaded')
+  useLoadingToast('ctx-assignments', assignmentStatus === 'loading', 'Computing layer assignments', 'Layer assignments ready')
+  useLoadingToast('ctx-agg-edges', isLoadingAggregatedEdges, 'Loading aggregated edges', 'Aggregated edges loaded')
+  useLoadingToast('ctx-children', isLoadingChildren, 'Loading child entities', 'Child entities loaded')
+  useLoadingToast('ctx-regions', regionCount > 0, 'Loading region data', 'Region data loaded')
+
+  // Warn the user once when any child fetch fails — gives them an explicit
+  // signal beyond the inline error rows inside the affected parent's subtree.
+  const { showToast } = useToast()
+  const lastFailedCountRef = useRef(0)
+  useEffect(() => {
+    const count = failedNodes?.size ?? 0
+    if (count > lastFailedCountRef.current) {
+      showToast('warning', count === 1 ? '1 entity failed to load' : `${count} entities failed to load`)
+    }
+    lastFailedCountRef.current = count
+  }, [failedNodes, showToast])
 
   // Tracks nodes currently being fetched — prevents duplicate fetches on rapid clicks.
   // A ref (not state) because we need synchronous reads inside the toggle callback.
@@ -1331,13 +1378,14 @@ export function ContextViewCanvas({
     return byNode
   }, [sortedLayers, nodeLayerMap])
 
-  // Browse-mode bundling threshold. The pre-bundle edge count above which
-  // the projection rolls leaf-pair edges up to their containment parents.
-  // 800 is empirically where SVG-edge density crosses from "readable" into
-  // "fog" on a typical layered canvas — chosen to match the renderer's
-  // density-tier thresholds.
-  const BROWSE_BUNDLE_THRESHOLD = 800
-  const browseBundleEnabled = !trace.isTracing && edges.length > BROWSE_BUNDLE_THRESHOLD
+  // Browse-mode bundling is on by default. The previous behaviour gated it
+  // behind `edges.length > 800`, which meant the most common dense case
+  // (300–700 edges with high per-pair fan-in) never bundled — bundling
+  // would only kick in after the canvas was already overloaded. Letting
+  // the projection run from the first edge collapses leaf pairs to
+  // collapsed-parent bundles immediately; expanded parents stay at leaf
+  // resolution because the walk respects `expandedNodes`.
+  const browseBundleEnabled = !trace.isTracing
 
   // Edge projection: lineageEdges, visibleLineageEdges
   // Pass the trace-filtered views so projected edges only reference visible
@@ -1365,20 +1413,65 @@ export function ContextViewCanvas({
     // exceeds the threshold.
     browseBundleEnabled,
     browseBundleParentMap: parentMap,
-    browseBundleFanInThreshold: 1,
+    browseBundleFanInThreshold: lineageBundleFanIn,
     nodeLayerIndexMap,
   })
 
+  // Render-mode resolution: `raw` shows every projected edge; `stubs`
+  // suppresses them in favour of per-node stub indicators; `auto` flips
+  // between the two based on `autoStubThreshold`. Trace mode bypasses
+  // the gate so an active trace always shows its edges.
+  const isStubsMode = useMemo(() => {
+    if (trace.isTracing) return false
+    if (lineageRenderMode === 'raw') return false
+    if (lineageRenderMode === 'stubs') return true
+    return visibleLineageEdges.length > autoStubThreshold
+  }, [trace.isTracing, lineageRenderMode, visibleLineageEdges.length, autoStubThreshold])
+
+  // Effective edge set passed to the renderer. In stubs mode only edges
+  // incident to the hovered or selected node materialize (so the user
+  // can drill in by interacting); the canvas otherwise stays light.
+  const effectiveLineageEdges = useMemo(() => {
+    if (!isStubsMode) return visibleLineageEdges
+    const focusIds = new Set<string>()
+    if (hoveredNodeId) focusIds.add(hoveredNodeId)
+    if (selectedNodeId) focusIds.add(selectedNodeId)
+    if (focusIds.size === 0) return []
+    return visibleLineageEdges.filter(e =>
+      focusIds.has(e.source) || focusIds.has(e.target)
+    )
+  }, [visibleLineageEdges, isStubsMode, hoveredNodeId, selectedNodeId])
+
+  // Per-node lineage counts in stubs mode. Drives the small partial-edge
+  // markers on each entity card — a quiet inbound arrow on the left when
+  // `in > 0`, a quiet outbound arrow on the right when `out > 0`. Counts
+  // come from the full projected set (not the hover-filtered slice) so
+  // the markers reflect the entity's true lineage volume regardless of
+  // which edges happen to be materialized for the current hover.
+  const nodeStubCounts = useMemo(() => {
+    if (!isStubsMode) return new Map<string, { in: number; out: number }>()
+    const counts = new Map<string, { in: number; out: number }>()
+    for (const e of visibleLineageEdges) {
+      const s = counts.get(e.source) ?? { in: 0, out: 0 }
+      s.out++
+      counts.set(e.source, s)
+      const t = counts.get(e.target) ?? { in: 0, out: 0 }
+      t.in++
+      counts.set(e.target, t)
+    }
+    return counts
+  }, [visibleLineageEdges, isStubsMode])
+
   // Highlight state: connected nodes/edges for selected node
   const { highlightState, isHighlightActive: isClickHighlightActive } = useHighlightState({
-    selectedNodeId, visibleLineageEdges,
+    selectedNodeId, visibleLineageEdges: effectiveLineageEdges,
     isTracing: trace.isTracing, displayMap, childMap,
   })
 
   // Hover highlight: same visual effect on hover (lighter), defers to click-highlight
   const { hoverHighlight, isHoverActive } = useHoverHighlight({
     hoveredNodeId,
-    visibleLineageEdges,
+    visibleLineageEdges: effectiveLineageEdges,
     isTracing: trace.isTracing,
     displayMap, childMap,
     isClickHighlightActive,
@@ -1508,6 +1601,8 @@ export function ContextViewCanvas({
         onToggleLineageFlow={() => setShowLineageFlow(!showLineageFlow)}
         showEdgeDirection={showEdgeDirection}
         onToggleEdgeDirection={() => setShowEdgeDirection(v => !v)}
+        lineageRenderMode={lineageRenderMode}
+        onSetLineageRenderMode={setLineageRenderMode}
         traceActive={trace.isTracing}
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
         onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
@@ -1607,7 +1702,7 @@ export function ContextViewCanvas({
             right: '1rem',
           }}
         >
-          <EdgeLegend defaultExpanded={false} visibleEdges={visibleLineageEdges} />
+          <EdgeLegend defaultExpanded={false} visibleEdges={effectiveLineageEdges} />
         </div>
 
 
@@ -1625,7 +1720,9 @@ export function ContextViewCanvas({
           {showLineageFlow && (
             <LineageFlowOverlay
               nodes={renderFlat}
-              edges={visibleLineageEdges}
+              edges={effectiveLineageEdges}
+              nodeStubCounts={nodeStubCounts}
+              showStubs={isStubsMode}
               expandedNodes={expandedNodes}
               selectEdge={selectEdge}
               isEdgePanelOpen={isEdgePanelOpen}
@@ -1640,6 +1737,29 @@ export function ContextViewCanvas({
               showDirection={showEdgeDirection}
             />
           )}
+
+          {/* Ghost-edge overlay — dashed pulsing connectors between ghost
+              cards in adjacent layers during initial hydration. Anchored
+              to the actual ghost-card DOM rects (via [data-canvas-ghost]),
+              so the lines land in the same vertical band where real edges
+              will appear once hydration completes. Unmounts the moment any
+              real node arrives (isHydratingInitial flips false). */}
+          <AnimatePresence>
+            {isHydratingInitial && (
+              <motion.div
+                key="ghost-lineage-overlay"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                className="absolute inset-0 pointer-events-none"
+                style={{ zIndex: 1 }}
+              >
+                <GhostLineageOverlay layers={sortedLayers} containerRef={horizontalScrollRef} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
 
           {/*
             z-30 + pointer-events-none on the columns wrapper:
@@ -1698,6 +1818,7 @@ export function ContextViewCanvas({
                 failedNodes={failedNodes}
                 onScroll={handleLayerScroll}
                 onAssignToLayer={(entityId) => handleAssignToLayer(entityId, layer.id)}
+                isHydratingInitial={isHydratingInitial}
               />
             ))}
           </div>

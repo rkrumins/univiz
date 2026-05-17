@@ -15,6 +15,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { HierarchyNode } from './types'
+import type { LineageRenderMode } from '@/store/preferences'
 
 export interface ContextViewHeaderProps {
   // Search
@@ -30,6 +31,13 @@ export interface ContextViewHeaderProps {
   // Edge direction toggle
   showEdgeDirection: boolean
   onToggleEdgeDirection: () => void
+
+  // Edge rendering mode — Stubs (chip-only) / Auto (size-adaptive) / Raw
+  // (render all). Bound to usePreferencesStore.lineageRenderMode; the
+  // canvas reads the same store separately. Header drives the user-
+  // facing toggle; persistence + side effects live in the store.
+  lineageRenderMode: LineageRenderMode
+  onSetLineageRenderMode: (mode: LineageRenderMode) => void
 
   // Trace — global toggle that mirrors the keyboard shortcut. Drawer's
   // per-node trace buttons remain for granular up/down/full control.
@@ -72,6 +80,8 @@ export function ContextViewHeader({
   onToggleLineageFlow,
   showEdgeDirection,
   onToggleEdgeDirection,
+  lineageRenderMode,
+  onSetLineageRenderMode,
   traceActive,
   canTrace,
   onStartTrace,
@@ -179,6 +189,44 @@ export function ContextViewHeader({
             <LucideIcons.MoveRight className="w-3.5 h-3.5" />
             <span>{showEdgeDirection ? 'Direction On' : 'Direction Off'}</span>
           </button>
+
+          {/* Render-mode segmented control. Stubs keeps the canvas clean
+              (edges materialize on hover/select); Auto switches between
+              raw and stubs based on the projected edge count; Raw renders
+              everything. Trace mode ignores this — an active trace always
+              renders its edges. */}
+          <div
+            role="radiogroup"
+            aria-label="Edge render mode"
+            className="flex items-stretch rounded-xl overflow-hidden bg-black/[0.04] border border-black/[0.10] dark:bg-white/[0.04] dark:border-white/[0.08] text-[11px] font-medium"
+          >
+            {(['stubs', 'auto', 'raw'] as const).map(mode => {
+              const active = lineageRenderMode === mode
+              const label = mode === 'stubs' ? 'Stubs' : mode === 'auto' ? 'Auto' : 'Raw'
+              const title = mode === 'stubs'
+                ? 'Show only stub chips; edges materialize on hover or click'
+                : mode === 'auto'
+                  ? 'Render real edges on small graphs; switch to stubs above the size threshold'
+                  : 'Render every projected edge (may be heavy on dense workspaces)'
+              return (
+                <button
+                  key={mode}
+                  role="radio"
+                  aria-checked={active}
+                  title={title}
+                  onClick={() => onSetLineageRenderMode(mode)}
+                  className={cn(
+                    'px-2.5 py-2 transition-colors',
+                    active
+                      ? 'bg-accent-lineage/15 text-accent-lineage dark:bg-accent-lineage/20'
+                      : 'text-ink-muted hover:bg-black/[0.05] hover:text-ink dark:hover:bg-white/[0.05]'
+                  )}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
 

@@ -21,6 +21,7 @@ from backend.app.auth.dependencies import (
     requires,
 )
 from backend.app.common.http_caching import make_etag, maybe_not_modified
+from backend.app.common.single_flight import read_stats_sf
 from backend.app.db.engine import get_db_session
 from backend.app.db.repositories import workspace_repo, provider_repo, ontology_definition_repo, data_source_repo
 from backend.app.providers.manager import provider_manager as provider_registry  # alias during migration
@@ -430,33 +431,6 @@ async def get_cached_stats(
         parse_iso, ttl_seconds,
     )
 
-    cache = await get_data_source_stats(session, ds_id)
-    if not cache:
-        msg_id = await enqueue_stats_job_safe(ds_id, workspace_id)
-        return JSONResponse(content=build_computing_envelope(ds_id, workspace_id, msg_id))
-
-    age = age_seconds(parse_iso(cache.updated_at))
-    tier = classify_tier(age)
-    if tier == "expired":
-        msg_id = await enqueue_stats_job_safe(ds_id, workspace_id)
-        return JSONResponse(content=build_computing_envelope(ds_id, workspace_id, msg_id))
-
-    # Cache-hit path: short-circuit with 304 if the client already has
-    # this exact (ds_id, updated_at) tuple. The composite payload is a
-    # pure function of those two, so an ETag match means "your cached
-    # body is still byte-identical to what we'd send." Time-dependent
-    # meta fields (age_seconds, ttl_seconds, refreshing) are recomputed
-    # by the client from their cached updated_at — same accuracy.
-    etag = make_etag("cached-stats", ds_id, cache.updated_at)
-    not_modified = maybe_not_modified(request, etag)
-    if not_modified is not None:
-        return not_modified
-
-    refreshing = False
-    if tier == "stale":
-        await enqueue_stats_job_safe(ds_id, workspace_id)
-        refreshing = True
-
     def _maybe_load(raw):
         if not raw or raw == "{}":
             return None
@@ -465,30 +439,87 @@ async def get_cached_stats(
         except (ValueError, TypeError):
             return None
 
-    composite = {
-        "nodeCount": cache.node_count or 0,
-        "edgeCount": cache.edge_count or 0,
-        "entityTypeCounts": _maybe_load(cache.entity_type_counts) or {},
-        "edgeTypeCounts": _maybe_load(cache.edge_type_counts) or {},
-        "schemaStats": _maybe_load(cache.schema_stats),
-        "ontologyMetadata": _maybe_load(cache.ontology_metadata),
-        "graphSchema": _maybe_load(cache.graph_schema),
-    }
+    async def _build_snapshot() -> dict:
+        """The single-flight-protected snapshot build.
 
-    service_status, last_error = await classify_stats_service_health(session, ds_id)
-    meta = build_meta(
-        status="fresh" if tier == "fresh" else "stale",
-        source="postgres",
-        data_source_id=ds_id,
-        age_seconds=age,
-        ttl_seconds=ttl_seconds(age),
-        stats_service_status=service_status,
-        provider_health="unreachable" if last_error else "healthy",
-        refreshing=refreshing,
-        updated_at=cache.updated_at,
-    )
+        Encapsulates the expensive shared work: cache row read +
+        classification + job enqueue + service-status probe + envelope
+        construction. When 100 concurrent callers arrive for the same
+        ``ds_id``, exactly one runs this body and the rest share the
+        returned dict — turning what was 100 cache rows + 100 job
+        enqueues into 1 + 1. Returns a plain dict (not the ORM row)
+        so the shared result has no implicit session affinity.
+        """
+        cache = await get_data_source_stats(session, ds_id)
+        if not cache:
+            msg_id = await enqueue_stats_job_safe(ds_id, workspace_id)
+            return {
+                "computing": True,
+                "envelope": build_computing_envelope(ds_id, workspace_id, msg_id),
+            }
+
+        age = age_seconds(parse_iso(cache.updated_at))
+        tier = classify_tier(age)
+        if tier == "expired":
+            msg_id = await enqueue_stats_job_safe(ds_id, workspace_id)
+            return {
+                "computing": True,
+                "envelope": build_computing_envelope(ds_id, workspace_id, msg_id),
+            }
+
+        refreshing = False
+        if tier == "stale":
+            await enqueue_stats_job_safe(ds_id, workspace_id)
+            refreshing = True
+
+        composite = {
+            "nodeCount": cache.node_count or 0,
+            "edgeCount": cache.edge_count or 0,
+            "entityTypeCounts": _maybe_load(cache.entity_type_counts) or {},
+            "edgeTypeCounts": _maybe_load(cache.edge_type_counts) or {},
+            "schemaStats": _maybe_load(cache.schema_stats),
+            "ontologyMetadata": _maybe_load(cache.ontology_metadata),
+            "graphSchema": _maybe_load(cache.graph_schema),
+        }
+
+        service_status, last_error = await classify_stats_service_health(session, ds_id)
+        meta = build_meta(
+            status="fresh" if tier == "fresh" else "stale",
+            source="postgres",
+            data_source_id=ds_id,
+            age_seconds=age,
+            ttl_seconds=ttl_seconds(age),
+            stats_service_status=service_status,
+            provider_health="unreachable" if last_error else "healthy",
+            refreshing=refreshing,
+            updated_at=cache.updated_at,
+        )
+        return {
+            "computing": False,
+            "envelope": build_envelope(composite, meta),
+            "updated_at": cache.updated_at,
+        }
+
+    snapshot = await read_stats_sf.run(("cached-stats", ds_id), _build_snapshot)
+
+    # The cold-cache and expired paths can't 304 — they return a
+    # "computing" envelope so the client knows to start polling. ETag
+    # only applies on the cache-hit path where the body is a pure
+    # function of (ds_id, updated_at).
+    if snapshot["computing"]:
+        return JSONResponse(content=snapshot["envelope"])
+
+    # Per-caller ETag check: ``If-None-Match`` is per-request, so this
+    # has to live outside the single-flight (which shares one body
+    # across all current callers). The ETag itself is computed from
+    # the shared ``updated_at`` so all callers compute the same tag.
+    etag = make_etag("cached-stats", ds_id, snapshot["updated_at"])
+    not_modified = maybe_not_modified(request, etag)
+    if not_modified is not None:
+        return not_modified
+
     return JSONResponse(
-        content=build_envelope(composite, meta),
+        content=snapshot["envelope"],
         headers={
             "ETag": etag,
             "Cache-Control": "private, max-age=0, must-revalidate",

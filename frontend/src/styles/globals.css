@@ -505,3 +505,91 @@
   opacity: 0.4;
 }
 
+/* === Ghost-state loading visuals ============================================
+ * Used by GhostFlatTreeItem (skeleton cards inside empty layer columns during
+ * initial hydration) and GhostLineageOverlay (dashed bezier ghost edges).
+ * The card silhouette is real — only the title/badge text and icon glyph
+ * are replaced with the soft sweep below. See plan:
+ * /Users/rkrumins/.claude/plans/when-opening-frontend-src-components-can-velvety-piglet.md
+ * ========================================================================== */
+
+.ghost-shimmer {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ghost-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.10) 50%,
+    transparent 100%
+  );
+  transform: translateX(-100%);
+  animation: ghostShimmerSweep 1.8s ease-in-out infinite;
+  animation-delay: var(--ghost-delay, 0ms);
+}
+
+@keyframes ghostShimmerSweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Subtle inset shimmer for the icon-container slot — keeps the gradient
+ * background dominant so the layer color still reads. */
+.ghost-icon-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    135deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.07) 50%,
+    transparent 100%
+  );
+  transform: translateX(-100%);
+  animation: ghostShimmerSweep 1.8s ease-in-out infinite;
+  animation-delay: var(--ghost-delay, 0ms);
+  pointer-events: none;
+}
+
+/* Ghost edge — opacity pulse synced with card shimmer */
+@keyframes ghostEdgePulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.70; }
+}
+
+/* Ghost edge — dashoffset march so the dashes glide left → right */
+@keyframes ghostEdgeFlow {
+  from { stroke-dashoffset: 0; }
+  to   { stroke-dashoffset: -20; }
+}
+
+.ghost-edge-path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 6;
+  animation:
+    ghostEdgePulse 1.8s ease-in-out infinite,
+    ghostEdgeFlow 1.4s linear infinite;
+  animation-delay: var(--ghost-delay, 0ms);
+}
+
+/* Reduced-motion users see static tints instead of sweeping animations.
+ * The layer-color accent border and icon-container gradient still make the
+ * ghost state legible without movement. */
+@media (prefers-reduced-motion: reduce) {
+  .ghost-shimmer::after,
+  .ghost-icon-shimmer,
+  .ghost-edge-path {
+    animation: none;
+  }
+  .ghost-shimmer::after { transform: none; opacity: 0.4; }
+  .ghost-icon-shimmer  { transform: none; opacity: 0.5; }
+  .ghost-edge-path     { opacity: 0.45; }
+}
+
