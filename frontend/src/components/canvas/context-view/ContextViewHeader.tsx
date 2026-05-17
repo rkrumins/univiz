@@ -16,6 +16,7 @@ import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { HierarchyNode } from './types'
 import type { LineageRenderMode } from '@/store/preferences'
+import { LineageDisplayPopover } from './LineageDisplayPopover'
 
 export interface ContextViewHeaderProps {
   // Search
@@ -151,9 +152,12 @@ export function ContextViewHeader({
 
         {/* Zone 3 — Actions */}
         <div className="flex items-center gap-3">
-          {/* Lineage Flow Toggle */}
+          {/* Lineage Flow Toggle — single stable label. State is conveyed
+              through the colored dot + active gradient. Trace state lives
+              on its own button below; this label no longer encodes it. */}
           <button
             onClick={onToggleLineageFlow}
+            title={showLineageFlow ? 'Hide the lineage mesh on the canvas' : 'Show the lineage mesh on the canvas'}
             className={cn(
               "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all duration-300",
               showLineageFlow
@@ -164,69 +168,25 @@ export function ContextViewHeader({
             <motion.div animate={{ rotate: showLineageFlow ? 0 : -180 }} transition={{ duration: 0.3 }}>
               <LucideIcons.GitBranch className="w-4 h-4" />
             </motion.div>
-            <span>
-              {showLineageFlow
-                ? (traceActive ? 'Flow + Trace' : 'Flow Active')
-                : 'Show Flow'}
-            </span>
+            <span>Lineage</span>
             <div className={cn(
               "w-2 h-2 rounded-full transition-colors duration-300",
               showLineageFlow ? "bg-green-500 dark:bg-green-400 dark:shadow-lg dark:shadow-green-400/50" : "bg-ink-muted/30"
             )} />
           </button>
 
-          {/* Show Direction toggle */}
-          <button
-            onClick={onToggleEdgeDirection}
-            title={showEdgeDirection ? 'Hide edge direction' : 'Show edge direction'}
-            className={cn(
-              "flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300",
-              showEdgeDirection
-                ? "bg-gradient-to-r from-cyan-500/15 to-cyan-500/[0.08] text-cyan-700 border border-cyan-400/40 shadow-sm shadow-cyan-500/10 dark:from-cyan-500/20 dark:to-cyan-500/10 dark:text-cyan-300 dark:border-cyan-400/30 dark:shadow-lg dark:shadow-cyan-400/10"
-                : "bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]"
-            )}
-          >
-            <LucideIcons.MoveRight className="w-3.5 h-3.5" />
-            <span>{showEdgeDirection ? 'Direction On' : 'Direction Off'}</span>
-          </button>
-
-          {/* Render-mode segmented control. Stubs keeps the canvas clean
-              (edges materialize on hover/select); Auto switches between
-              raw and stubs based on the projected edge count; Raw renders
-              everything. Trace mode ignores this — an active trace always
-              renders its edges. */}
-          <div
-            role="radiogroup"
-            aria-label="Edge render mode"
-            className="flex items-stretch rounded-xl overflow-hidden bg-black/[0.04] border border-black/[0.10] dark:bg-white/[0.04] dark:border-white/[0.08] text-[11px] font-medium"
-          >
-            {(['stubs', 'auto', 'raw'] as const).map(mode => {
-              const active = lineageRenderMode === mode
-              const label = mode === 'stubs' ? 'Stubs' : mode === 'auto' ? 'Auto' : 'Raw'
-              const title = mode === 'stubs'
-                ? 'Show only stub chips; edges materialize on hover or click'
-                : mode === 'auto'
-                  ? 'Render real edges on small graphs; switch to stubs above the size threshold'
-                  : 'Render every projected edge (may be heavy on dense workspaces)'
-              return (
-                <button
-                  key={mode}
-                  role="radio"
-                  aria-checked={active}
-                  title={title}
-                  onClick={() => onSetLineageRenderMode(mode)}
-                  className={cn(
-                    'px-2.5 py-2 transition-colors',
-                    active
-                      ? 'bg-accent-lineage/15 text-accent-lineage dark:bg-accent-lineage/20'
-                      : 'text-ink-muted hover:bg-black/[0.05] hover:text-ink dark:hover:bg-white/[0.05]'
-                  )}
-                >
-                  {label}
-                </button>
-              )
-            })}
-          </div>
+          {/* Display popover — consolidates Edge Density (Stubs/Auto/Raw)
+              and Direction arrows behind a single trigger. Hidden when
+              Lineage is off: with no mesh rendering, these settings have
+              no effect, so the toolbar stays uncluttered. */}
+          {showLineageFlow && (
+            <LineageDisplayPopover
+              lineageRenderMode={lineageRenderMode}
+              onSetLineageRenderMode={onSetLineageRenderMode}
+              showEdgeDirection={showEdgeDirection}
+              onToggleEdgeDirection={onToggleEdgeDirection}
+            />
+          )}
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
 
