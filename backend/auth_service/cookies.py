@@ -24,6 +24,13 @@ from .interface import SessionTokens
 ACCESS_COOKIE_NAME = "nx_access"
 REFRESH_COOKIE_NAME = "nx_refresh"
 CSRF_COOKIE_NAME = "nx_csrf"
+# Short-lived signed cookie holding the in-flight OIDC handshake
+# (state / nonce / PKCE verifier). Scoped to the auth subtree so it is
+# only ever sent to the callback. SameSite=Lax is required: the IdP
+# redirects back via a top-level GET navigation.
+OIDC_COOKIE_NAME = "nx_oidc"
+OIDC_COOKIE_PATH = "/api/v1/auth/"
+_OIDC_COOKIE_MAX_AGE = 600
 
 # Refresh cookie is scoped to the /auth subtree so it's sent to /refresh
 # AND /logout (logout needs to read it to revoke the rotation family)
@@ -95,3 +102,24 @@ def read_refresh_cookie(request: Request) -> str | None:
 
 def read_csrf_cookie(request: Request) -> str | None:
     return request.cookies.get(CSRF_COOKIE_NAME)
+
+
+def set_oidc_cookie(response: Response, state_token: str) -> None:
+    response.set_cookie(
+        key=OIDC_COOKIE_NAME,
+        value=state_token,
+        max_age=_OIDC_COOKIE_MAX_AGE,
+        httponly=True,
+        path=OIDC_COOKIE_PATH,
+        **_common_kwargs(),
+    )
+
+
+def clear_oidc_cookie(response: Response) -> None:
+    response.delete_cookie(
+        OIDC_COOKIE_NAME, path=OIDC_COOKIE_PATH, **_common_kwargs()
+    )
+
+
+def read_oidc_cookie(request: Request) -> str | None:
+    return request.cookies.get(OIDC_COOKIE_NAME)

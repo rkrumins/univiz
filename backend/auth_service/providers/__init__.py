@@ -1,6 +1,7 @@
 """Identity provider registry — pluggable per-protocol implementations."""
 from .base import IdentityProvider, ProviderCredentials, ProviderIdentity
 from .local import LocalIdentityProvider
+from .oidc import OidcProvider, load_oidc_settings
 
 _REGISTRY: dict[str, IdentityProvider] = {}
 
@@ -24,6 +25,8 @@ __all__ = [
     "ProviderCredentials",
     "ProviderIdentity",
     "LocalIdentityProvider",
+    "OidcProvider",
+    "load_oidc_settings",
     "register_provider",
     "get_provider",
     "known_providers",

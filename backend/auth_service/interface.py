@@ -100,6 +100,15 @@ class IdentityService(Protocol):
         """Look up a user by id. Returns ``None`` if not found or deleted."""
         ...
 
+    async def complete_sso_login(self, identity) -> tuple[User, SessionTokens]:
+        """Find-or-provision a user from a verified SSO ``ProviderIdentity``
+        and issue a fresh session.
+
+        Applies the identity-linking guardrails. Raises ``SSOAuthError``
+        when linking is unsafe (the caller surfaces a generic failure).
+        """
+        ...
+
 
 # ── Errors ───────────────────────────────────────────────────────────
 
@@ -115,6 +124,13 @@ class InvalidRefreshToken(AuthError):
     """Refresh token is missing, malformed, expired, or reused."""
 
 
+class SSOAuthError(AuthError):
+    """SSO login could not be completed — e.g. the IdP subject's email
+    collides with an existing account and auto-linking is unsafe. The
+    route maps this to a generic failure; the reason is audited, not
+    shown to the browser."""
+
+
 __all__ = [
     "User",
     "SessionTokens",
@@ -122,4 +138,5 @@ __all__ = [
     "AuthError",
     "InvalidCredentials",
     "InvalidRefreshToken",
+    "SSOAuthError",
 ]

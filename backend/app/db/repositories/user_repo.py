@@ -68,6 +68,75 @@ async def get_user_by_id(session: AsyncSession, user_id: str) -> Optional[UserOR
     return result.scalar_one_or_none()
 
 
+# ── SSO identity (provider + external subject) ─────────────────────────
+
+async def get_user_by_external_identity(
+    session: AsyncSession, auth_provider: str, external_id: str,
+) -> Optional[UserORM]:
+    """Look up by the SSO join key. This — never email — is the durable
+    identity key for provisioned/linked SSO accounts."""
+    result = await session.execute(
+        select(UserORM).where(
+            UserORM.auth_provider == auth_provider,
+            UserORM.external_id == external_id,
+            UserORM.deleted_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_sso_user(
+    session: AsyncSession,
+    *,
+    email: str,
+    first_name: str,
+    last_name: str,
+    auth_provider: str,
+    external_id: str,
+    password_hash: str,
+) -> UserORM:
+    """JIT-provision an IdP-owned account. Active immediately (the IdP
+    authenticated the subject); no role bindings — permissions stay
+    default-deny until a group/role mapping or admin grant lands.
+
+    ``password_hash`` is a discardable random Argon2id hash so the local
+    password path can never authenticate this account."""
+    user = UserORM(
+        email=email.strip().lower(),
+        password_hash=password_hash,
+        first_name=first_name.strip(),
+        last_name=last_name.strip(),
+        status="active",
+        auth_provider=auth_provider,
+        external_id=external_id,
+    )
+    session.add(user)
+    await session.flush()
+    return user
+
+
+async def link_user_to_provider(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    auth_provider: str,
+    external_id: str,
+    disabled_password_hash: str,
+) -> Optional[UserORM]:
+    """Bind an existing local account to an SSO subject and disable its
+    password login (the hash is replaced with a discardable random
+    one). Caller must have already enforced the linking guardrails."""
+    user = await get_user_by_id(session, user_id)
+    if user is None:
+        return None
+    user.auth_provider = auth_provider
+    user.external_id = external_id
+    user.password_hash = disabled_password_hash
+    user.updated_at = _now()
+    await session.flush()
+    return user
+
+
 async def list_users(
     session: AsyncSession,
     status: Optional[str] = None,

@@ -9,25 +9,34 @@ implementation for an HTTP client only requires touching app startup.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from ..cookies import (
+    clear_oidc_cookie,
     clear_session_cookies,
     read_access_cookie,
+    read_oidc_cookie,
     read_refresh_cookie,
+    set_oidc_cookie,
     set_session_cookies,
 )
+from ..core.tokens import create_oidc_state_token, decode_oidc_state_token
 from ..interface import (
     IdentityService,
     InvalidCredentials,
     InvalidRefreshToken,
+    SSOAuthError,
     User,
 )
+from ..providers import get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +158,124 @@ async def refresh(request: Request, response: Response):
 
     set_session_cookies(response, tokens)
     return SessionResponse(user=user)
+
+
+# ── OIDC (Authorization Code + PKCE) ──────────────────────────────────
+
+# Generic, relative landing pages. Absolute URLs are never used so the
+# callback can't be turned into an open redirect.
+_OIDC_FAILURE_PATH = "/login?sso_error=1"
+
+
+def _oidc_provider():
+    """Return the registered, enabled OIDC provider or 404."""
+    try:
+        provider = get_provider("oidc")
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OIDC is not configured")
+    if not getattr(provider, "enabled", False):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "OIDC is not configured")
+    return provider
+
+
+def _safe_next(raw: str | None) -> str:
+    """Only allow a same-site relative path. Anything that could escape
+    the origin (scheme, host, protocol-relative ``//``) falls back to
+    the app root — an open-redirect guard on the post-login bounce."""
+    if not raw or not raw.startswith("/") or raw.startswith("//"):
+        return "/"
+    return raw
+
+
+@router.get("/oidc/login")
+async def oidc_login(request: Request, next: str | None = None):
+    """Leg 1: build the IdP authorization URL and 302 there.
+
+    The handshake parameters (state / nonce / PKCE verifier) are signed
+    into the short-lived, HttpOnly ``nx_oidc`` cookie — no server-side
+    session store.
+    """
+    provider = _oidc_provider()
+    next_path = _safe_next(next)
+    try:
+        auth_url, flow = await provider.build_authorization(next_path)
+    except Exception as exc:  # noqa: BLE001 — config/network → generic 503
+        logger.warning("OIDC authorize build failed: %s", exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "OIDC temporarily unavailable"
+        )
+
+    state_token = create_oidc_state_token(
+        state=flow["state"],
+        nonce=flow["nonce"],
+        code_verifier=flow["code_verifier"],
+        next_path=flow["next"],
+    )
+    response = RedirectResponse(auth_url, status_code=status.HTTP_302_FOUND)
+    set_oidc_cookie(response, state_token)
+    return response
+
+
+@router.get("/oidc/callback")
+async def oidc_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    """Leg 2: validate ``state``, exchange the code, verify the ID
+    token, then find-or-provision and issue the session.
+
+    Every failure path clears the flow cookie and bounces to a generic
+    error page — the browser never sees the reason (it's audited).
+    """
+    provider = _oidc_provider()
+    svc = _identity_service(request)
+
+    def _fail(reason: str) -> RedirectResponse:
+        logger.info("OIDC callback failed: %s", reason)
+        resp = RedirectResponse(
+            _OIDC_FAILURE_PATH, status_code=status.HTTP_302_FOUND
+        )
+        clear_oidc_cookie(resp)
+        return resp
+
+    if error or not code or not state:
+        return _fail(f"idp_error={error or 'missing_code_or_state'}")
+
+    raw_cookie = read_oidc_cookie(request)
+    if not raw_cookie:
+        return _fail("missing_flow_cookie")
+    try:
+        flow = decode_oidc_state_token(raw_cookie)
+    except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError) as exc:
+        return _fail(f"bad_flow_cookie:{exc}")
+
+    # Constant-time state comparison (CSRF defence for the callback).
+    if not hmac.compare_digest(str(flow.get("state", "")), state):
+        return _fail("state_mismatch")
+
+    try:
+        identity = await provider.fetch_identity(
+            code=code,
+            code_verifier=flow["code_verifier"],
+            nonce=flow["nonce"],
+        )
+    except Exception as exc:  # noqa: BLE001 — OidcError etc. → generic
+        return _fail(f"token_or_idtoken:{exc}")
+
+    try:
+        user, tokens = await svc.complete_sso_login(identity)
+    except SSOAuthError as exc:
+        return _fail(f"sso_login_rejected:{exc}")
+
+    response = RedirectResponse(
+        _safe_next(flow.get("next")), status_code=status.HTTP_302_FOUND
+    )
+    set_session_cookies(response, tokens)
+    clear_oidc_cookie(response)
+    logger.info("OIDC login succeeded for user=%s", user.id)
+    return response
 
 
 # ── GET /auth/me ──────────────────────────────────────────────────────

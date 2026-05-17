@@ -287,6 +287,18 @@ async def lifespan(_app: FastAPI):
     #    client implementing the same protocol.
     register_provider("local", LocalIdentityProvider())
 
+    # Phase 1: OIDC (Authorization Code + PKCE). Always registered so
+    # the /auth/oidc/* routes can answer 404 when unconfigured; the
+    # provider self-reports ``enabled`` from env (OIDC_ENABLED + creds).
+    from backend.auth_service.providers import OidcProvider, load_oidc_settings
+    _oidc_settings = load_oidc_settings()
+    register_provider("oidc", OidcProvider(_oidc_settings))
+    logger.info(
+        "OIDC provider registered (enabled=%s, issuer=%s)",
+        _oidc_settings.enabled,
+        _oidc_settings.issuer or "<unset>",
+    )
+
     async def _emit_user_event(session, event_type: str, payload: dict) -> None:
         await user_repo.create_outbox_event(session, event_type=event_type, payload=payload)
 
