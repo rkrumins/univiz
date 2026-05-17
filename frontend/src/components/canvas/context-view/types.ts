@@ -75,4 +75,10 @@ export type ComputedEdge = {
    * Drives the badge label "+N pairs" instead of "+N edges".
    */
   isBrowseBundle?: boolean
+  /**
+   * True when the projection collapsed an A→B and a B→A bundle into a
+   * single record. Renderer should draw a dual-arrowhead path
+   * (markerStart + markerEnd) to communicate two-way flow.
+   */
+  isBidirectional?: boolean
 }

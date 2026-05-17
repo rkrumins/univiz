@@ -61,6 +61,9 @@ export function useContainmentHierarchy({
   const prevFingerprintRef = useRef(fingerprint)
   const childSetsRef = useRef(new Map<string, Set<string>>())
   const parentMapRef = useRef(new Map<string, string>())
+  const childMapRef = useRef(new Map<string, string[]>())
+  const childMapSourceRef = useRef<Map<string, Set<string>> | null>(null)
+  const childMapKeyRef = useRef<string>('')
 
   const { nodeMap, childMap, parentMap } = useMemo(() => {
     const nMap = new Map(nodes.map((n) => [n.id, n]))
@@ -75,15 +78,39 @@ export function useContainmentHierarchy({
     let pMap: Map<string, string>
 
     if (needsFullRebuild) {
-      // Full rebuild
-      cSets = new Map<string, Set<string>>()
-      pMap = new Map<string, string>()
+      // Full rebuild into fresh maps. After building, compare content with
+      // the previous parentMap and reuse the old reference if equal — the
+      // canvas-version fingerprint flips on every store mutation (including
+      // lineage-edge merges that don't touch containment), so a content-
+      // equal rebuild would otherwise invalidate downstream memos that
+      // consume `parentMap` (e.g. useEdgeProjection's bundling pass).
+      const newCSets = new Map<string, Set<string>>()
+      const newPMap = new Map<string, string>()
       for (const edge of edges) {
         if (!edge.source || !edge.target) continue
         if (!isContainmentEdge(normalizeEdgeType(edge))) continue
-        if (!cSets.has(edge.source)) cSets.set(edge.source, new Set())
-        cSets.get(edge.source)!.add(edge.target)
-        pMap.set(edge.target, edge.source)
+        if (!newCSets.has(edge.source)) newCSets.set(edge.source, new Set())
+        newCSets.get(edge.source)!.add(edge.target)
+        newPMap.set(edge.target, edge.source)
+      }
+
+      const prevPMap = parentMapRef.current
+      let parentMapEqual = prevPMap.size === newPMap.size
+      if (parentMapEqual) {
+        for (const [k, v] of newPMap) {
+          if (prevPMap.get(k) !== v) { parentMapEqual = false; break }
+        }
+      }
+
+      if (parentMapEqual) {
+        // Content unchanged — keep the prior refs so downstream memos
+        // (parentMap-keyed bundling, layer assignment, trace filter) see
+        // stable references and skip re-projection.
+        pMap = prevPMap
+        cSets = childSetsRef.current
+      } else {
+        pMap = newPMap
+        cSets = newCSets
       }
     } else {
       // Incremental: reuse previous maps, only process new edges
@@ -100,9 +127,27 @@ export function useContainmentHierarchy({
       }
     }
 
-    // Convert Sets to arrays for downstream consumers
-    const cMap = new Map<string, string[]>()
-    cSets.forEach((children, parent) => cMap.set(parent, Array.from(children)))
+    // Convert Sets to arrays for downstream consumers. Cache the derived
+    // cMap and reuse its reference when the underlying cSets hasn't changed
+    // structurally — keyed by (reference, parent-count, total-children).
+    // Incremental rebuilds mutate cSets in place, so a reference match alone
+    // is insufficient; we also compare the total child count to detect adds.
+    let totalChildren = 0
+    cSets.forEach(set => { totalChildren += set.size })
+    const cMapKey = `${cSets.size}:${totalChildren}`
+    let cMap: Map<string, string[]>
+    if (
+      childMapSourceRef.current === cSets
+      && childMapKeyRef.current === cMapKey
+    ) {
+      cMap = childMapRef.current
+    } else {
+      cMap = new Map<string, string[]>()
+      cSets.forEach((children, parent) => cMap.set(parent, Array.from(children)))
+      childMapRef.current = cMap
+      childMapSourceRef.current = cSets
+      childMapKeyRef.current = cMapKey
+    }
 
     // Update refs for next incremental pass
     prevEdgeLenRef.current = edges.length

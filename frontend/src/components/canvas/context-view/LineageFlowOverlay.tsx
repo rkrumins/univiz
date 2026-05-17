@@ -24,6 +24,8 @@ export const EXTREMITY_EDGE_GUTTER_PX =
 export function LineageFlowOverlay({
   nodes,
   edges,
+  nodeStubCounts,
+  showStubs = false,
   expandedNodes,
   selectEdge,
   isEdgePanelOpen,
@@ -39,6 +41,17 @@ export function LineageFlowOverlay({
 }: {
   nodes: any[],
   edges: any[],
+  /**
+   * Per-node lineage counts for the stub indicators. Drives a short
+   * partial-edge marker on each entity card: a quiet inbound arrow on
+   * the left if `in > 0`, a quiet outbound arrow on the right if
+   * `out > 0`. The stubs are entity-anchored decorations — they never
+   * attempt to span across to a partner node. Hover/select on an entity
+   * materializes the real edges over these markers.
+   */
+  nodeStubCounts?: Map<string, { in: number; out: number }>,
+  /** When true, render the per-node stub indicators. */
+  showStubs?: boolean,
   expandedNodes: Set<string>,
   selectEdge: (id: string) => void,
   isEdgePanelOpen: boolean,
@@ -60,6 +73,19 @@ export function LineageFlowOverlay({
   const [overflowBadges, setOverflowBadges] = useState<OverflowBadge[]>([])
   // Trailing edge stubs — partial curves from visible nodes toward container boundary
   const [overflowEdges, setOverflowEdges] = useState<OverflowEdge[]>([])
+  // Per-node lineage indicators — tight indigo ribbons that "peek out"
+  // from behind each entity card on the side(s) with lineage. The
+  // ribbon is rendered in the overlay's lower z-index so the card
+  // chrome hides the inboard portion — visually it reads as a soft
+  // glow tab integrated into the card design rather than a separate
+  // decoration. Stroke width / opacity scale with the lineage count.
+  const [computedStubs, setComputedStubs] = useState<Array<{
+    nodeId: string
+    side: 'in' | 'out'
+    count: number
+    cx: number; cy: number  // ribbon center
+    width: number; height: number
+  }>>([])
 
   // Viewport tracking for virtualization
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: typeof window !== 'undefined' ? window.innerHeight : 1000 })
@@ -111,6 +137,7 @@ export function LineageFlowOverlay({
     }
     return { bySource, byTarget }
   }, [edges])
+
 
   // Debounced update function using requestAnimationFrame
   const scheduleUpdate = useCallback(() => {
@@ -364,6 +391,7 @@ export function LineageFlowOverlay({
             isFocusIncident,
             isReverseFlow: isRev,
             isBrowseBundle: !!(edge as any).isBrowseBundle,
+            isBidirectional: !!(edge as any).isBidirectional,
           })
         }
         return
@@ -432,6 +460,66 @@ export function LineageFlowOverlay({
 
     setComputedEdges(newComputedEdges)
 
+    // ── Per-node lineage ribbons ────────────────────────────────────────
+    //
+    // For every visible entity that has lineage on either side, emit a
+    // tight indigo ribbon that PEEKS OUT from behind the card's edge.
+    // The overlay sits at z-[5] and the card chrome at z-[10]+, so the
+    // inboard portion of the ribbon is hidden naturally by the card —
+    // the visible result is a soft glow tab attached to the card edge.
+    // No external spacing, no floating decorations, no arrows trying to
+    // bridge gaps. Just a quiet "this side has lineage" indicator that
+    // reads as part of the card design.
+    //
+    // The ribbon vertical extent is sized to the card's own height
+    // (45%) so it always feels proportional, whether the entity is a
+    // tall layer card or a tight leaf row.
+    if (showStubs && nodeStubCounts && nodeStubCounts.size > 0) {
+      const RIBBON_W = 5
+      const RIBBON_HEIGHT_RATIO = 0.45
+      // 1.5px overlap into the card — enough to anchor visually without
+      // showing a hard edge against the card border. With 5px width the
+      // visible peek-out is ~3.5px on the outboard side.
+      const RIBBON_INSET = 1.5
+      const newStubs: typeof computedStubs = []
+      globalVisibleNodes.forEach(domId => {
+        const nodeId = domId.startsWith('layer-node-') ? domId.slice('layer-node-'.length) : domId
+        const counts = nodeStubCounts.get(nodeId)
+        if (!counts) return
+        const el = getEl(domId)
+        if (!el) return
+        const rect = el.getBoundingClientRect()
+        const midY = rect.top + rect.height / 2 - containerRect.top
+        const height = Math.max(14, rect.height * RIBBON_HEIGHT_RATIO)
+        if (counts.in > 0) {
+          // Inbound ribbon center sits `(RIBBON_W/2 - RIBBON_INSET)` to
+          // the left of the card-left edge — so part of the pill peeks
+          // out, the rest is hidden by the card chrome.
+          const cardLeft = rect.left - containerRect.left
+          newStubs.push({
+            nodeId, side: 'in', count: counts.in,
+            cx: cardLeft - (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+        if (counts.out > 0) {
+          const cardRight = rect.right - containerRect.left
+          newStubs.push({
+            nodeId, side: 'out', count: counts.out,
+            cx: cardRight + (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+      })
+      setComputedStubs(newStubs)
+    } else if (computedStubs.length > 0) {
+      setComputedStubs([])
+    }
+
     const badges: OverflowBadge[] = []
     buckets.forEach((bucket) => {
       const avgX = bucket.gutterXs.reduce((a, b) => a + b, 0) / bucket.gutterXs.length
@@ -444,7 +532,8 @@ export function LineageFlowOverlay({
     })
     setOverflowBadges(badges)
     setOverflowEdges(trailingEdges)
-  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId, showStubs, nodeStubCounts])
 
   // Store updateFlow in ref for ResizeObserver access and expose to parent
   useEffect(() => {
@@ -453,6 +542,15 @@ export function LineageFlowOverlay({
       triggerRedrawRef.current = scheduleUpdate
     }
   }, [updateFlow, scheduleUpdate, triggerRedrawRef])
+
+  // Stubs mode toggles + stub-count changes need a redraw because
+  // updateFlow's identity changes but the observers above don't refire —
+  // without this, switching to stubs (or swapping the per-node counts)
+  // leaves the canvas showing the previous geometry until the next
+  // scroll / resize / hover.
+  useEffect(() => {
+    scheduleUpdate()
+  }, [showStubs, nodeStubCounts, scheduleUpdate])
 
   // ResizeObserver + IntersectionObserver for node elements.
   // Uses MutationObserver to dynamically track layer-node-* elements as they're
@@ -729,8 +827,17 @@ export function LineageFlowOverlay({
               .edge-direction-flow {
                 animation: edgeFlow 1.4s linear infinite;
               }
+              @keyframes lineageStubFlow {
+                to { stroke-dashoffset: -14; }
+              }
+              .lineage-stub-flow {
+                animation: lineageStubFlow 1.6s linear infinite;
+              }
+              .lineage-stub-group {
+                transition: opacity 220ms ease;
+              }
               @media (prefers-reduced-motion: reduce) {
-                .flow-particles, .flow-particles-ghost, .edge-direction-flow {
+                .flow-particles, .flow-particles-ghost, .edge-direction-flow, .lineage-stub-flow {
                   animation: none;
                 }
               }
@@ -757,7 +864,11 @@ export function LineageFlowOverlay({
                 markerHeight="10"
                 refX="11"
                 refY="5"
-                orient="auto"
+                // auto-start-reverse lets the same marker serve markerEnd
+                // (forward arrowhead) AND markerStart (reversed at the
+                // source end) for bidirectional edges — one marker def per
+                // color instead of two.
+                orient="auto-start-reverse"
                 markerUnits="userSpaceOnUse"
               >
                 <polygon points="0 0, 12 5, 0 10, 2 5" fill={c} stroke={c} strokeWidth="0.5" />
@@ -900,6 +1011,7 @@ export function LineageFlowOverlay({
                   transition: 'stroke-width 0.2s ease',
                 }}
                 markerEnd={showDirection ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
+                markerStart={showDirection && edge.isBidirectional ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
                 className="pointer-events-none"
               />
 
@@ -1001,6 +1113,80 @@ export function LineageFlowOverlay({
             </g>
           )
         })}
+
+        {/* ── Per-node partial-edge stubs ─────────────────────────────────
+            Polished, entity-anchored indicators that say "this entity has
+            incoming / outgoing lineage." A short tail (18px) on the
+            inbound side ends at the entity with a notched arrowhead; the
+            outbound side mirrors it. The tail itself fades from quiet at
+            the outer tip to fuller at the arrow — same direction-encoded
+            gradient as a real edge — and is set on the indigo accent so
+            it reads as part of the lineage system, not a separate UI
+            chrome layer.
+
+            Crucially these stubs do NOT span across to a partner node.
+            They're decorations on the entity card. Side-by-side
+            adjacent-layer entities each get their own quiet pair of
+            inbound/outbound markers. Hovering or selecting a node
+            materializes the real edges over these stubs — the markers
+            disappear into the full edge rendering. ─────────────────── */}
+        {computedStubs.length > 0 && (
+          <>
+            <defs>
+              {/* Single direction-encoded gradient. The path always runs
+                  left-to-right (incoming: outer→entity, outgoing: entity→
+                  outer). The arrow is always at the right (`tx`) end of
+                  the path. So a gradient that fades at 0% and strengthens
+                  toward 100% always lands the strong end at the arrow —
+                  identical to how real edges fade from source→target.
+                  objectBoundingBox + a single def serves every stub. */}
+              <linearGradient id="lineage-stub" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
+                <stop offset="40%" stopColor="rgb(129, 140, 248)" stopOpacity="0.32" />
+                <stop offset="100%" stopColor="rgb(99, 102, 241)" stopOpacity="0.95" />
+              </linearGradient>
+              {/* Notched arrowhead — same 5-vertex silhouette as the
+                  real-edge markers, smaller (9×7 vs 12×10) so the stub
+                  reads as the quieter cousin in one consistent visual
+                  vocabulary. Fully opaque so the arrow tip is crisp even
+                  where the stroke gradient has faded. */}
+              <marker
+                id="lineage-stub-arrow"
+                markerWidth="9"
+                markerHeight="7"
+                refX="8.4"
+                refY="3.5"
+                orient="auto-start-reverse"
+                markerUnits="userSpaceOnUse"
+              >
+                <polygon
+                  points="0 0, 9 3.5, 0 7, 1.4 3.5"
+                  fill="rgb(99, 102, 241)"
+                />
+              </marker>
+            </defs>
+            {computedStubs.map(stub => {
+              const key = `stub-${stub.nodeId}-${stub.side}`
+              // Log-scaled width — same family as real bundled-edge formula
+              // (line ~289). Heavy fan-in reads heavier; light pairs stay
+              // thin. Capped 2.4 so high counts don't bulge.
+              const strokeW = Math.min(1.2 + Math.log2(Math.max(1, stub.count)) * 0.45, 2.4)
+              const pathD = `M ${stub.sx} ${stub.sy} L ${stub.tx} ${stub.ty}`
+              return (
+                <g key={key} className="pointer-events-none lineage-stub-group">
+                  <path
+                    d={pathD}
+                    stroke="url(#lineage-stub)"
+                    strokeWidth={strokeW}
+                    strokeLinecap="round"
+                    fill="none"
+                    markerEnd="url(#lineage-stub-arrow)"
+                  />
+                </g>
+              )
+            })}
+          </>
+        )}
 
         {/* ── Trailing overflow edges — partial S-curves fading toward container edge ── */}
         {overflowEdges.map(oe => (
@@ -1121,6 +1307,15 @@ export function LineageFlowOverlay({
               {edge.edgeCount > 1 && (
                 <span className="text-[10px] text-white/50 tabular-nums">
                   ×{edge.edgeCount.toLocaleString()} bundled
+                </span>
+              )}
+              {edge.isBidirectional && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                  style={{ background: `${edge.color}1a`, color: edge.color, border: `1px solid ${edge.color}33` }}
+                  title="Flow exists in both directions between these endpoints"
+                >
+                  Two-way
                 </span>
               )}
             </div>

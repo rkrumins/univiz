@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { create } from 'zustand'
+import { POLLING_INTERVALS, withJitter } from '@/config/polling'
 import { providerService, type ProviderStatusResponse } from '@/services/providerService'
 
 export interface ProviderStatusEntry extends ProviderStatusResponse {}
@@ -14,7 +15,7 @@ interface ProviderStatusState {
   refresh: () => Promise<void>
 }
 
-const POLL_INTERVAL_MS = 30_000
+const POLL_INTERVAL_MS = POLLING_INTERVALS.providerStatus
 
 // P4.2 — persist last-known status to localStorage so a returning visit
 // renders the previous truth instantly while the first poll completes.
@@ -105,7 +106,10 @@ function startPolling() {
 
   const poll = async () => {
     await useProviderStatusStore.getState().refresh()
-    pollTimer = setTimeout(poll, POLL_INTERVAL_MS)
+    // Jitter every reschedule so 1000 clients that mounted near the
+    // same instant don't fire in lockstep forever. Same flat-load
+    // motivation as the announcements + aggregation-history pollers.
+    pollTimer = setTimeout(poll, withJitter(POLL_INTERVAL_MS))
   }
 
   void poll()

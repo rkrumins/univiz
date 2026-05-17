@@ -617,11 +617,63 @@ export function useEdgeProjection({
         isReverseFlow,
         isDelegated: false,
         isResidual: false,
+        isBidirectional: false,
         data: { edgeTypes: typesArray, confidence: maxConfidence, edgeCount }
       })
     })
 
-    return projected
+    // Bidirectional collapse: when projected groups exist for both A→B and
+    // B→A, merge into a single bundle stamped `isBidirectional: true`. The
+    // canonical orientation is `min(sourceId, targetId) → max(...)` so the
+    // renderer has a stable anchor; the dual-arrowhead is the visual cue
+    // for two-way flow. Hover/click can still reveal the underlying per-
+    // direction edges from `data.edgeTypes` and counts.
+    const byPair = new Map<string, { fwd?: any, rev?: any }>()
+    projected.forEach(p => {
+      const a = p.source, b = p.target
+      if (a === b) return
+      const canonical = a < b ? `${a}->${b}` : `${b}->${a}`
+      const slot = byPair.get(canonical) ?? {}
+      if (a < b) slot.fwd = p
+      else slot.rev = p
+      byPair.set(canonical, slot)
+    })
+
+    const merged: any[] = []
+    const consumed = new Set<any>()
+    byPair.forEach((slot, canonical) => {
+      const { fwd, rev } = slot
+      if (fwd && rev) {
+        const [s, t] = canonical.split('->')
+        const types = new Set<string>()
+        ;(fwd.types as string[]).forEach(t => types.add(t))
+        ;(rev.types as string[]).forEach(t => types.add(t))
+        const edgeCount = (fwd.edgeCount as number) + (rev.edgeCount as number)
+        const typesArr = Array.from(types)
+        merged.push({
+          id: `bundle-bi-${canonical}`,
+          source: s,
+          target: t,
+          isBundled: true,
+          isBrowseBundle: fwd.isBrowseBundle || rev.isBrowseBundle,
+          isGhost: fwd.isGhost && rev.isGhost,
+          edgeCount,
+          types: typesArr,
+          confidence: Math.max(fwd.confidence, rev.confidence),
+          isAggregated: fwd.isAggregated || rev.isAggregated,
+          isReverseFlow: false,
+          isDelegated: false,
+          isResidual: false,
+          isBidirectional: true,
+          data: { edgeTypes: typesArr, confidence: Math.max(fwd.confidence, rev.confidence), edgeCount },
+        })
+        consumed.add(fwd)
+        consumed.add(rev)
+      }
+    })
+
+    if (consumed.size === 0) return projected
+    return [...projected.filter(p => !consumed.has(p)), ...merged]
   }, [ancestorMap, lineageEdges, edges, aggregatedEdges, displayMap, urnToIdMap, showLineageFlow, isTracing, traceContextSet, isContainmentEdge, expandedNodes, suppressedAggEdgeKeys, traceAddedEdgeIds, traceBundleParentMap, entityTypeLevels, traceFocusLevel, nodeIndex, browseBundleEnabled, browseBundleParentMap, browseBundleFanInThreshold, nodeLayerIndexMap])
 
   // ── Edge delegation — separate memo so hoveredNodeId changes are O(E) not O(expensive) ──

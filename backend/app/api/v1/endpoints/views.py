@@ -29,6 +29,7 @@ from backend.app.auth.dependencies import (
     rbac_flag,
     requires,
 )
+from backend.app.common.single_flight import normalised_principal, read_views_sf
 from backend.app.db.engine import get_db_session
 from backend.app.db.models import ViewORM
 from backend.app.db.repositories import view_repo
@@ -153,9 +154,22 @@ async def list_popular_views(
     user=Depends(get_optional_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """List the most-favourited enterprise-visible views."""
-    return await view_repo.list_popular_views(
-        session, limit=limit, user_id=_user_id(user),
+    """List the most-favourited enterprise-visible views.
+
+    Single-flight wrapped: when N concurrent callers hit this with the
+    same (principal, limit) pair the leader runs the query and the
+    others receive the same result. Most-favourited views are a
+    homepage-style render that frequently sees burst traffic from
+    every Explorer tab opening at once; this kills the thundering
+    herd against the views + favourites tables.
+    """
+    principal = normalised_principal(_user_id(user))
+    key = ("popular", principal, limit)
+    return await read_views_sf.run(
+        key,
+        lambda: view_repo.list_popular_views(
+            session, limit=limit, user_id=_user_id(user),
+        ),
     )
 
 
@@ -169,8 +183,15 @@ async def get_view_facets(
     dropdowns from the authoritative DB-wide set of values rather than
     deriving them from the currently-loaded page (which would miss
     tags/creators beyond the first page at scale).
+
+    Single-flight wrapped: facets is a global aggregation read with a
+    fixed key. Under any concurrency, exactly one worker runs the
+    aggregate and the rest piggy-back on its result.
     """
-    return await view_repo.get_view_facets(session)
+    return await read_views_sf.run(
+        ("facets",),
+        lambda: view_repo.get_view_facets(session),
+    )
 
 
 @router.get("/stats", response_model=ViewCatalogStats)
