@@ -41,10 +41,15 @@ REVOCATION_TTL_SECONDS: int = int(
 )
 
 _KEY_PREFIX = "rbac:revoked:"
+_USER_SIDS_PREFIX = "rbac:user_sids:"
 
 
 def _key(sid: str) -> str:
     return f"{_KEY_PREFIX}{sid}"
+
+
+def _user_sids_key(user_id: str) -> str:
+    return f"{_USER_SIDS_PREFIX}{user_id}"
 
 
 # ── Backend protocol (so tests can swap in a fake) ───────────────────
@@ -53,6 +58,9 @@ class RevocationBackend(Protocol):
     async def exists(self, key: str) -> bool: ...
     async def set_with_ttl(self, key: str, ttl_seconds: int) -> None: ...
     async def delete(self, key: str) -> None: ...
+    # user → sids reverse index (a set keyed by user, whole-key TTL).
+    async def add_to_set(self, key: str, member: str, ttl_seconds: int) -> None: ...
+    async def set_members(self, key: str) -> set[str]: ...
     async def health(self) -> bool: ...
 
 
@@ -91,6 +99,21 @@ class RedisBackend:
         except Exception as exc:
             raise RevocationBackendError(str(exc)) from exc
 
+    async def add_to_set(self, key: str, member: str, ttl_seconds: int) -> None:
+        try:
+            await self._client.sadd(key, member)
+            # Refresh the whole-key TTL on every add so an active user's
+            # index outlives their most recent session by the buffer.
+            await self._client.expire(key, ttl_seconds)
+        except Exception as exc:
+            raise RevocationBackendError(str(exc)) from exc
+
+    async def set_members(self, key: str) -> set[str]:
+        try:
+            return set(await self._client.smembers(key))
+        except Exception as exc:
+            raise RevocationBackendError(str(exc)) from exc
+
     async def health(self) -> bool:
         try:
             return bool(await self._client.ping())
@@ -106,6 +129,7 @@ class InMemoryBackend:
     """
     def __init__(self) -> None:
         self._set: set[str] = set()
+        self._sets: dict[str, set[str]] = {}
 
     async def exists(self, key: str) -> bool:
         return key in self._set
@@ -117,6 +141,14 @@ class InMemoryBackend:
 
     async def delete(self, key: str) -> None:
         self._set.discard(key)
+        self._sets.pop(key, None)
+
+    async def add_to_set(self, key: str, member: str, ttl_seconds: int) -> None:
+        # TTL ignored in the fake (see set_with_ttl).
+        self._sets.setdefault(key, set()).add(member)
+
+    async def set_members(self, key: str) -> set[str]:
+        return set(self._sets.get(key, ()))
 
     async def health(self) -> bool:
         return True
@@ -163,24 +195,33 @@ class RevocationService:
         for sid in sids:
             await self.revoke_session(sid)
 
-    # Coarse revocation: caller knows the user but not their sids.
-    # Phase 1: there is no sid index by user yet — we mint a new
-    # session per login and that's the only place it is recorded.
-    # Phase 2 may add a Redis-side ``rbac:user_sids:<user>`` reverse
-    # index so this becomes O(1); for now we provide the placeholder
-    # so call sites can be written today.
-    async def revoke_all_user_sessions(self, user_id: str) -> None:
-        """Phase 1 stub — see docstring.
+    # Session tracking: every login/refresh mints a fresh sid; record
+    # it under the user's reverse index so a later coarse revocation
+    # can find every live session for that user. The set carries a
+    # whole-key TTL (refreshed on each add) equal to the revocation
+    # window, so stale sids self-expire — a revoked sid whose access
+    # token has already lapsed is a harmless no-op anyway.
+    async def record_session(self, user_id: str, sid: str) -> None:
+        if not user_id or not sid:
+            return
+        await self._backend.add_to_set(
+            _user_sids_key(user_id), sid, self._ttl
+        )
 
-        In Phase 1 the helper is a no-op because we don't yet keep a
-        user → sids index. This is intentional: Phase 1 ships the
-        revocation set without yet using it, so the only "revocation"
-        path that actually matters is at session creation/logout (the
-        existing refresh-token rotation handles that). The helper is
-        published now so Phase 2 can fill in the body without any call-
-        site change."""
-        logger.debug(
-            "revoke_all_user_sessions: user=%s — Phase 1 no-op", user_id,
+    # Coarse revocation: caller knows the user but not their sids.
+    # Reads the reverse index, revokes every sid in it, then drops the
+    # index so a re-login starts a clean set.
+    async def revoke_all_user_sessions(self, user_id: str) -> None:
+        if not user_id:
+            return
+        key = _user_sids_key(user_id)
+        sids = await self._backend.set_members(key)
+        for sid in sids:
+            await self.revoke_session(sid)
+        await self._backend.delete(key)
+        logger.info(
+            "revoke_all_user_sessions: user=%s revoked %d session(s)",
+            user_id, len(sids),
         )
 
     async def health(self) -> bool:

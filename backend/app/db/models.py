@@ -878,6 +878,14 @@ class UserORM(Base):
 
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
+        # SSO identity join key. Local rows leave external_id NULL and
+        # NULLs are distinct under a UNIQUE constraint, so this only
+        # constrains provisioned SSO subjects (one row per
+        # provider+subject) without affecting local accounts.
+        UniqueConstraint(
+            "auth_provider", "external_id",
+            name="uq_users_provider_external_id",
+        ),
         Index("idx_users_status_created", "status", "created_at"),
         CheckConstraint(
             "status IN ('pending', 'active', 'suspended')",
@@ -1454,6 +1462,38 @@ class OutboxEventORM(Base):
 
     def __repr__(self) -> str:
         return f"<OutboxEvent id={self.id!r} type={self.event_type!r}>"
+
+
+# ------------------------------------------------------------------ #
+# auth_audit_log  (append-only audit trail, drained from the outbox)   #
+# ------------------------------------------------------------------ #
+
+class AuthAuditLogORM(Base):
+    """Immutable record of every domain event the outbox relay drains.
+
+    Append-only: rows are inserted by the relay and never updated or
+    deleted. ``source_event_id`` is the originating outbox event id and
+    is UNIQUE so a relay re-run after a crash cannot double-record.
+    """
+    __tablename__ = "auth_audit_log"
+
+    id = Column(Text, primary_key=True, default=lambda: f"aud_{uuid.uuid4().hex[:12]}")
+    source_event_id = Column(Text, nullable=False)   # OutboxEventORM.id
+    event_type = Column(Text, nullable=False)
+    aggregate_type = Column(Text, nullable=True)
+    aggregate_id = Column(Text, nullable=True)
+    payload = Column(Text, nullable=False, default="{}")  # JSON (verbatim)
+    occurred_at = Column(Text, nullable=False)       # source event created_at
+    recorded_at = Column(Text, nullable=False, default=_now)
+
+    __table_args__ = (
+        UniqueConstraint("source_event_id", name="uq_auth_audit_source_event"),
+        Index("idx_auth_audit_event_type", "event_type"),
+        Index("idx_auth_audit_recorded_at", "recorded_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AuthAuditLog id={self.id!r} type={self.event_type!r}>"
 
 
 # ------------------------------------------------------------------ #

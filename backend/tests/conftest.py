@@ -14,6 +14,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # refuse to send the cookies back on subsequent requests.
 os.environ.setdefault("AUTH_COOKIE_SECURE", "false")
 
+# JWT_SECRET_KEY is mandatory (>= 32 chars) and has no ephemeral
+# fallback — backend.auth_service.core.config raises at import if it is
+# unset. Set a deterministic test secret before any auth module loads.
+os.environ.setdefault(
+    "JWT_SECRET_KEY", "test-only-jwt-secret-key-not-for-production-use"
+)
+
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------

@@ -1,17 +1,22 @@
 """
 Auth-service configuration — environment-driven.
 
-Production deployments MUST set JWT_SECRET_KEY. In dev (no secret set) a
-random ephemeral key is generated per process and a warning is logged;
-restarting the app invalidates all outstanding sessions.
+``JWT_SECRET_KEY`` MUST be set explicitly (>= 32 chars) in every
+environment — production, dev, and test. There is intentionally **no
+ephemeral fallback**: a per-process random key silently invalidates
+every outstanding session on restart and masks a missing-secret
+misconfiguration in production. Absence or a too-weak value fails fast
+at import so the process never starts in an insecure state.
 """
 import logging
 import os
-import secrets
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ALGORITHM = "HS256"
+# HS256 needs a high-entropy shared secret. 32 chars is the floor we
+# accept; anything shorter is rejected as weak.
+_MIN_SECRET_LENGTH = 32
 # RBAC Phase 1: short access-token TTL paired with Redis revocation
 # set. Old default was 15 minutes; the design plan calls for ≤5 min so
 # revocation lag stays within enterprise tolerances. Operators can
@@ -21,16 +26,25 @@ _DEFAULT_ACCESS_EXPIRY_MINUTES = 5
 _DEFAULT_REFRESH_EXPIRY_DAYS = 7
 
 
+class MissingSigningSecret(RuntimeError):
+    """Raised at import when JWT_SECRET_KEY is unset or too weak."""
+
+
 def _resolve_secret() -> str:
     key = os.getenv("JWT_SECRET_KEY")
-    if key:
-        return key
-    generated = secrets.token_urlsafe(64)
-    logger.warning(
-        "JWT_SECRET_KEY is not set — using a random ephemeral key. "
-        "Tokens will not survive restarts. Set JWT_SECRET_KEY in production."
-    )
-    return generated
+    if not key:
+        raise MissingSigningSecret(
+            "JWT_SECRET_KEY is not set. Set a high-entropy secret "
+            f"(>= {_MIN_SECRET_LENGTH} chars) in the environment — there "
+            "is no ephemeral fallback. Generate one with "
+            "`python -c 'import secrets; print(secrets.token_urlsafe(48))'`."
+        )
+    if len(key) < _MIN_SECRET_LENGTH:
+        raise MissingSigningSecret(
+            f"JWT_SECRET_KEY is too weak ({len(key)} chars); "
+            f"require >= {_MIN_SECRET_LENGTH}."
+        )
+    return key
 
 
 JWT_SECRET_KEY: str = _resolve_secret()
