@@ -475,11 +475,12 @@ export function LineageFlowOverlay({
     // (45%) so it always feels proportional, whether the entity is a
     // tall layer card or a tight leaf row.
     if (showStubs && nodeStubCounts && nodeStubCounts.size > 0) {
-      const RIBBON_W = 5
-      const RIBBON_HEIGHT_RATIO = 0.45
-      // 1.5px overlap into the card — enough to anchor visually without
-      // showing a hard edge against the card border. With 5px width the
-      // visible peek-out is ~3.5px on the outboard side.
+      // Sized to be confidently visible without dominating the card.
+      // 7px core + 4px halo around it gives a soft glow tab that reads
+      // at a glance. ~5.5px peeks out beyond the card edge (1.5px overlap
+      // hides any hard inboard edge behind the card chrome).
+      const RIBBON_W = 7
+      const RIBBON_HEIGHT_RATIO = 0.55
       const RIBBON_INSET = 1.5
       const newStubs: typeof computedStubs = []
       globalVisibleNodes.forEach(domId => {
@@ -490,7 +491,7 @@ export function LineageFlowOverlay({
         if (!el) return
         const rect = el.getBoundingClientRect()
         const midY = rect.top + rect.height / 2 - containerRect.top
-        const height = Math.max(14, rect.height * RIBBON_HEIGHT_RATIO)
+        const height = Math.max(18, rect.height * RIBBON_HEIGHT_RATIO)
         if (counts.in > 0) {
           // Inbound ribbon center sits `(RIBBON_W/2 - RIBBON_INSET)` to
           // the left of the card-left edge — so part of the pill peeks
@@ -1114,74 +1115,104 @@ export function LineageFlowOverlay({
           )
         })}
 
-        {/* ── Per-node partial-edge stubs ─────────────────────────────────
-            Polished, entity-anchored indicators that say "this entity has
-            incoming / outgoing lineage." A short tail (18px) on the
-            inbound side ends at the entity with a notched arrowhead; the
-            outbound side mirrors it. The tail itself fades from quiet at
-            the outer tip to fuller at the arrow — same direction-encoded
-            gradient as a real edge — and is set on the indigo accent so
-            it reads as part of the lineage system, not a separate UI
-            chrome layer.
+        {/* ── Per-node lineage ribbons ────────────────────────────────────
+            Indigo accents that peek out from behind each entity card on
+            the side(s) with lineage. Three layers compose the premium
+            look without external decoration:
 
-            Crucially these stubs do NOT span across to a partner node.
-            They're decorations on the entity card. Side-by-side
-            adjacent-layer entities each get their own quiet pair of
-            inbound/outbound markers. Hovering or selecting a node
-            materializes the real edges over these stubs — the markers
-            disappear into the full edge rendering. ─────────────────── */}
+              1. Halo  — wider, blurry-tinted pill behind the core, gives
+                         the ribbon a soft glow against the card edge.
+              2. Core  — narrower pill with a vertical fade gradient.
+              3. Sheen — thin highlight stripe inside the core, lifts the
+                         ribbon off the canvas (faux specular).
+
+            The overlay sits at z-[5] beneath the card chrome (z-[10+])
+            so the inboard half of every layer is hidden by the card.
+            Native SVG <title> on each group provides the hover tooltip
+            ("8 incoming connections" / etc.) so the user can confirm
+            meaning. Hover/select the entity materializes the real edges
+            and these indicators recede behind them. ─────────────────── */}
         {computedStubs.length > 0 && (
           <>
             <defs>
-              {/* Single direction-encoded gradient. The path always runs
-                  left-to-right (incoming: outer→entity, outgoing: entity→
-                  outer). The arrow is always at the right (`tx`) end of
-                  the path. So a gradient that fades at 0% and strengthens
-                  toward 100% always lands the strong end at the arrow —
-                  identical to how real edges fade from source→target.
-                  objectBoundingBox + a single def serves every stub. */}
-              <linearGradient id="lineage-stub" x1="0" y1="0" x2="1" y2="0">
+              {/* Halo: wider gradient, lighter tones, generous fade.
+                  Sits behind the core to create a soft glow without
+                  needing an expensive SVG filter. */}
+              <linearGradient id="lineage-ribbon-halo" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
-                <stop offset="40%" stopColor="rgb(129, 140, 248)" stopOpacity="0.32" />
-                <stop offset="100%" stopColor="rgb(99, 102, 241)" stopOpacity="0.95" />
+                <stop offset="50%" stopColor="rgb(129, 140, 248)" stopOpacity="0.55" />
+                <stop offset="100%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
               </linearGradient>
-              {/* Notched arrowhead — same 5-vertex silhouette as the
-                  real-edge markers, smaller (9×7 vs 12×10) so the stub
-                  reads as the quieter cousin in one consistent visual
-                  vocabulary. Fully opaque so the arrow tip is crisp even
-                  where the stroke gradient has faded. */}
-              <marker
-                id="lineage-stub-arrow"
-                markerWidth="9"
-                markerHeight="7"
-                refX="8.4"
-                refY="3.5"
-                orient="auto-start-reverse"
-                markerUnits="userSpaceOnUse"
-              >
-                <polygon
-                  points="0 0, 9 3.5, 0 7, 1.4 3.5"
-                  fill="rgb(99, 102, 241)"
-                />
-              </marker>
+              {/* Core: vertical fade with full saturation in the middle.
+                  rgb(79, 70, 229) is indigo-600 — slightly deeper than the
+                  accent-lineage indigo-500 so the ribbon reads as a
+                  punctuated accent against the card. */}
+              <linearGradient id="lineage-ribbon-core" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+                <stop offset="18%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="50%" stopColor="rgb(79, 70, 229)" stopOpacity="1" />
+                <stop offset="82%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="100%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+              </linearGradient>
+              {/* Sheen: a thin highlight stripe running down one side of
+                  the core. Adds a subtle "glass" depth so the ribbon
+                  doesn't read as flat fill. */}
+              <linearGradient id="lineage-ribbon-sheen" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgba(255, 255, 255, 0)" />
+                <stop offset="45%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="55%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="100%" stopColor="rgba(255, 255, 255, 0)" />
+              </linearGradient>
             </defs>
             {computedStubs.map(stub => {
-              const key = `stub-${stub.nodeId}-${stub.side}`
-              // Log-scaled width — same family as real bundled-edge formula
-              // (line ~289). Heavy fan-in reads heavier; light pairs stay
-              // thin. Capped 2.4 so high counts don't bulge.
-              const strokeW = Math.min(1.2 + Math.log2(Math.max(1, stub.count)) * 0.45, 2.4)
-              const pathD = `M ${stub.sx} ${stub.sy} L ${stub.tx} ${stub.ty}`
+              const key = `ribbon-${stub.nodeId}-${stub.side}`
+              // Opacity scales subtly with lineage volume — light pairs
+              // get a quieter ribbon, heavy fan-in nodes get a stronger
+              // accent. log2 cap keeps the difference perceptible
+              // without making heavy-traffic nodes shout.
+              const intensity = Math.min(0.75 + Math.log2(Math.max(1, stub.count)) * 0.06, 1)
+              const haloW = stub.width + 6
+              const haloH = stub.height + 4
+              const sheenW = Math.max(1.4, stub.width * 0.38)
+              const sheenInset = stub.side === 'in'
+                ? stub.width * 0.18   // sheen toward the card-facing side
+                : -stub.width * 0.18
+              const label = stub.count > 1
+                ? `${stub.count.toLocaleString()} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connections`
+                : `${stub.count} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connection`
               return (
-                <g key={key} className="pointer-events-none lineage-stub-group">
-                  <path
-                    d={pathD}
-                    stroke="url(#lineage-stub)"
-                    strokeWidth={strokeW}
-                    strokeLinecap="round"
-                    fill="none"
-                    markerEnd="url(#lineage-stub-arrow)"
+                <g key={key} className="pointer-events-none" opacity={intensity}>
+                  {/* Halo */}
+                  <rect
+                    x={stub.cx - haloW / 2}
+                    y={stub.cy - haloH / 2}
+                    width={haloW}
+                    height={haloH}
+                    rx={haloW / 2}
+                    ry={haloW / 2}
+                    fill="url(#lineage-ribbon-halo)"
                   />
+                  {/* Core */}
+                  <rect
+                    x={stub.cx - stub.width / 2}
+                    y={stub.cy - stub.height / 2}
+                    width={stub.width}
+                    height={stub.height}
+                    rx={stub.width / 2}
+                    ry={stub.width / 2}
+                    fill="url(#lineage-ribbon-core)"
+                  />
+                  {/* Sheen */}
+                  <rect
+                    x={stub.cx - sheenW / 2 + sheenInset}
+                    y={stub.cy - stub.height / 2 + 2}
+                    width={sheenW}
+                    height={stub.height - 4}
+                    rx={sheenW / 2}
+                    ry={sheenW / 2}
+                    fill="url(#lineage-ribbon-sheen)"
+                  />
+                  <title>{label}</title>
                 </g>
               )
             })}
