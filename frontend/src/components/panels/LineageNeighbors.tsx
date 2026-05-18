@@ -16,7 +16,7 @@
  * center the canvas (onFocusNode prop).
  */
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { useCanvasStore, type LineageNode, type LineageEdge } from '@/store/canvas'
@@ -31,7 +31,10 @@ import { cn } from '@/lib/utils'
 
 interface LineageNeighborsProps {
   nodeId: string
-  onFocusNode?: (nodeId: string) => void
+  /** Reveal the target on canvas (expand ancestors, pan/scroll). May
+   *  return a promise — the clicked row shows an inline spinner until it
+   *  resolves. */
+  onFocusNode?: (nodeId: string) => void | Promise<void>
 }
 
 type Direction = 'incoming' | 'outgoing'
@@ -52,9 +55,20 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
   const edges = visibleEdges.length > 0 ? visibleEdges : rawEdges
   const nodes = useCanvasStore((s) => s.nodes)
   const openNodeDrawer = useCanvasStore((s) => s.openNodeDrawer)
+  const selectNode = useCanvasStore((s) => s.selectNode)
   const containmentEdgeTypes = useContainmentEdgeTypes()
 
   const [expanded, setExpanded] = useState<Direction | null>(null)
+
+  // Reset expansion when the drawer's focal entity changes. Without this,
+  // navigating from one entity to a neighbor leaves the previous entity's
+  // expand state in place — the new entity's "Data Sources" looks already
+  // expanded, so the user's intended-to-expand click reads as a collapse
+  // ("first click does nothing"). Children's filter/search state lives
+  // inside ExpandedDetail which unmounts on collapse, so it resets here too.
+  useEffect(() => {
+    setExpanded(null)
+  }, [nodeId])
 
   const nodeMap = useMemo(() => {
     const m = new Map<string, LineageNode>()
@@ -90,9 +104,14 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
   const outgoingCount = outgoingRecords.length
   const totalCount = incomingCount + outgoingCount
 
-  const handleNeighborClick = (neighborId: string) => {
+  const handleNeighborClick = async (neighborId: string) => {
+    // Drawer-swap first (instant, no awaiting). selectNode so the canvas's
+    // selection-driven highlight (useHighlightState in GraphCanvas, the
+    // selectedNodeId styling in ContextView) lights up the target after the
+    // reveal pans to it.
     openNodeDrawer(neighborId)
-    onFocusNode?.(neighborId)
+    selectNode(neighborId)
+    await onFocusNode?.(neighborId)
   }
 
   const toggle = (dir: Direction) =>
@@ -152,7 +171,7 @@ interface DirectionCardProps {
   records: NeighborRecord[]
   expanded: boolean
   onToggle: () => void
-  onNeighborClick: (neighborId: string) => void
+  onNeighborClick: (neighborId: string) => void | Promise<void>
 }
 
 function DirectionCard({
@@ -290,7 +309,7 @@ function DirectionCard({
 interface ExpandedDetailProps {
   records: NeighborRecord[]
   direction: Direction
-  onNeighborClick: (neighborId: string) => void
+  onNeighborClick: (neighborId: string) => void | Promise<void>
 }
 
 function ExpandedDetail({
@@ -616,7 +635,7 @@ interface EntityTypeGroupProps {
   direction: Direction
   collapsed: boolean
   onToggleCollapse: () => void
-  onNeighborClick: (neighborId: string) => void
+  onNeighborClick: (neighborId: string) => void | Promise<void>
 }
 
 function EntityTypeGroup({
@@ -708,8 +727,9 @@ function NeighborRow({
 }: {
   record: NeighborRecord
   direction: Direction
-  onClick: () => void
+  onClick: () => void | Promise<void>
 }) {
+  const [busy, setBusy] = useState(false)
   const { neighborNode, edgeTypeNorm, neighborId } = record
   const isIncoming = direction === 'incoming'
   const accent = isIncoming ? 'text-blue-500' : 'text-green-500'
@@ -726,18 +746,35 @@ function NeighborRow({
     technical && technical !== label ? technical : data?.urn ?? neighborId
   const showSecondary = secondary && secondary !== label
 
+  // Reveal lifecycle: while the parent's `onClick` (the canvas's reveal
+  // cascade) is in flight, swap the trailing chevron for a spinner and
+  // disable the row to avoid double-triggers.
+  const handleClick = async () => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await onClick()
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <button
       type="button"
-      onClick={onClick}
-      className="group relative w-full flex items-center gap-2.5 px-3 py-2 hover:bg-white/[0.05] transition-colors duration-150 text-left"
+      onClick={handleClick}
+      disabled={busy}
+      className={cn(
+        'group relative w-full flex items-center gap-2.5 px-3 py-2 hover:bg-white/[0.05] transition-colors duration-150 text-left',
+        busy && 'cursor-progress',
+      )}
       title={data?.urn ?? neighborId}
     >
       <div
         className={cn(
           'w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors duration-150',
           accentBg,
-          'group-hover:scale-105',
+          !busy && 'group-hover:scale-105',
         )}
       >
         <ArrowIcon className={cn('w-3 h-3', accent)} />
@@ -760,12 +797,19 @@ function NeighborRow({
         )}
       </div>
       <EdgeTypeChip edgeType={edgeTypeNorm} />
-      <LucideIcons.ArrowRight
-        className={cn(
-          'w-3.5 h-3.5 text-ink-muted/70 transition-all duration-150 flex-shrink-0',
-          'opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0',
-        )}
-      />
+      {busy ? (
+        <LucideIcons.Loader2
+          data-testid="reveal-spinner"
+          className={cn('w-3.5 h-3.5 animate-spin flex-shrink-0', accent)}
+        />
+      ) : (
+        <LucideIcons.ArrowRight
+          className={cn(
+            'w-3.5 h-3.5 text-ink-muted/70 transition-all duration-150 flex-shrink-0',
+            'opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0',
+          )}
+        />
+      )}
     </button>
   )
 }

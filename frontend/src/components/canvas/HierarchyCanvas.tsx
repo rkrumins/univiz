@@ -497,6 +497,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
         onTraceUp={(nodeId) => trace.traceUpstream(nodeId)}
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
+        onFocusNode={expandToNode}
       />
 
       {/* === UX-FIRST INTERACTION COMPONENTS (Unified with LineageCanvas) === */}
