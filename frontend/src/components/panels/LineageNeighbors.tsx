@@ -2,17 +2,15 @@
  * LineageNeighbors — 1-hop incoming/outgoing neighbor preview for the entity
  * drawer.
  *
- * Default state: two compact summary rows showing the upstream/downstream
- * counts (same shape as the previous "3 Data Sources / 7 Data Consumers"
- * placeholder). Clicking a row expands an inline detail panel with grouped
- * neighbors, entity-type chips, edge-type chips and free-text search.
+ * Default state: two card-style summary rows showing upstream/downstream
+ * counts. Clicking a card expands an inline panel with grouped neighbors,
+ * always-on search, and entity-type / edge-type filter chips.
  *
- * Data source: `canvas.edges` directly — same source the canvas renders
- * from. Deliberately bypasses `useNodeEdges` because that hook funnels
- * through the global edge-type filter (so when filters are toggled, this
- * section would lie about lineage). Decoupled from Trace Lineage: counts
- * reflect whatever edges currently touch this node, regardless of whether
- * a trace has been run.
+ * Data source: `canvas.visibleEdges` (the projected/aggregated edge set the
+ * canvas renders) with a fallback to raw `canvas.edges`. Containment edges
+ * are filtered out via the schema's containment set. Fully decoupled from
+ * Trace Lineage — counts reflect whatever lineage edges currently touch
+ * this node.
  *
  * Click a neighbor row → swap drawer (openNodeDrawer) and, when wired,
  * center the canvas (onFocusNode prop).
@@ -43,17 +41,14 @@ interface NeighborRecord {
   neighborId: string
   neighborNode: LineageNode | undefined
   direction: Direction
-  edgeTypeNorm: string // upper-case
+  edgeTypeNorm: string
 }
 
 export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps) {
   const rawEdges = useCanvasStore((s) => s.edges)
   const visibleEdges = useCanvasStore((s) => s.visibleEdges)
-  // Prefer the canvas's projected/aggregated visible-edge set so the section
-  // mirrors exactly what the user sees on canvas (aggregated parent-level
-  // edges, projected leaf edges, etc.). Falls back to raw store edges when
-  // no canvas has published a visible set (e.g. before mount, on a canvas
-  // variant that doesn't project).
+  // Mirror the canvas: prefer the projected/aggregated visible set; fall
+  // back to raw edges when no canvas has published one yet.
   const edges = visibleEdges.length > 0 ? visibleEdges : rawEdges
   const nodes = useCanvasStore((s) => s.nodes)
   const openNodeDrawer = useCanvasStore((s) => s.openNodeDrawer)
@@ -67,10 +62,8 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
     return m
   }, [nodes])
 
-  // Lineage-only neighbors. Containment edges (parent ↔ child structural
-  // relationships) are filtered out — the user wants flow lineage, not
-  // hierarchy. Edge type is normalised to upper-case before checking against
-  // the loaded ontology's containment set.
+  // Lineage-only neighbors. Containment edges (structural parent ↔ child) are
+  // filtered out — the section is about flow lineage.
   const { incomingRecords, outgoingRecords } = useMemo(() => {
     const incoming: NeighborRecord[] = []
     const outgoing: NeighborRecord[] = []
@@ -95,6 +88,7 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
 
   const incomingCount = incomingRecords.length
   const outgoingCount = outgoingRecords.length
+  const totalCount = incomingCount + outgoingCount
 
   const handleNeighborClick = (neighborId: string) => {
     openNodeDrawer(neighborId)
@@ -113,127 +107,184 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
             Lineage
           </h3>
         </div>
+        {totalCount > 0 && (
+          <span className="text-[10px] font-medium text-ink-muted/80 tabular-nums">
+            {totalCount} connection{totalCount === 1 ? '' : 's'}
+          </span>
+        )}
       </div>
 
       <div className="space-y-2">
-        <SummaryRow
+        <DirectionCard
           direction="incoming"
           label="Data Sources"
           subLabel="Upstream connections"
           count={incomingCount}
+          records={incomingRecords}
           expanded={expanded === 'incoming'}
           onToggle={() => toggle('incoming')}
+          onNeighborClick={handleNeighborClick}
         />
-        <AnimatePresence initial={false}>
-          {expanded === 'incoming' && (
-            <ExpandedDetail
-              records={incomingRecords}
-              direction="incoming"
-              onNeighborClick={handleNeighborClick}
-            />
-          )}
-        </AnimatePresence>
-
-        <SummaryRow
+        <DirectionCard
           direction="outgoing"
           label="Data Consumers"
           subLabel="Downstream connections"
           count={outgoingCount}
+          records={outgoingRecords}
           expanded={expanded === 'outgoing'}
           onToggle={() => toggle('outgoing')}
+          onNeighborClick={handleNeighborClick}
         />
-        <AnimatePresence initial={false}>
-          {expanded === 'outgoing' && (
-            <ExpandedDetail
-              records={outgoingRecords}
-              direction="outgoing"
-              onNeighborClick={handleNeighborClick}
-            />
-          )}
-        </AnimatePresence>
       </div>
     </div>
   )
 }
 
 // ============================================
-// Summary row — collapsed default
+// Direction card — summary + expandable detail in a single container
 // ============================================
 
-interface SummaryRowProps {
+interface DirectionCardProps {
   direction: Direction
   label: string
   subLabel: string
   count: number
+  records: NeighborRecord[]
   expanded: boolean
   onToggle: () => void
+  onNeighborClick: (neighborId: string) => void
 }
 
-function SummaryRow({
+function DirectionCard({
   direction,
   label,
   subLabel,
   count,
+  records,
   expanded,
   onToggle,
-}: SummaryRowProps) {
+  onNeighborClick,
+}: DirectionCardProps) {
   const isIncoming = direction === 'incoming'
   const ArrowIcon = isIncoming
     ? LucideIcons.ArrowDownLeft
     : LucideIcons.ArrowUpRight
-  const accent = isIncoming ? 'text-blue-500' : 'text-green-500'
-  const accentBg = isIncoming ? 'bg-blue-500/10' : 'bg-green-500/10'
-  const accentBorder = isIncoming
-    ? 'border-blue-500/20'
-    : 'border-green-500/20'
+
+  // Colour tokens — kept locally so the gradient/border/text accents
+  // stay coherent without spreading classnames through the tree.
+  const tokens = isIncoming
+    ? {
+        accent: 'text-blue-500',
+        bg: 'bg-blue-500/10',
+        bgHover: 'group-hover:bg-blue-500/15',
+        ring: 'border-blue-500/20',
+        ringExpanded: 'border-blue-500/40',
+        gradient:
+          'bg-[linear-gradient(135deg,rgba(59,130,246,0.08)_0%,transparent_55%)]',
+      }
+    : {
+        accent: 'text-green-500',
+        bg: 'bg-green-500/10',
+        bgHover: 'group-hover:bg-green-500/15',
+        ring: 'border-green-500/20',
+        ringExpanded: 'border-green-500/40',
+        gradient:
+          'bg-[linear-gradient(135deg,rgba(34,197,94,0.08)_0%,transparent_55%)]',
+      }
 
   const disabled = count === 0
 
   return (
-    <button
-      onClick={onToggle}
-      disabled={disabled}
+    <div
       className={cn(
-        'w-full flex items-center gap-3 p-3 rounded-xl border transition-colors duration-150 text-left',
-        expanded
-          ? cn(accentBg, accentBorder)
-          : 'bg-black/5 dark:bg-white/5 border-transparent hover:bg-black/10 dark:hover:bg-white/10',
-        disabled && 'opacity-50 cursor-default hover:bg-black/5 dark:hover:bg-white/5',
+        'rounded-2xl border transition-colors duration-200 overflow-hidden',
+        expanded ? tokens.ringExpanded : tokens.ring,
+        disabled && 'opacity-60',
       )}
     >
-      <div
+      {/* Summary header */}
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={disabled}
         className={cn(
-          'w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0',
-          accentBg,
+          'group relative w-full flex items-center gap-3 p-3.5 text-left transition-colors duration-200',
+          tokens.gradient,
+          !disabled && 'hover:bg-white/[0.02] cursor-pointer',
+          disabled && 'cursor-default',
         )}
       >
-        <ArrowIcon className={cn('w-4 h-4', accent)} />
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="flex items-baseline gap-2">
-          <span className={cn('text-lg font-semibold tabular-nums', accent)}>
-            {count}
-          </span>
-          <span className="text-sm font-medium text-ink truncate">
-            {label}
-          </span>
-        </div>
-        <span className="text-[11px] text-ink-muted">{subLabel}</span>
-      </div>
-      {count > 0 && (
-        <LucideIcons.ChevronDown
+        <div
           className={cn(
-            'w-4 h-4 text-ink-muted transition-transform duration-150',
-            expanded && 'rotate-180',
+            'w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors duration-200',
+            tokens.bg,
+            !disabled && tokens.bgHover,
           )}
-        />
-      )}
-    </button>
+        >
+          <ArrowIcon className={cn('w-5 h-5', tokens.accent)} />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2">
+            <span
+              className={cn(
+                'text-2xl font-display font-semibold tabular-nums leading-none',
+                tokens.accent,
+              )}
+            >
+              {count}
+            </span>
+            <span className="text-sm font-medium text-ink truncate">
+              {label}
+            </span>
+          </div>
+          <div className="text-[11px] text-ink-muted mt-0.5">{subLabel}</div>
+        </div>
+
+        {!disabled && (
+          <div
+            className={cn(
+              'w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors duration-200',
+              expanded
+                ? cn(tokens.bg, tokens.accent)
+                : 'text-ink-muted group-hover:bg-white/10 group-hover:text-ink',
+            )}
+          >
+            <LucideIcons.ChevronDown
+              className={cn(
+                'w-4 h-4 transition-transform duration-200',
+                expanded && 'rotate-180',
+              )}
+            />
+          </div>
+        )}
+      </button>
+
+      <AnimatePresence initial={false}>
+        {expanded && !disabled && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
+            className="overflow-hidden"
+          >
+            <div className="border-t border-white/[0.06]">
+              <ExpandedDetail
+                records={records}
+                direction={direction}
+                onNeighborClick={onNeighborClick}
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
   )
 }
 
 // ============================================
-// Expanded detail panel
+// Expanded detail
 // ============================================
 
 interface ExpandedDetailProps {
@@ -321,83 +372,127 @@ function ExpandedDetail({
     setter(next)
   }
 
-  const showSearch = records.length > 5
+  const activeFilterCount = activeEntityTypes.size + activeEdgeTypes.size
+  const clearAllFilters = () => {
+    setActiveEntityTypes(new Set())
+    setActiveEdgeTypes(new Set())
+    setSearch('')
+  }
+
   const isFilteredEmpty = filtered.length === 0
   const unloadedCount = filtered.filter((r) => !r.neighborNode).length
 
   return (
-    <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0 }}
-      transition={{ duration: 0.18 }}
-      className="overflow-hidden"
-    >
-      <div className="pt-2 pb-1 pl-2 space-y-3">
-        {showSearch && (
-          <div className="relative">
-            <LucideIcons.Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-muted pointer-events-none" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter by name or URN…"
-              className="w-full pl-9 pr-3 py-2 text-xs rounded-lg bg-white/5 border border-white/10 focus:border-accent-lineage/40 focus:bg-white/8 outline-none transition-colors duration-150"
+    <div className="p-3 space-y-3">
+      {/* Search — always visible when expanded so the filter affordance is
+          discoverable even with few results. */}
+      <div className="relative">
+        <LucideIcons.Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-muted pointer-events-none" />
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search by name or URN…"
+          className="w-full pl-9 pr-8 py-2 text-xs rounded-lg bg-black/10 dark:bg-white/[0.04] border border-white/10 focus:border-accent-lineage/40 focus:bg-white/[0.06] outline-none transition-colors duration-150 placeholder:text-ink-muted/70"
+        />
+        {search && (
+          <button
+            type="button"
+            onClick={() => setSearch('')}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-ink-muted hover:text-ink hover:bg-white/10 transition-colors duration-150"
+            title="Clear search"
+          >
+            <LucideIcons.X className="w-3 h-3" />
+          </button>
+        )}
+      </div>
+
+      {/* Active filter strip — quick visibility of what's narrowing the list,
+          plus a one-click escape hatch. */}
+      {activeFilterCount > 0 && (
+        <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-accent-lineage/5 border border-accent-lineage/20">
+          <span className="text-[11px] text-accent-lineage font-medium">
+            {activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'} active
+          </span>
+          <button
+            type="button"
+            onClick={clearAllFilters}
+            className="text-[10px] font-medium text-accent-lineage/80 hover:text-accent-lineage uppercase tracking-wide"
+          >
+            Clear all
+          </button>
+        </div>
+      )}
+
+      {/* Filter facets — only render when there's something to choose. */}
+      {entityTypeFacets.length > 1 && (
+        <FilterChipRow
+          label="Entity type"
+          icon={LucideIcons.Tag}
+          facets={entityTypeFacets}
+          active={activeEntityTypes}
+          onToggle={(k) => toggleSet(activeEntityTypes, setActiveEntityTypes, k)}
+          variant="entity"
+        />
+      )}
+      {edgeTypeFacets.length > 1 && (
+        <FilterChipRow
+          label="Relationship"
+          icon={LucideIcons.Link2}
+          facets={edgeTypeFacets}
+          active={activeEdgeTypes}
+          onToggle={(k) => toggleSet(activeEdgeTypes, setActiveEdgeTypes, k)}
+          variant="edge"
+        />
+      )}
+
+      {/* Results */}
+      <div className="space-y-1.5">
+        {isFilteredEmpty ? (
+          <EmptyState
+            icon={
+              activeFilterCount > 0 || search
+                ? LucideIcons.SearchX
+                : LucideIcons.Unlink
+            }
+            title={
+              activeFilterCount > 0 || search
+                ? 'No matching connections'
+                : 'No connections in this direction'
+            }
+            hint={
+              activeFilterCount > 0 || search
+                ? 'Try clearing filters or the search.'
+                : undefined
+            }
+          />
+        ) : (
+          grouped.map(([type, rows]) => (
+            <EntityTypeGroup
+              key={type}
+              type={type}
+              rows={rows}
+              direction={direction}
+              collapsed={collapsedGroups.has(type)}
+              onToggleCollapse={() =>
+                toggleSet(collapsedGroups, setCollapsedGroups, type)
+              }
+              onNeighborClick={onNeighborClick}
             />
+          ))
+        )}
+
+        {unloadedCount > 0 && !isFilteredEmpty && (
+          <div className="flex items-start gap-1.5 text-[11px] text-ink-muted/70 px-2 pt-1.5">
+            <LucideIcons.Info className="w-3 h-3 flex-shrink-0 mt-0.5" />
+            <span>
+              {unloadedCount} neighbor{unloadedCount === 1 ? '' : 's'} not
+              currently rendered on canvas — expand the graph to see details.
+            </span>
           </div>
         )}
-
-        {entityTypeFacets.length > 1 && (
-          <FilterChipRow
-            label="Entity types"
-            facets={entityTypeFacets}
-            active={activeEntityTypes}
-            onToggle={(k) => toggleSet(activeEntityTypes, setActiveEntityTypes, k)}
-            variant="entity"
-          />
-        )}
-
-        {edgeTypeFacets.length > 1 && (
-          <FilterChipRow
-            label="Edge types"
-            facets={edgeTypeFacets}
-            active={activeEdgeTypes}
-            onToggle={(k) => toggleSet(activeEdgeTypes, setActiveEdgeTypes, k)}
-            variant="edge"
-          />
-        )}
-
-        <div className="space-y-1.5">
-          {isFilteredEmpty ? (
-            <EmptyState
-              icon={LucideIcons.Filter}
-              title="No matches"
-              hint="Try clearing filters or the search."
-            />
-          ) : (
-            grouped.map(([type, rows]) => (
-              <EntityTypeGroup
-                key={type}
-                type={type}
-                rows={rows}
-                direction={direction}
-                collapsed={collapsedGroups.has(type)}
-                onToggleCollapse={() =>
-                  toggleSet(collapsedGroups, setCollapsedGroups, type)
-                }
-                onNeighborClick={onNeighborClick}
-              />
-            ))
-          )}
-
-          {unloadedCount > 0 && !isFilteredEmpty && (
-            <div className="text-[11px] text-ink-muted/70 italic px-1 pt-1">
-              {unloadedCount} neighbor{unloadedCount === 1 ? '' : 's'} not loaded in view — expand the graph or use Trace to fetch.
-            </div>
-          )}
-        </div>
       </div>
-    </motion.div>
+    </div>
   )
 }
 
@@ -407,6 +502,7 @@ function ExpandedDetail({
 
 interface FilterChipRowProps {
   label: string
+  icon: React.ComponentType<{ className?: string }>
   facets: Array<[string, number]>
   active: Set<string>
   onToggle: (key: string) => void
@@ -415,6 +511,7 @@ interface FilterChipRowProps {
 
 function FilterChipRow({
   label,
+  icon: Icon,
   facets,
   active,
   onToggle,
@@ -422,8 +519,11 @@ function FilterChipRow({
 }: FilterChipRowProps) {
   return (
     <div>
-      <div className="text-[10px] font-semibold text-ink-muted/70 uppercase tracking-wider mb-1.5">
-        {label}
+      <div className="flex items-center gap-1.5 mb-1.5">
+        <Icon className="w-3 h-3 text-ink-muted/70" />
+        <span className="text-[10px] font-semibold text-ink-muted/70 uppercase tracking-wider">
+          {label}
+        </span>
       </div>
       <div className="flex flex-wrap gap-1.5">
         {facets.map(([key, count]) => (
@@ -474,25 +574,34 @@ function FilterChip({
 
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
-        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors duration-150 border',
+        'inline-flex items-center gap-1.5 pl-1.5 pr-2 py-1 rounded-full text-[11px] font-medium transition-all duration-150 border',
         active
-          ? 'border-transparent'
-          : 'border-white/10 hover:border-white/20 text-ink-muted hover:text-ink',
+          ? 'border-transparent shadow-sm'
+          : 'border-white/10 bg-white/[0.03] hover:bg-white/[0.06] hover:border-white/20 text-ink-muted hover:text-ink',
       )}
       style={
         active
-          ? { backgroundColor: `${color}26`, color }
+          ? { backgroundColor: `${color}28`, color, borderColor: `${color}40` }
           : undefined
       }
     >
       <span
-        className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+        className="w-2 h-2 rounded-full flex-shrink-0"
         style={{ backgroundColor: color }}
       />
-      <span className="truncate max-w-[140px]">{displayName}</span>
-      <span className="text-[10px] opacity-70 tabular-nums">{count}</span>
+      <span className="truncate max-w-[120px]">{displayName}</span>
+      <span
+        className={cn(
+          'text-[10px] tabular-nums px-1 py-px rounded-full',
+          active ? 'bg-white/10' : 'bg-white/[0.04]',
+        )}
+        style={active ? { color } : undefined}
+      >
+        {count}
+      </span>
     </button>
   )
 }
@@ -531,41 +640,63 @@ function EntityTypeGroup({
     undefined
 
   return (
-    <div className="rounded-lg bg-black/[0.04] dark:bg-white/[0.04] overflow-hidden">
+    <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
       <button
+        type="button"
         onClick={onToggleCollapse}
-        className="w-full flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 transition-colors duration-150"
+        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/[0.04] transition-colors duration-150"
       >
         <LucideIcons.ChevronDown
           className={cn(
-            'w-3 h-3 text-ink-muted transition-transform duration-150',
+            'w-3.5 h-3.5 text-ink-muted/70 transition-transform duration-200',
             collapsed && '-rotate-90',
           )}
         />
+        <div
+          className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
+          style={{ backgroundColor: `${color}1f` }}
+        >
+          {IconCmp ? (
+            <IconCmp className="w-3 h-3" />
+          ) : (
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ backgroundColor: color }}
+            />
+          )}
+        </div>
         <span
-          className="w-1.5 h-1.5 rounded-full flex-shrink-0"
-          style={{ backgroundColor: color }}
-        />
-        {IconCmp && <IconCmp className="w-3 h-3 text-ink-muted" />}
-        <span className="text-[11px] font-semibold text-ink uppercase tracking-wide">
+          className="text-[11px] font-semibold uppercase tracking-wide"
+          style={{ color }}
+        >
           {displayName}
         </span>
-        <span className="ml-auto text-[10px] text-ink-muted tabular-nums">
+        <span className="ml-auto inline-flex items-center justify-center min-w-[20px] h-[18px] px-1.5 rounded-full bg-white/[0.06] text-[10px] font-medium text-ink-muted tabular-nums">
           {rows.length}
         </span>
       </button>
-      {!collapsed && (
-        <div className="divide-y divide-white/5">
-          {rows.map((r) => (
-            <NeighborRow
-              key={r.edge.id + ':' + r.direction}
-              record={r}
-              direction={direction}
-              onClick={() => onNeighborClick(r.neighborId)}
-            />
-          ))}
-        </div>
-      )}
+      <AnimatePresence initial={false}>
+        {!collapsed && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            className="overflow-hidden"
+          >
+            <div className="border-t border-white/[0.04] divide-y divide-white/[0.04]">
+              {rows.map((r) => (
+                <NeighborRow
+                  key={r.edge.id + ':' + r.direction}
+                  record={r}
+                  direction={direction}
+                  onClick={() => onNeighborClick(r.neighborId)}
+                />
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
@@ -581,39 +712,60 @@ function NeighborRow({
 }) {
   const { neighborNode, edgeTypeNorm, neighborId } = record
   const isIncoming = direction === 'incoming'
-  const arrowColor = isIncoming ? 'text-blue-500' : 'text-green-500'
+  const accent = isIncoming ? 'text-blue-500' : 'text-green-500'
+  const accentBg = isIncoming ? 'bg-blue-500/10' : 'bg-green-500/10'
   const ArrowIcon = isIncoming
     ? LucideIcons.ArrowDownLeft
     : LucideIcons.ArrowUpRight
 
   const data = neighborNode?.data
   const label =
-    data?.label || data?.businessLabel || data?.urn || neighborId
-  const secondary = data?.urn ?? neighborId
+    data?.businessLabel || data?.label || data?.urn || neighborId
+  const technical = data?.technicalLabel
+  const secondary =
+    technical && technical !== label ? technical : data?.urn ?? neighborId
+  const showSecondary = secondary && secondary !== label
 
   return (
     <button
+      type="button"
       onClick={onClick}
-      className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] transition-colors duration-150 group text-left"
-      title={secondary}
+      className="group relative w-full flex items-center gap-2.5 px-3 py-2 hover:bg-white/[0.05] transition-colors duration-150 text-left"
+      title={data?.urn ?? neighborId}
     >
-      <ArrowIcon className={cn('w-3 h-3 flex-shrink-0', arrowColor)} />
+      <div
+        className={cn(
+          'w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors duration-150',
+          accentBg,
+          'group-hover:scale-105',
+        )}
+      >
+        <ArrowIcon className={cn('w-3 h-3', accent)} />
+      </div>
       <div className="flex-1 min-w-0">
-        <div className="text-[12px] text-ink truncate">{label}</div>
+        <div className="text-[12.5px] text-ink truncate font-medium leading-snug">
+          {label}
+        </div>
         {neighborNode ? (
-          secondary !== label && (
-            <div className="text-[10px] text-ink-muted truncate font-mono">
+          showSecondary && (
+            <div className="text-[10px] text-ink-muted truncate font-mono leading-tight">
               {secondary}
             </div>
           )
         ) : (
-          <div className="text-[10px] text-amber-500/80">
-            Not loaded in view
+          <div className="text-[10px] text-amber-500/90 flex items-center gap-1 leading-tight">
+            <LucideIcons.AlertCircle className="w-2.5 h-2.5" />
+            Not rendered on canvas
           </div>
         )}
       </div>
       <EdgeTypeChip edgeType={edgeTypeNorm} />
-      <LucideIcons.ChevronRight className="w-3 h-3 text-ink-muted opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0" />
+      <LucideIcons.ArrowRight
+        className={cn(
+          'w-3.5 h-3.5 text-ink-muted/70 transition-all duration-150 flex-shrink-0',
+          'opacity-0 -translate-x-1 group-hover:opacity-100 group-hover:translate-x-0',
+        )}
+      />
     </button>
   )
 }
@@ -624,13 +776,17 @@ function EdgeTypeChip({ edgeType }: { edgeType: string }) {
     (r) => r.id.toUpperCase() === edgeType.toUpperCase(),
   )
   const color = rt?.visual.strokeColor ?? generateEdgeColorFromType(edgeType)
-  const displayName = rt?.name ?? edgeType.toLowerCase()
+  const displayName = rt?.name ?? edgeType.toLowerCase().replace(/_/g, ' ')
 
   return (
     <span
-      className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium"
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-semibold uppercase tracking-wide whitespace-nowrap"
       style={{ backgroundColor: `${color}1a`, color }}
     >
+      <span
+        className="w-1 h-1 rounded-full"
+        style={{ backgroundColor: color }}
+      />
       {displayName}
     </span>
   )
@@ -643,13 +799,17 @@ function EmptyState({
 }: {
   icon: React.ComponentType<{ className?: string }>
   title: string
-  hint: string
+  hint?: string
 }) {
   return (
-    <div className="flex flex-col items-center justify-center text-center py-5 px-4 rounded-lg bg-black/[0.03] dark:bg-white/[0.03]">
-      <Icon className="w-4 h-4 text-ink-muted/60 mb-1.5" />
-      <p className="text-[11px] font-medium text-ink-muted">{title}</p>
-      <p className="text-[10px] text-ink-muted/70 mt-0.5">{hint}</p>
+    <div className="flex flex-col items-center justify-center text-center py-6 px-4 rounded-xl bg-black/[0.02] dark:bg-white/[0.02] border border-dashed border-white/[0.08]">
+      <div className="w-9 h-9 rounded-full bg-white/[0.04] flex items-center justify-center mb-2">
+        <Icon className="w-4 h-4 text-ink-muted/60" />
+      </div>
+      <p className="text-[11.5px] font-medium text-ink-muted">{title}</p>
+      {hint && (
+        <p className="text-[10.5px] text-ink-muted/70 mt-0.5">{hint}</p>
+      )}
     </div>
   )
 }
