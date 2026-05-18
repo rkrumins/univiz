@@ -40,10 +40,11 @@ interface EntityDrawerProps {
   onTraceDown?: (nodeId: string) => void
   /** Callback when full trace is triggered */
   onFullTrace?: (nodeId: string) => void
-  /** Center the underlying canvas on the given node id. Optional — some
-   *  canvas variants (Hierarchy, ContextView) don't yet have a focus API
-   *  wired, in which case clicking a neighbor still swaps the drawer. */
-  onFocusNode?: (nodeId: string) => void
+  /** Reveal the underlying canvas on the given node id — expands any
+   *  collapsed ancestors (lazy-loading from the backend if needed), then
+   *  pans/scrolls to the target. May return a promise; the drawer's
+   *  neighbor row awaits it to show a loading spinner. */
+  onFocusNode?: (nodeId: string) => void | Promise<void>
   /** External link URL builder */
   getExternalUrl?: (urn: string) => string | null
 }
@@ -698,7 +699,7 @@ interface ViewModeContentProps {
   propertiesBag: Record<string, any>
   onCopyUrn: () => void
   copiedUrn: boolean
-  onFocusNode?: (nodeId: string) => void
+  onFocusNode?: (nodeId: string) => void | Promise<void>
 }
 
 function ViewModeContent({

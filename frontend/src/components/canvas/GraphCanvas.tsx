@@ -59,6 +59,8 @@ import { NodePalette } from './NodePalette'
 
 // Hooks
 import { useGraphHydration } from '@/hooks/useGraphHydration'
+import { useRevealNode } from '@/hooks/useRevealNode'
+import { useGraphProvider } from '@/providers/GraphProviderContext'
 import { useElkLayout } from '@/hooks/useElkLayout'
 import { useContainmentHierarchy } from '@/hooks/useContainmentHierarchy'
 import { useCanvasTrace } from '@/hooks/useCanvasTrace'
@@ -560,6 +562,10 @@ export function GraphCanvas({ className }: { className?: string }) {
   // 14. ELK Layout
   const { applyLayout, isLayouting, direction, toggleDirection } = useElkLayout()
   const [layoutedNodes, setLayoutedNodes] = useState<LineageNode[]>([])
+  // Ref mirror so the reveal-focus adapter can read post-layout positions
+  // without re-binding every render. Synced below on every render.
+  const layoutedNodesRef = useRef<LineageNode[]>([])
+  layoutedNodesRef.current = layoutedNodes
   const prevLayoutSig = useRef('')
   const hasAppliedInitialLayout = useRef(false)
   const fitViewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -575,20 +581,34 @@ export function GraphCanvas({ className }: { className?: string }) {
     }, 250)
   }, [rfInstance])
 
-  // Centers the viewport on a node by id. Used by EntityDrawer's
-  // LineageNeighbors so clicking a neighbor pans the canvas to it.
-  const focusOnCanvas = useCallback(
-    (id: string) => {
+  // Reveal + center the viewport on a node by id. Used by EntityDrawer's
+  // LineageNeighbors so clicking a neighbor pans the canvas to it — and,
+  // when the neighbor is hidden inside collapsed parents, expands the
+  // ancestor chain (lazy-loading from the backend if needed) before
+  // panning. See [useRevealNode](../../hooks/useRevealNode.ts).
+  //
+  // The pan adapter reads from `layoutedNodes` (post-elk positions) via a
+  // ref because canvas-store positions are pre-layout. Trace mode is
+  // transparent here — visibility is governed by parentMap + expandedNodes,
+  // not by trace state, so the cascade works under both browse and trace.
+  const provider = useGraphProvider()
+  const revealAndFocus = useRevealNode({
+    parentMap,
+    setExpandedNodes,
+    loadChildren,
+    provider,
+    focus: (id: string) => {
       if (!rfInstance) return
-      const node = rawNodes.find((n) => n.id === id)
+      const node =
+        layoutedNodesRef.current.find((n) => n.id === id) ??
+        useCanvasStore.getState().nodes.find((n) => n.id === id)
       if (!node) return
       rfInstance.setCenter(node.position.x, node.position.y, {
         zoom: rfInstance.getZoom(),
         duration: 400,
       })
     },
-    [rfInstance, rawNodes],
-  )
+  })
 
   const scheduleFitViewRef = useRef(scheduleFitView)
   scheduleFitViewRef.current = scheduleFitView
@@ -1441,7 +1461,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         onTraceUp={(nodeId) => trace.traceUpstream(nodeId)}
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
-        onFocusNode={focusOnCanvas}
+        onFocusNode={revealAndFocus}
       />
 
       {/* UX Components */}

@@ -36,6 +36,7 @@ import { usePreferencesStore } from '@/store/preferences'
 import { useGraphProvider } from '@/providers'
 import type { TraceV2Result } from '@/providers/GraphDataProvider'
 import { useGraphHydration } from '@/hooks/useGraphHydration'
+import { useRevealNode } from '@/hooks/useRevealNode'
 import { useAggregatedLineage } from '@/hooks/useAggregatedLineage'
 import { EdgeDetailPanel, generateEdgeTypeFilters } from '../../panels/EdgeDetailPanel'
 import { EntityDrawer } from '../../panels/EntityDrawer'
@@ -1065,6 +1066,26 @@ export function ContextViewCanvas({
   // Toggle node expansion with Lazy Loading
   const { loadChildren, searchChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes, failedNodes } = useGraphHydration()
 
+  // Reveal-and-focus: clicking a neighbor in the drawer's Lineage section
+  // expands collapsed ancestors (lazy-loading from the backend if needed),
+  // then scrolls the now-visible target into view. Works during trace mode
+  // because visibility here is governed by parentMap + expandedNodes, not
+  // by trace state directly. See [useRevealNode](../../../hooks/useRevealNode.ts).
+  const revealAndFocus = useRevealNode({
+    parentMap,
+    setExpandedNodes,
+    loadChildren,
+    provider,
+    focus: (id: string) => {
+      const el = document.getElementById(`layer-node-${id}`)
+      el?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+        inline: 'center',
+      })
+    },
+  })
+
   // Hydration phase mirrored into the canvas store by CanvasRouter — drives
   // the ghost-card stack in empty layers and the GhostLineageOverlay.
   // Anything-not-complete counts as hydrating so that:
@@ -1911,6 +1932,7 @@ export function ContextViewCanvas({
             onTraceUp={(nodeId) => traceUpstreamWithSmartLevel(nodeId)}
             onTraceDown={(nodeId) => traceDownstreamWithSmartLevel(nodeId)}
             onFullTrace={(nodeId) => traceFullLineageWithSmartLevel(nodeId)}
+            onFocusNode={revealAndFocus}
           />
         )}
         {!drawerNodeId && isEdgePanelOpen && (

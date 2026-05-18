@@ -16,7 +16,7 @@
  */
 
 import React from 'react'
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -32,7 +32,7 @@ import type { WorkspaceSchema } from '@/types/schema'
 // Framer-motion: render plain elements + render children synchronously so
 // AnimatePresence-wrapped detail panels appear in the DOM immediately.
 vi.mock('framer-motion', () => {
-  const passthrough = (tag: keyof JSX.IntrinsicElements) =>
+  const passthrough = (tag: string) =>
     React.forwardRef<HTMLElement, React.HTMLAttributes<HTMLElement>>(
       function MotionStub(props, ref) {
         return React.createElement(tag, { ...props, ref })
@@ -42,7 +42,7 @@ vi.mock('framer-motion', () => {
     motion: new Proxy(
       {},
       {
-        get: (_target, key: string) => passthrough(key as keyof JSX.IntrinsicElements),
+        get: (_target, key: string) => passthrough(key),
       },
     ),
     AnimatePresence: ({ children }: { children: React.ReactNode }) => (
@@ -421,5 +421,29 @@ describe('LineageNeighbors — neighbor click', () => {
 
     await user.click(screen.getByText('Upstream Source'))
     expect(useCanvasStore.getState().drawerNodeId).toBe(UPSTREAM_A)
+  })
+
+  it('shows a spinner on the clicked row while onFocusNode is pending', async () => {
+    const user = userEvent.setup()
+    let resolveReveal: () => void = () => {}
+    const onFocusNode = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveReveal = resolve
+        }),
+    )
+    seedCanvas([makeEdge('e1', UPSTREAM_A, FOCAL, 'FLOWS_TO')])
+    render(<LineageNeighbors nodeId={FOCAL} onFocusNode={onFocusNode} />)
+    await user.click(screen.getByText('Data Sources'))
+
+    await user.click(screen.getByText('Upstream Source'))
+
+    // Spinner visible while the promise is pending.
+    expect(screen.getByTestId('reveal-spinner')).toBeInTheDocument()
+
+    resolveReveal()
+    await waitFor(() =>
+      expect(screen.queryByTestId('reveal-spinner')).not.toBeInTheDocument(),
+    )
   })
 })
