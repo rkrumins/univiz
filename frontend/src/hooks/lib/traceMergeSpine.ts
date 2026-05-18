@@ -16,9 +16,13 @@
  * the original code was guarding against.
  *
  * When a participant's spine cannot reach a known anchor (the entire ancestor
- * chain is novel), the topmost spine node is flagged as `unreachable`; the
- * caller should attach an `assignmentHint` (typically the focus's layer) to
- * that node so useLayerAssignment has a fallback in the root-priority chain.
+ * chain is novel), the topmost spine node is flagged as `unreachable`. The
+ * caller is expected to merge such participants only if they have a
+ * legitimate layer claim via useLayerAssignment's normal priority chain
+ * (explicit assignment, instance, view config, rules, inheritance);
+ * otherwise they fall out of `nodesByLayer` and don't render. This is the
+ * desired behaviour — preventing trace from parking unassigned entities in
+ * the focus's layer.
  */
 
 export interface SpineInput {
@@ -33,7 +37,7 @@ export interface SpineInput {
 export interface SpineResult {
   /** Ancestor URNs that must be merged to route new participants to a known anchor. */
   spineUrns: Set<string>
-  /** Spine roots whose chain never reached a known anchor — caller attaches assignmentHint. */
+  /** Spine roots whose chain never reached a known anchor — informational; callers no longer use these as an assignment fallback. */
   unreachableRoots: Set<string>
 }
 
