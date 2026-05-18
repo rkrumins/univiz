@@ -26,6 +26,7 @@ import { usePersonaStore } from '@/store/persona'
 import { useEntityColorSet } from '@/hooks/useEntityVisual'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { PropertyEditor } from '@/components/panels/PropertyEditor'
+import { LineageNeighbors } from '@/components/panels/LineageNeighbors'
 import { cn } from '@/lib/utils'
 
 // ============================================
@@ -39,6 +40,10 @@ interface EntityDrawerProps {
   onTraceDown?: (nodeId: string) => void
   /** Callback when full trace is triggered */
   onFullTrace?: (nodeId: string) => void
+  /** Center the underlying canvas on the given node id. Optional — some
+   *  canvas variants (Hierarchy, ContextView) don't yet have a focus API
+   *  wired, in which case clicking a neighbor still swaps the drawer. */
+  onFocusNode?: (nodeId: string) => void
   /** External link URL builder */
   getExternalUrl?: (urn: string) => string | null
 }
@@ -53,6 +58,7 @@ export function EntityDrawer({
   onTraceUp,
   onTraceDown,
   onFullTrace,
+  onFocusNode,
   getExternalUrl,
 }: EntityDrawerProps) {
   const { drawerNodeId, nodes, updateNode, clearSelection, closeNodeDrawer } = useCanvasStore()
@@ -466,6 +472,7 @@ export function EntityDrawer({
         <div className="flex-1 overflow-y-auto custom-scrollbar">
           {viewMode === 'view' && (
             <ViewModeContent
+              nodeId={selectedNode.id}
               formData={formData}
               urn={urn}
               childCount={childCount}
@@ -474,6 +481,7 @@ export function EntityDrawer({
               propertiesBag={propertiesBag}
               onCopyUrn={handleCopyUrn}
               copiedUrn={copiedUrn}
+              onFocusNode={onFocusNode}
             />
           )}
 
@@ -681,6 +689,7 @@ function DetailsList({ formData }: { formData: Record<string, any> }) {
 // ============================================
 
 interface ViewModeContentProps {
+  nodeId: string
   formData: Record<string, any>
   urn: string
   childCount: number
@@ -689,15 +698,18 @@ interface ViewModeContentProps {
   propertiesBag: Record<string, any>
   onCopyUrn: () => void
   copiedUrn: boolean
+  onFocusNode?: (nodeId: string) => void
 }
 
 function ViewModeContent({
+  nodeId,
   formData,
   urn,
   colors,
   propertiesBag,
   onCopyUrn,
   copiedUrn,
+  onFocusNode,
 }: ViewModeContentProps) {
   const hasAdditional = Object.keys(propertiesBag).length > 0
   return (
@@ -754,13 +766,8 @@ function ViewModeContent({
         </Section>
       )}
 
-      {/* Lineage Preview */}
-      <Section title="Lineage Preview" icon={LucideIcons.GitBranch} action={<ComingSoonChip />}>
-        <div className="space-y-2">
-          <LineagePreviewRow direction="upstream" count={3} label="Data Sources" />
-          <LineagePreviewRow direction="downstream" count={7} label="Data Consumers" />
-        </div>
-      </Section>
+      {/* Lineage — real 1-hop neighbors with direction/entity/edge filters. */}
+      <LineageNeighbors nodeId={nodeId} onFocusNode={onFocusNode} />
 
       {/* Recent Activity */}
       <Section title="Recent Activity" icon={LucideIcons.History} action={<ComingSoonChip />}>
@@ -1031,32 +1038,6 @@ function JsonModeContent({ rawJson, jsonError, onChange }: JsonModeContentProps)
 // ============================================
 // Helper Components
 // ============================================
-
-interface LineagePreviewRowProps {
-  direction: 'upstream' | 'downstream'
-  count: number
-  label: string
-}
-
-function LineagePreviewRow({ direction, count, label }: LineagePreviewRowProps) {
-  return (
-    <button className={cn(
-      "w-full flex items-center gap-3 p-3 rounded-xl",
-      "bg-black/5 dark:bg-white/5",
-      "hover:bg-black/10 dark:hover:bg-white/10 transition-colors duration-150"
-    )}>
-      {direction === 'upstream' ? (
-        <LucideIcons.ArrowUpRight className="w-4 h-4 text-ink-muted" />
-      ) : (
-        <LucideIcons.ArrowDownLeft className="w-4 h-4 text-ink-muted" />
-      )}
-      <div className="flex-1 text-left">
-        <span className="text-sm font-medium text-ink">{count} {label}</span>
-      </div>
-      <span className="text-xs text-ink-muted">View →</span>
-    </button>
-  )
-}
 
 interface ActivityRowProps {
   action: string
