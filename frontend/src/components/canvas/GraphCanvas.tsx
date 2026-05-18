@@ -109,6 +109,7 @@ export function GraphCanvas({ className }: { className?: string }) {
 
   // 2. Canvas store
   const { setNodes, setEdges, selectNode, selectEdge, clearSelection, addEdges, addNodes } = useCanvasStore()
+  const setVisibleEdges = useCanvasStore((s) => s.setVisibleEdges)
   const rawNodes = useCanvasStore((s) => s.nodes)
   const rawEdges = useCanvasStore((s) => s.edges)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
@@ -445,6 +446,25 @@ export function GraphCanvas({ className }: { className?: string }) {
     [allVisibleEdges]
   )
 
+  // Publish the projected lineage edge set so EntityDrawer's Lineage section
+  // can mirror what the user sees on canvas (see canvas.ts:visibleEdges).
+  // Dedup by id-fingerprint so unstable upstream memos (allVisibleEdges
+  // re-derives on every aggregatedEdges Map churn) don't cause repeated
+  // store writes that feed back into a render loop.
+  const lineageEdgesFingerprint = useMemo(
+    () => lineageEdges.map((e) => e.id).join('|'),
+    [lineageEdges],
+  )
+  const lineageEdgesRef = useRef(lineageEdges)
+  lineageEdgesRef.current = lineageEdges
+  useEffect(() => {
+    setVisibleEdges(lineageEdgesRef.current as LineageEdgeType[])
+    // No cleanup-reset: avoids a second store write per cycle that triggers
+    // a re-render in any subscriber (LineageNeighbors) and feeds the loop.
+    // Stale data on unmount is overwritten by the next canvas mount; if no
+    // canvas is mounted, LineageNeighbors falls back to raw `edges`.
+  }, [lineageEdgesFingerprint, setVisibleEdges])
+
   // 12. Highlight state — uses lineageEdges for click/hover highlighting
   const hoveredNodeId = useHoveredNodeId()
   const { highlightState, isHighlightActive: isClickHighlightActive } = useHighlightState({
@@ -554,6 +574,21 @@ export function GraphCanvas({ className }: { className?: string }) {
       fitViewTimer.current = null
     }, 250)
   }, [rfInstance])
+
+  // Centers the viewport on a node by id. Used by EntityDrawer's
+  // LineageNeighbors so clicking a neighbor pans the canvas to it.
+  const focusOnCanvas = useCallback(
+    (id: string) => {
+      if (!rfInstance) return
+      const node = rawNodes.find((n) => n.id === id)
+      if (!node) return
+      rfInstance.setCenter(node.position.x, node.position.y, {
+        zoom: rfInstance.getZoom(),
+        duration: 400,
+      })
+    },
+    [rfInstance, rawNodes],
+  )
 
   const scheduleFitViewRef = useRef(scheduleFitView)
   scheduleFitViewRef.current = scheduleFitView
@@ -1406,6 +1441,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         onTraceUp={(nodeId) => trace.traceUpstream(nodeId)}
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
+        onFocusNode={focusOnCanvas}
       />
 
       {/* UX Components */}

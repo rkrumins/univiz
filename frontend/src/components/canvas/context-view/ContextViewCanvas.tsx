@@ -29,7 +29,7 @@ import {
   useViewRelationshipTypes,
   useViewEntityTypes,
 } from '@/hooks/useViewSchema'
-import { useCanvasStore, useCanvasVersion } from '@/store/canvas'
+import { useCanvasStore, useCanvasVersion, type LineageEdge } from '@/store/canvas'
 import { useInstanceAssignments, useReferenceModelStore } from '@/store/referenceModelStore'
 import { useWorkspacesStore } from '@/store/workspaces'
 import { usePreferencesStore } from '@/store/preferences'
@@ -95,6 +95,7 @@ export function ContextViewCanvas({
   const edges = useCanvasStore((s) => s.edges)
   const addNodes = useCanvasStore((s) => s.addNodes)
   const addEdges = useCanvasStore((s) => s.addEdges)
+  const setVisibleEdges = useCanvasStore((s) => s.setVisibleEdges)
   const removeEdgesByNodeIds = useCanvasStore((s) => s.removeEdgesByNodeIds)
   const removeStoreEdges = useCanvasStore((s) => s.removeEdges)
   const selectNode = useCanvasStore((s) => s.selectNode)
@@ -1432,6 +1433,26 @@ export function ContextViewCanvas({
     browseBundleFanInThreshold: lineageBundleFanIn,
     nodeLayerIndexMap,
   })
+
+  // Publish the projected lineage edge set to the canvas store so panels
+  // outside the canvas (EntityDrawer's Lineage section) can mirror exactly
+  // what the user sees. `visibleLineageEdges` already excludes containment
+  // and rolls leaf-level edges up to visible ancestors. Dedup by
+  // id-fingerprint — upstream memos can return a new array reference even
+  // when content is identical, and a naive ref-based dep would cause repeated
+  // store writes feeding back into a render loop.
+  const visibleLineageEdgesFingerprint = useMemo(
+    () => visibleLineageEdges.map((e: { id: string }) => e.id).join('|'),
+    [visibleLineageEdges],
+  )
+  const visibleLineageEdgesRef = useRef(visibleLineageEdges)
+  visibleLineageEdgesRef.current = visibleLineageEdges
+  useEffect(() => {
+    setVisibleEdges(visibleLineageEdgesRef.current as LineageEdge[])
+    // No cleanup-reset: avoids a second store write per cycle. Stale data
+    // on unmount gets overwritten by the next canvas mount; the consumer
+    // (LineageNeighbors) falls back to raw `edges` when empty.
+  }, [visibleLineageEdgesFingerprint, setVisibleEdges])
 
   // Render-mode resolution: `raw` shows every projected edge; `stubs`
   // suppresses them in favour of per-node stub indicators; `auto` flips

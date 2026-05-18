@@ -56,6 +56,18 @@ interface CanvasState {
   /** Atomic add of both nodes and edges with dedup (1 re-render) */
   addGraph: (nodes: LineageNode[], edges: LineageEdge[]) => void
 
+  // Visible edges — the projected + aggregated lineage edge set currently
+  // rendered on the canvas. Published by whichever canvas component owns
+  // edge projection (ContextViewCanvas via useEdgeProjection; GraphCanvas via
+  // its allVisibleEdges memo). Read by panels that need to mirror what the
+  // user actually sees on canvas (e.g. EntityDrawer's Lineage section),
+  // which raw `edges` alone cannot represent because raw edges live at
+  // leaf level while the canvas shows them rolled up to visible ancestors
+  // and merged with backend-aggregated edges. Empty when no canvas is
+  // mounted — readers must fall back to `edges`.
+  visibleEdges: LineageEdge[]
+  setVisibleEdges: (edges: LineageEdge[]) => void
+
   // Selection
   selectedNodeIds: string[]
   selectedEdgeIds: string[]
@@ -169,6 +181,8 @@ export const useCanvasStore = create<CanvasState>()(
       _version: 0,
       setNodes: (nodes) => set({ nodes, _nodeIndex: new Set(nodes.map((n) => n.id)) }),
       setEdges: (edges) => set({ edges, _edgeIndex: new Set(edges.map((e) => e.id)) }),
+      visibleEdges: [],
+      setVisibleEdges: (visibleEdges) => set({ visibleEdges }),
       addNodes: (newNodes) => set((state) => {
         const existingIds = state._nodeIndex
         const uniqueNodes = newNodes.filter((n) => !existingIds.has(n.id))
