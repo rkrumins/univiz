@@ -16,7 +16,7 @@
  */
 
 import React from 'react'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -31,13 +31,26 @@ import type { WorkspaceSchema } from '@/types/schema'
 
 // Framer-motion: render plain elements + render children synchronously so
 // AnimatePresence-wrapped detail panels appear in the DOM immediately.
+// CRITICAL: cache the passthrough component per tag. A naive
+// `new Proxy({}, { get: () => passthrough(tag) })` returns a fresh
+// `forwardRef` instance on every access — React treats each render as a
+// new component type, unmounting and remounting children. That destroys
+// local state inside any motion-wrapped descendant (e.g. the
+// `lastSelectedId` anchor inside ExpandedDetail).
 vi.mock('framer-motion', () => {
-  const passthrough = (tag: string) =>
-    React.forwardRef<HTMLElement, React.HTMLAttributes<HTMLElement>>(
-      function MotionStub(props, ref) {
-        return React.createElement(tag, { ...props, ref })
-      },
-    )
+  const cache = new Map<string, React.ComponentType<unknown>>()
+  const passthrough = (tag: string) => {
+    let cmp = cache.get(tag)
+    if (!cmp) {
+      cmp = React.forwardRef<HTMLElement, React.HTMLAttributes<HTMLElement>>(
+        function MotionStub(props, ref) {
+          return React.createElement(tag, { ...props, ref })
+        },
+      ) as unknown as React.ComponentType<unknown>
+      cache.set(tag, cmp)
+    }
+    return cmp
+  }
   return {
     motion: new Proxy(
       {},
@@ -513,19 +526,36 @@ describe('LineageNeighbors — multi-select', () => {
     const firstClick = screen.getAllByRole('button', { name: /select neighbor/i })
     expect(firstClick).toHaveLength(3)
     await user.click(firstClick[0])
+    // Confirm the anchor click landed.
+    await waitFor(() =>
+      expect(screen.getByText('1 selected')).toBeInTheDocument(),
+    )
 
-    // Re-query after the click (the action bar mounts + React may
-    // re-render row checkboxes). Then fire the shift-click via
-    // fireEvent — user-event v14's keyboard-held-shift doesn't reliably
-    // propagate through the synthetic click event in jsdom.
+    // Re-query after the click (the action bar mounted + React re-rendered
+    // row checkboxes). user-event v14 holds the shift modifier via the
+    // `{Shift>}` syntax; the next click() inherits the modifier and the
+    // resulting React synthetic event sees `shiftKey: true`.
     const afterFirst = screen.getAllByRole(
       'button',
       { name: /select neighbor|deselect neighbor/i },
     )
-    fireEvent.click(afterFirst[2], { shiftKey: true })
+    // Dispatch a real MouseEvent with shiftKey set — fireEvent's options
+    // shorthand goes through jsdom's Event constructor which doesn't
+    // carry modifier flags reliably. The explicit `new MouseEvent` with
+    // shiftKey in the init dictionary propagates correctly to React's
+    // SyntheticEvent.
+    afterFirst[2].dispatchEvent(
+      new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        shiftKey: true,
+      }),
+    )
 
     // All three rows should be selected (range A→C inclusive).
-    expect(screen.getByText('3 selected')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByText('3 selected')).toBeInTheDocument(),
+    )
   })
 })
 

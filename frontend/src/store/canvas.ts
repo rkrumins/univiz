@@ -68,12 +68,15 @@ interface CanvasState {
   visibleEdges: LineageEdge[]
   setVisibleEdges: (edges: LineageEdge[]) => void
 
-  // One-shot pulse highlight — set after a "jump to node" reveal completes
-  // so the user sees a visible confirmation of where they landed. Auto-
-  // clears after the pulse animation duration (700ms). Read by node
-  // components (GenericNode, FlatTreeItem) to apply a `lineage-pulse`
-  // class.
-  pulseNodeId: string | null
+  // One-shot pulse highlight — populated after a "jump to node" reveal so
+  // the user sees a visible confirmation of where they landed. A Set
+  // because multi-locate flows fire multiple pulses concurrently; using
+  // a single id would let the latest call overwrite earlier ones and
+  // only the last node would visibly pulse. Each entry auto-clears
+  // after the animation duration (~900ms). Read by node components
+  // (GenericNode, FlatTreeItem) via `pulseNodeIds.has(id)` to apply the
+  // `lineage-pulse` class.
+  pulseNodeIds: Set<string>
   pulseNode: (id: string) => void
 
   // Selection
@@ -191,16 +194,25 @@ export const useCanvasStore = create<CanvasState>()(
       setEdges: (edges) => set({ edges, _edgeIndex: new Set(edges.map((e) => e.id)) }),
       visibleEdges: [],
       setVisibleEdges: (visibleEdges) => set({ visibleEdges }),
-      pulseNodeId: null,
+      pulseNodeIds: new Set(),
       pulseNode: (id) => {
-        set({ pulseNodeId: id })
-        // Auto-clear after the animation duration. The id-guard prevents a
-        // newer pulse from being prematurely cleared by an older timeout.
+        // Add to the pulsing set; each id auto-clears after the
+        // animation duration. Using a Set lets multi-locate fire many
+        // pulses in parallel without overwriting each other.
+        set((state) => {
+          if (state.pulseNodeIds.has(id)) return state // already pulsing
+          const next = new Set(state.pulseNodeIds)
+          next.add(id)
+          return { pulseNodeIds: next }
+        })
         setTimeout(() => {
-          if (useCanvasStore.getState().pulseNodeId === id) {
-            set({ pulseNodeId: null })
-          }
-        }, 700)
+          set((state) => {
+            if (!state.pulseNodeIds.has(id)) return state
+            const next = new Set(state.pulseNodeIds)
+            next.delete(id)
+            return { pulseNodeIds: next }
+          })
+        }, 900)
       },
       addNodes: (newNodes) => set((state) => {
         const existingIds = state._nodeIndex
