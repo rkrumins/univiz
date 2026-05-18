@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { UseUnifiedTraceResult } from '@/hooks/useUnifiedTrace'
+import { DEFAULT_TRACE_DEPTH } from '@/hooks/useUnifiedTrace'
 import type { HierarchyNode } from '@/types/hierarchy'
 import { useCountUp } from './useCountUp'
 import { TraceRecentPopover } from './TraceRecentPopover'
@@ -68,10 +69,37 @@ export function TraceDockTitleBar({
   const direction = deriveDirection(trace.showUpstream, trace.showDownstream)
   const recentCount = trace.traceHistory.length
 
+  // Re-fetch the trace with the chosen direction. Matches the Entity
+  // Drawer trace actions (onTraceUp / onTraceDown / onTraceBoth) — the
+  // arrow isn't just a visibility toggle on already-fetched data; it
+  // triggers a fresh /trace/v2 call that asks the server for the new
+  // direction.
+  //
+  // Direction is encoded server-side via depth values: depth=0 disables
+  // that side. We preserve the existing depth on kept sides and floor
+  // at DEFAULT_TRACE_DEPTH when re-enabling a previously-disabled side,
+  // so toggling 'up' → 'both' doesn't return only one downstream hop.
   const setDirection = (dir: Direction) => {
-    if (dir === 'up') { trace.setShowUpstream(true); trace.setShowDownstream(false) }
-    else if (dir === 'down') { trace.setShowUpstream(false); trace.setShowDownstream(true) }
-    else { trace.setShowUpstream(true); trace.setShowDownstream(true) }
+    const curUp = trace.config.upstreamDepth
+    const curDown = trace.config.downstreamDepth
+    if (dir === 'up') {
+      trace.setConfig({ upstreamDepth: Math.max(curUp, DEFAULT_TRACE_DEPTH), downstreamDepth: 0 })
+      trace.setShowUpstream(true)
+      trace.setShowDownstream(false)
+    } else if (dir === 'down') {
+      trace.setConfig({ upstreamDepth: 0, downstreamDepth: Math.max(curDown, DEFAULT_TRACE_DEPTH) })
+      trace.setShowUpstream(false)
+      trace.setShowDownstream(true)
+    } else {
+      trace.setConfig({
+        upstreamDepth: Math.max(curUp, DEFAULT_TRACE_DEPTH),
+        downstreamDepth: Math.max(curDown, DEFAULT_TRACE_DEPTH),
+      })
+      trace.setShowUpstream(true)
+      trace.setShowDownstream(true)
+    }
+    // Fire-and-forget — error handling is centralised in startTrace.
+    void trace.retrace()
   }
 
   const controlsRef = useRef<HTMLElement[]>([])

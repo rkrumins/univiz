@@ -38,6 +38,7 @@ export function LineageFlowOverlay({
   resolveEdgeColor,
   onEdgeDoubleClick,
   showDirection = true,
+  expandingEdgeIds,
 }: {
   nodes: any[],
   edges: any[],
@@ -66,6 +67,8 @@ export function LineageFlowOverlay({
   onEdgeDoubleClick?: (edgeId: string) => void,
   /** When true, render arrowheads + animated mid-edge chevron flow. */
   showDirection?: boolean,
+  /** Edge ids whose drill-down is in flight — pulses them via `.nx-edge-expanding`. */
+  expandingEdgeIds?: Set<string>,
 }) {
   // Store computed abstract edges instead of direct React nodes for virtualization
   const [computedEdges, setComputedEdges] = useState<ComputedEdge[]>([])
@@ -931,13 +934,18 @@ export function LineageFlowOverlay({
           const gradId = `edge-grad-${edge.id.replace(/[^a-zA-Z0-9]/g, '')}`
           const coreOpacity = isHighlighted ? Math.min(0.95, edgeOpacity * 1.2) : edgeOpacity
 
+          const isExpanding = expandingEdgeIds?.has(edge.id) ?? false
+          const edgeClasses = [
+            edge.isTraceEdge ? 'nx-edge-trace' : null,
+            isExpanding ? 'nx-edge-expanding' : null,
+          ].filter(Boolean).join(' ') || undefined
           return (
             <g
               key={edge.id}
               data-edge-id={edge.id}
               data-edge-src={edge.source}
               data-edge-tgt={edge.target}
-              className={edge.isTraceEdge ? 'nx-edge-trace' : undefined}
+              className={edgeClasses}
               style={{ opacity: groupOpacity, transition: 'opacity 0.12s ease' }}
             >
               {/* Per-edge directional gradient. `userSpaceOnUse` with start/

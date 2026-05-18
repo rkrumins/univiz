@@ -8,6 +8,7 @@ import { TraceDockTitleBar } from './TraceDockTitleBar'
 import { TraceDockTabs, type TraceDockTab } from './TraceDockTabs'
 import { TraceDockOverview } from './TraceDockOverview'
 import { TraceDockDrilldownList } from './TraceDockDrilldownList'
+import { TraceDockBreadcrumb } from './TraceDockBreadcrumb'
 import { TraceDockSettings } from './TraceDockSettings'
 import { shouldShowTruncationNotice } from './TraceDockNoticeStrip'
 import type { GranularityOption } from './TraceDockControls'
@@ -26,6 +27,10 @@ export interface TraceBottomDockProps {
 }
 
 const COMPACT_HEIGHT = 64
+// Breadcrumb row height (px-4 + py-1.5 + ~16px line-height + 1px border).
+// Added to compact height when one or more drills are active so the row
+// isn't clipped by the dock's overflow-hidden container.
+const BREADCRUMB_ROW_HEIGHT = 30
 const MIN_EXPANDED_HEIGHT = 240
 const DEFAULT_EXPANDED_HEIGHT = 320
 const MAX_VH_FRACTION = 0.6
@@ -133,7 +138,10 @@ export function TraceBottomDock({
     window.addEventListener('pointerup', onUp)
   }
 
-  const dockHeight = expanded ? expandedHeight : COMPACT_HEIGHT
+  const hasBreadcrumb = drilldownCount > 0
+  const dockHeight = expanded
+    ? expandedHeight
+    : COMPACT_HEIGHT + (hasBreadcrumb ? BREADCRUMB_ROW_HEIGHT : 0)
 
   // Publish dock height as a CSS variable on the parent canvas-body so
   // EdgeLegend (and any other bottom-anchored chrome) can lift above it.
@@ -169,7 +177,7 @@ export function TraceBottomDock({
       transition={MOTION.modalSpring}
       style={{ height: dockHeight }}
       className={cn(
-        'absolute left-3 right-3 bottom-3 z-30',
+        'absolute left-3 right-3 bottom-3 z-40',
         'rounded-2xl overflow-hidden',
         // Premium frosted shell: gradient base + heavy blur + accent-tinted border
         'bg-gradient-to-b from-canvas-elevated/96 via-canvas-elevated/95 to-canvas-elevated/96',
@@ -222,6 +230,18 @@ export function TraceBottomDock({
           expanded={expanded}
           onToggleExpanded={onToggleExpanded}
           onExit={onExit}
+        />
+
+        {/* Drill-back breadcrumb — visible whenever one or more drills are
+            active, in both compact and expanded modes. Self-hides when
+            drilldowns is empty so the dock stays slim during a fresh
+            trace. */}
+        <TraceDockBreadcrumb
+          focusId={trace.focusId}
+          focusName={focusNode?.name ?? trace.focusId ?? 'Focus'}
+          drilldowns={trace.drilldowns}
+          displayMap={displayMap}
+          onCollapse={trace.collapseDrilldown}
         />
 
         {/* Tabs + body — only in expanded mode */}

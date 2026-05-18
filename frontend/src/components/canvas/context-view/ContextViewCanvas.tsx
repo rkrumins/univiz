@@ -1445,6 +1445,27 @@ export function ContextViewCanvas({
     )
   }, [visibleLineageEdges, isStubsMode, hoveredNodeId, selectedNodeId, trace.isTracing, trace.result?.focusId])
 
+  // Edges whose drill-down is in flight — match by `${sourceUrn}->${targetUrn}`
+  // against `trace.expandingPairs`. The renderer pulses these so the
+  // canvas never appears frozen during the /trace/expand round-trip.
+  const expandingEdgeIds = useMemo(() => {
+    if (trace.expandingPairs.size === 0) return undefined
+    const ids = new Set<string>()
+    const resolveUrn = (id: string | undefined | null): string | undefined => {
+      if (!id) return undefined
+      const node = displayMap.get(id)
+      return (node?.urn as string | undefined) ?? id
+    }
+    for (const e of effectiveLineageEdges) {
+      const sUrn = resolveUrn((e as { source?: string; sourceUrn?: string }).source ?? (e as { sourceUrn?: string }).sourceUrn)
+      const tUrn = resolveUrn((e as { target?: string; targetUrn?: string }).target ?? (e as { targetUrn?: string }).targetUrn)
+      if (sUrn && tUrn && trace.expandingPairs.has(`${sUrn}->${tUrn}`)) {
+        ids.add(e.id)
+      }
+    }
+    return ids
+  }, [trace.expandingPairs, effectiveLineageEdges, displayMap])
+
   // Per-node lineage counts in stubs mode. Drives the small partial-edge
   // markers on each entity card — a quiet inbound arrow on the left when
   // `in > 0`, a quiet outbound arrow on the right when `out > 0`. Counts
@@ -1610,6 +1631,14 @@ export function ContextViewCanvas({
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
         onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
         onExitTrace={exitTrace}
+        traceUpstreamDepth={trace.config.upstreamDepth}
+        traceDownstreamDepth={trace.config.downstreamDepth}
+        onSetTraceDepth={(dir, value) => {
+          // Apply the new depth, then re-fetch when a trace is active so
+          // the canvas reflects the change without a manual re-trace.
+          trace.setConfig(dir === 'upstream' ? { upstreamDepth: value } : { downstreamDepth: value })
+          if (trace.isTracing) void trace.retrace()
+        }}
         onAddEntity={() => { setIsCreatingEntity(true); setCreationParentId(null); setCreationLayerId(null) }}
         viewName={activeView?.name}
         entityTypeCount={activeView?.content.visibleEntityTypes.length}
@@ -1714,6 +1743,7 @@ export function ContextViewCanvas({
           ref={horizontalScrollRef}
           className="flex-1 overflow-auto relative scroll-smooth"
           onClick={handleBackgroundClick}
+          style={{ paddingBottom: 'var(--trace-dock-height, 0px)' }}
         >
           {/* Lineage Flow Overlay - Render BEFORE columns to be behind them
               (z-index managed in component to 0, cols should be higher).
@@ -1738,6 +1768,7 @@ export function ContextViewCanvas({
               resolveEdgeColor={resolveEdgeColor}
               onEdgeDoubleClick={handleEdgeDoubleClick}
               showDirection={showEdgeDirection}
+              expandingEdgeIds={expandingEdgeIds}
             />
           )}
 

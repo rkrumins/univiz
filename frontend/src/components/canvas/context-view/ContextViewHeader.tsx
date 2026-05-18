@@ -17,6 +17,7 @@ import { cn } from '@/lib/utils'
 import type { HierarchyNode } from './types'
 import type { LineageRenderMode } from '@/store/preferences'
 import { LineageDisplayPopover } from './LineageDisplayPopover'
+import { TraceDepthControl } from './TraceDepthControl'
 
 export interface ContextViewHeaderProps {
   // Search
@@ -46,6 +47,13 @@ export interface ContextViewHeaderProps {
   canTrace: boolean
   onStartTrace: () => void
   onExitTrace: () => void
+
+  // Trace depth — visible affordance under the Lineage controls so users
+  // can see and adjust the current upstream/downstream hop count. Edits
+  // re-run the active trace (handled by the parent's onSetTraceDepth).
+  traceUpstreamDepth: number
+  traceDownstreamDepth: number
+  onSetTraceDepth: (dir: 'upstream' | 'downstream', value: number) => void
 
   // Add entity
   onAddEntity: () => void
@@ -87,6 +95,9 @@ export function ContextViewHeader({
   canTrace,
   onStartTrace,
   onExitTrace,
+  traceUpstreamDepth,
+  traceDownstreamDepth,
+  onSetTraceDepth,
   onAddEntity,
   viewName,
   entityTypeCount,
@@ -174,6 +185,16 @@ export function ContextViewHeader({
               showLineageFlow ? "bg-green-500 dark:bg-green-400 dark:shadow-lg dark:shadow-green-400/50" : "bg-ink-muted/30"
             )} />
           </button>
+
+          {/* Trace depth — current upstream/downstream hop counts, with
+              steppers to adjust. Always visible alongside Lineage so the
+              active scope is legible at a glance. Re-runs the trace on
+              edit when one is active (handled by the parent). */}
+          <TraceDepthControl
+            upstreamDepth={traceUpstreamDepth}
+            downstreamDepth={traceDownstreamDepth}
+            onChange={onSetTraceDepth}
+          />
 
           {/* Display popover — consolidates Edge Density (Stubs/Auto/Raw)
               and Direction arrows behind a single trigger. Hidden when

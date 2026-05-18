@@ -1098,6 +1098,22 @@ export function GraphCanvas({ className }: { className?: string }) {
     }
   }, [rawNodes, rawEdges])
 
+  // ESC-driven trace exit. Mirrors ContextViewCanvas: purges the edges the
+  // trace merged into the canvas store, clears trace state, and reverts
+  // ancestor-chain auto-expansion. Without this, ESC fell through to plain
+  // selection-clear and the trace dock stayed open.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) {
+      useCanvasStore.getState().removeEdges(idsToRemove)
+    }
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace])
+
   // 19. Canvas interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => trace.startTrace(nodeId),
@@ -1116,6 +1132,7 @@ export function GraphCanvas({ className }: { className?: string }) {
       }
       return false
     },
+    onExitTrace: exitTrace,
   })
 
   useCanvasKeyboard({ enabled: true, handlers: interactions.keyboardHandlers })
