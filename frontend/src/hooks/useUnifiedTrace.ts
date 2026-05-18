@@ -247,16 +247,17 @@ const TRACE_HISTORY_LIMIT = 5
  * that was previously zeroed out. Also the initial config depth, so a
  * fresh trace covers the full pipeline by default.
  */
-export const DEFAULT_TRACE_DEPTH = 10
+export const DEFAULT_TRACE_DEPTH = 25
+
+/** Hard upper bound for any depth input — matches the trace depth control's slider max. */
+export const MAX_TRACE_DEPTH = 100
 
 const DEFAULT_CONFIG: TraceConfig = {
-    // 10/10 covers a deep end-to-end pipeline by default (source → staging
-    // → refined → mart → reporting and back, with room for branching) so
-    // dock direction toggles return a complete trace rather than the
-    // immediate neighbourhood. Materialized AGGREGATED edges at the focus
-    // level keep hub-node traces tractable; the deeper presets
-    // (traceUpstream/Downstream = 50, traceFullLineage = 25/25) remain
-    // available for analysts who want to walk further out.
+    // 25/25 covers a deep end-to-end pipeline by default. Users can raise
+    // this to 100 via the Trace Depth header chip (visible only in trace
+    // mode), or drop to 0 on one side via the dock direction arrows.
+    // Materialized AGGREGATED edges at the focus level keep hub-node
+    // traces tractable even at the upper bound.
     upstreamDepth: DEFAULT_TRACE_DEPTH,
     downstreamDepth: DEFAULT_TRACE_DEPTH,
     includeColumnLineage: true,
