@@ -116,10 +116,27 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     return set
   }, [trace.isTracing, trace.visibleTraceNodes, parentMap])
 
+  // ESC-driven trace exit. Mirrors ContextViewCanvas: purges trace-merged
+  // edges from the canvas store, clears trace state, and reverts ancestor-
+  // chain auto-expansion. Without this, ESC fell through to selection-clear
+  // and the trace dock stayed open.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) {
+      useCanvasStore.getState().removeEdges(idsToRemove)
+    }
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace])
+
   // UX-first Canvas Interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => trace.startTrace(nodeId),
     onNodeCreated: (nodeId) => selectNode(nodeId),
+    onExitTrace: exitTrace,
   })
 
   // Keyboard shortcuts
