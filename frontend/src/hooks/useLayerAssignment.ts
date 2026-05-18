@@ -39,9 +39,8 @@ export interface UseLayerAssignmentResult {
   displayFlat: HierarchyNode[]
   displayMap: Map<string, HierarchyNode>
   urnToIdMap: Map<string, string>
-  /** Final effective layer per node id — used by the trace merge to derive
-   *  an assignmentHint for lineage participants whose containment chain
-   *  doesn't reach an already-placed canvas anchor. */
+  /** Final effective layer per node id — exposed for layer-ordinal lookups
+   *  by the canvas (e.g. left/right neighbor sort for trace pinning). */
   nodeLayerMap: Map<string, string>
 }
 
@@ -193,16 +192,11 @@ export function useLayerAssignment({
         // 5. inheritance (for non-containment relationships, if any)
         if (!myLayerId && inheritedLayerId) myLayerId = inheritedLayerId
 
-        // 6. assignmentHint — last-resort fallback used by the trace merge.
-        //    When /trace/v2 returns a lineage participant whose containment
-        //    chain doesn't reach a known canvas anchor, the merge stamps a
-        //    hint (typically the focus's layer) onto the node's metadata so
-        //    it lands somewhere visible instead of being silently dropped.
-        if (!myLayerId) {
-          const nodeRecord = nodeMap.get(nodeId)
-          const hint = (nodeRecord?.data?.metadata as Record<string, unknown> | undefined)?.assignmentHint
-          if (typeof hint === 'string' && hint.length > 0) myLayerId = hint
-        }
+        // No fallback beyond inheritance. Nodes that match nothing in the
+        // chain stay unassigned and drop out of `nodesByLayer` — this is
+        // what keeps trace results from pulling in entities (e.g. layer
+        // nodes with no view-level assignment) into a focus column where
+        // they don't actually belong.
       }
 
       if (myLayerId === '__UNASSIGNED__') myLayerId = undefined

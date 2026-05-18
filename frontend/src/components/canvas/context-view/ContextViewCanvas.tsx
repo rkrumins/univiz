@@ -150,9 +150,18 @@ export function ContextViewCanvas({
       //
       // The spine helper returns the minimum ancestor chain needed to route
       // each new participant up to a node the canvas already places. We merge
-      // participants + spine, then attach an `assignmentHint` to spine roots
-      // whose chain never reached a known anchor — useLayerAssignment honours
-      // that hint as a last-resort fallback so the lineage stays visible.
+      // participants + spine and let useLayerAssignment's natural priority
+      // chain (explicit → instance → view config → rules → inheritance)
+      // decide where each node lands. Participants whose chain never reaches
+      // a known anchor AND whose entity type/rules don't claim them in this
+      // view fall out of `nodesByLayer` and don't render — the same outcome
+      // as browse mode. We intentionally drop the previous "stamp the focus
+      // layer as a fallback" behaviour: it pulled in entities (e.g. a
+      // `Web Analytics` layer node that has no view assignment) and parked
+      // them in the focus's column, falsely implying they belonged to that
+      // layer. Losing the lineage involving truly unassigned nodes is the
+      // correct trade-off — the user can place those nodes in a layer to
+      // surface them.
       if (result.lineageResult) {
         const lr = result.lineageResult
 
@@ -162,17 +171,11 @@ export function ContextViewCanvas({
         lr.downstreamUrns.forEach(u => participantUrns.add(u))
 
         const knownAssignedUrns = new Set<string>(displayMap.keys())
-        const { spineUrns, unreachableRoots } = computeTraceMergeSpine({
+        const { spineUrns } = computeTraceMergeSpine({
           participantUrns,
           containmentEdges: result.containmentEdges ?? [],
           knownAssignedUrns,
         })
-
-        // Determine the focus's effective layer for the assignmentHint
-        // fallback. In ContextViewCanvas the canvas node id == urn, so we
-        // can look it up directly. Outside trace mode this map is rebuilt
-        // every render; reading it here is O(1).
-        const focusLayerId = result.focusId ? nodeLayerMap.get(result.focusId) : undefined
 
         const shouldMergeNode = (urn: string): boolean =>
           (participantUrns.has(urn) || spineUrns.has(urn)) && !knownAssignedUrns.has(urn)
@@ -184,9 +187,6 @@ export function ContextViewCanvas({
               ...gn.properties,
               childCount: gn.childCount,
               sourceSystem: gn.sourceSystem,
-            }
-            if (unreachableRoots.has(gn.urn) && focusLayerId) {
-              metadata.assignmentHint = focusLayerId
             }
             return {
               id: gn.urn,
@@ -1105,19 +1105,16 @@ export function ContextViewCanvas({
     expanded.downstreamUrns.forEach(u => participantUrns.add(u))
 
     const knownAssignedUrns = new Set<string>(displayMap.keys())
-    const { spineUrns, unreachableRoots } = computeTraceMergeSpine({
+    const { spineUrns } = computeTraceMergeSpine({
       participantUrns,
       containmentEdges: expanded.containmentEdges ?? [],
       knownAssignedUrns,
     })
 
-    // For drilldowns we don't have a single focus, so derive a hint from
-    // expanded.focus.urn (the trace anchor). If unavailable, leave
-    // unreachable participants without a hint — they still fall through
-    // useLayerAssignment's existing chain.
-    const drillAnchor = expanded.focus?.urn
-    const focusLayerId = drillAnchor ? nodeLayerMap.get(drillAnchor) : undefined
-
+    // No assignmentHint stamp on unreachable roots — see the matching
+    // comment block in `onTraceComplete`. Drilldown participants with no
+    // legitimate view assignment (themselves or via an ancestor) drop out
+    // of `nodesByLayer` rather than being parked in the anchor's column.
     const shouldMergeNode = (urn: string): boolean =>
       (participantUrns.has(urn) || spineUrns.has(urn)) && !knownAssignedUrns.has(urn)
     const isResolvableEndpoint = (urn: string): boolean =>
@@ -1130,9 +1127,6 @@ export function ContextViewCanvas({
           ...gn.properties,
           childCount: gn.childCount,
           sourceSystem: gn.sourceSystem,
-        }
-        if (unreachableRoots.has(gn.urn) && focusLayerId) {
-          metadata.assignmentHint = focusLayerId
         }
         return {
           id: gn.urn,
@@ -1200,7 +1194,7 @@ export function ContextViewCanvas({
       })
       return next
     })
-  }, [addNodes, addEdges, parentMap, displayMap, nodeLayerMap, trace])
+  }, [addNodes, addEdges, parentMap, displayMap, trace])
 
   // Entity-type → hierarchy.level lookup for auto-drill. The drill-down
   // RPC takes the *current* level and returns one level finer; we derive
