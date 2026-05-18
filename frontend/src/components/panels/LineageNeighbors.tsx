@@ -66,15 +66,36 @@ export function LineageNeighbors({ nodeId, onFocusNode, onLocateMany }: LineageN
 
   const [expanded, setExpanded] = useState<Direction | null>(null)
 
-  // Reset expansion when the drawer's focal entity changes. Without this,
-  // navigating from one entity to a neighbor leaves the previous entity's
-  // expand state in place — the new entity's "Data Sources" looks already
-  // expanded, so the user's intended-to-expand click reads as a collapse
-  // ("first click does nothing"). Children's filter/search state lives
-  // inside ExpandedDetail which unmounts on collapse, so it resets here too.
+  // Multi-select state lives at the panel level (rather than inside each
+  // direction's ExpandedDetail) for two reasons:
+  //   1. Action bar must be sticky to the DRAWER scroll, but ExpandedDetail
+  //      sits inside `overflow-hidden` wrappers that block sticky from
+  //      anchoring there. Hoisting to LineageNeighbors places the action
+  //      bar at a sibling level with no overflow ancestors in the way.
+  //   2. Selection now persists when toggling between Sources/Consumers,
+  //      matching the "panel-wide selection" desktop pattern.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [locateBusy, setLocateBusy] = useState(false)
+
+  // Reset expansion AND any in-flight selection when the drawer's focal
+  // entity changes. Without this, navigating to a neighbor leaves stale
+  // state in place — e.g., "Data Sources" looks already expanded so the
+  // first click on it reads as a collapse.
   useEffect(() => {
     setExpanded(null)
+    setSelectedIds(new Set())
   }, [nodeId])
+
+  const clearSelected = () => setSelectedIds(new Set())
+  const handleLocateMany = async () => {
+    if (selectedIds.size === 0 || !onLocateMany || locateBusy) return
+    setLocateBusy(true)
+    try {
+      await onLocateMany([...selectedIds])
+    } finally {
+      setLocateBusy(false)
+    }
+  }
 
   const nodeMap = useMemo(() => {
     const m = new Map<string, LineageNode>()
@@ -149,7 +170,9 @@ export function LineageNeighbors({ nodeId, onFocusNode, onLocateMany }: LineageN
           expanded={expanded === 'incoming'}
           onToggle={() => toggle('incoming')}
           onNeighborClick={handleNeighborClick}
-          onLocateMany={onLocateMany}
+          selectionEnabled={!!onLocateMany}
+          selectedIds={selectedIds}
+          setSelectedIds={setSelectedIds}
         />
         <DirectionCard
           direction="outgoing"
@@ -160,9 +183,64 @@ export function LineageNeighbors({ nodeId, onFocusNode, onLocateMany }: LineageN
           expanded={expanded === 'outgoing'}
           onToggle={() => toggle('outgoing')}
           onNeighborClick={handleNeighborClick}
-          onLocateMany={onLocateMany}
+          selectionEnabled={!!onLocateMany}
+          selectedIds={selectedIds}
+          setSelectedIds={setSelectedIds}
         />
       </div>
+
+      {/* Sticky action bar at the panel level (outside the DirectionCards'
+          overflow-hidden wrappers) so it can anchor to the drawer scroll
+          container and stay reachable when the neighbor list runs long
+          (200+ rows). Backdrop blur + a top hairline so it reads as a
+          separate surface when content scrolls behind it. */}
+      <AnimatePresence>
+        {onLocateMany && selectedIds.size > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            transition={{ duration: 0.15 }}
+            className={cn(
+              'sticky bottom-0 z-10 mt-2',
+              '-mx-5 px-5 pt-2 pb-3',
+              'bg-canvas-elevated/85 backdrop-blur-md',
+              'border-t border-glass-border/50',
+            )}
+          >
+            <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-accent-lineage/15 border border-accent-lineage/40 shadow-lg shadow-black/30">
+              <span className="text-[12px] font-medium text-ink">
+                {selectedIds.size} selected
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={clearSelected}
+                  className="px-2.5 py-1 rounded-md text-[11px] font-medium text-ink-muted hover:text-ink hover:bg-white/[0.06] transition-colors duration-150"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLocateMany}
+                  disabled={locateBusy}
+                  className={cn(
+                    'px-3 py-1 rounded-md text-[11px] font-semibold bg-accent-lineage text-white shadow-sm hover:brightness-110 transition-all duration-150 flex items-center gap-1.5',
+                    locateBusy && 'opacity-70 cursor-progress',
+                  )}
+                >
+                  {locateBusy ? (
+                    <LucideIcons.Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <LucideIcons.Crosshair className="w-3 h-3" />
+                  )}
+                  Locate {selectedIds.size} on canvas
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
@@ -180,7 +258,13 @@ interface DirectionCardProps {
   expanded: boolean
   onToggle: () => void
   onNeighborClick: (neighborId: string) => void | Promise<void>
-  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
+  /** Selection-mode props supplied by LineageNeighbors. Enabled means the
+   *  parent has an `onLocateMany` handler and is rendering the action
+   *  bar; the cards therefore show checkboxes and forward selection
+   *  events. */
+  selectionEnabled: boolean
+  selectedIds: Set<string>
+  setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>
 }
 
 function DirectionCard({
@@ -192,7 +276,9 @@ function DirectionCard({
   expanded,
   onToggle,
   onNeighborClick,
-  onLocateMany,
+  selectionEnabled,
+  selectedIds,
+  setSelectedIds,
 }: DirectionCardProps) {
   const isIncoming = direction === 'incoming'
   const ArrowIcon = isIncoming
@@ -303,7 +389,9 @@ function DirectionCard({
                 records={records}
                 direction={direction}
                 onNeighborClick={onNeighborClick}
-                onLocateMany={onLocateMany}
+                selectionEnabled={selectionEnabled}
+                selectedIds={selectedIds}
+                setSelectedIds={setSelectedIds}
               />
             </div>
           </motion.div>
@@ -321,14 +409,22 @@ interface ExpandedDetailProps {
   records: NeighborRecord[]
   direction: Direction
   onNeighborClick: (neighborId: string) => void | Promise<void>
-  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
+  /** Selection lives at LineageNeighbors so the action bar can be sticky
+   *  outside this card's overflow-hidden wrappers. ExpandedDetail still
+   *  owns the visible-order list + range-select anchor (both naturally
+   *  scoped to this direction's filter/sort state). */
+  selectionEnabled: boolean
+  selectedIds: Set<string>
+  setSelectedIds: React.Dispatch<React.SetStateAction<Set<string>>>
 }
 
 function ExpandedDetail({
   records,
   direction,
   onNeighborClick,
-  onLocateMany,
+  selectionEnabled,
+  selectedIds,
+  setSelectedIds,
 }: ExpandedDetailProps) {
   const [activeEntityTypes, setActiveEntityTypes] = useState<Set<string>>(
     new Set(),
@@ -337,10 +433,10 @@ function ExpandedDetail({
   const [search, setSearch] = useState('')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   const [sortMode, setSortMode] = useState<SortMode>('default')
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [locateBusy, setLocateBusy] = useState(false)
-  // Range-select anchor: id of the last single-toggled row. Shift-clicking
-  // another row selects everything between them in visible order.
+  // Range-select anchor: id of the last single-toggled row in THIS
+  // direction's view. Shift-clicking another row selects everything
+  // between them in visible order. Anchor is per-direction because
+  // visible-order changes when you toggle direction or filter.
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null)
 
   const entityTypeFacets = useMemo(() => {
@@ -479,33 +575,13 @@ function ExpandedDetail({
     }
   }
 
-  const clearSelected = () => {
-    setSelectedIds(new Set())
-    setLastSelectedId(null)
-  }
-  // Drop any selected ids that fall out of the visible filtered set so
-  // the action-bar count never misrepresents what "Locate" will act on.
-  useEffect(() => {
-    if (selectedIds.size === 0) return
-    const visible = new Set(filtered.map((r) => r.neighborId))
-    let changed = false
-    const next = new Set<string>()
-    for (const id of selectedIds) {
-      if (visible.has(id)) next.add(id)
-      else changed = true
-    }
-    if (changed) setSelectedIds(next)
-  }, [filtered, selectedIds])
-
-  const handleLocateMany = async () => {
-    if (selectedIds.size === 0 || !onLocateMany || locateBusy) return
-    setLocateBusy(true)
-    try {
-      await onLocateMany([...selectedIds])
-    } finally {
-      setLocateBusy(false)
-    }
-  }
+  // Selection is owned by LineageNeighbors so the action bar can be
+  // sticky outside the DirectionCard's overflow-hidden wrappers. The
+  // selection no longer gets pruned on filter change — that was the
+  // direction-scoped behaviour; panel-wide selection means a row hidden
+  // by THIS card's filter is still meaningfully selected (the user can
+  // see the action-bar count and clear/find via the other direction or
+  // by relaxing filters).
 
   const toggleSet = (
     set: Set<string>,
@@ -556,7 +632,7 @@ function ExpandedDetail({
         {records.length > 1 && (
           <SortMenu value={sortMode} onChange={setSortMode} />
         )}
-        {onLocateMany && flatVisibleIds.length > 0 && (
+        {selectionEnabled && flatVisibleIds.length > 0 && (
           <button
             type="button"
             onClick={toggleAllVisible}
@@ -658,7 +734,7 @@ function ExpandedDetail({
                 toggleSet(collapsedGroups, setCollapsedGroups, type)
               }
               onNeighborClick={onNeighborClick}
-              selectionEnabled={!!onLocateMany}
+              selectionEnabled={selectionEnabled}
               selectionActive={selectedIds.size > 0}
               selectedIds={selectedIds}
               onToggleRow={handleRowSelectClick}
@@ -678,49 +754,6 @@ function ExpandedDetail({
         )}
       </div>
 
-      {/* Multi-select action bar — only renders when at least one row is
-          checked. Slides in from the bottom so it's evident but doesn't
-          steal vertical space when unused. */}
-      <AnimatePresence>
-        {onLocateMany && selectedIds.size > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 8 }}
-            transition={{ duration: 0.15 }}
-            className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-accent-lineage/10 border border-accent-lineage/30"
-          >
-            <span className="text-[12px] font-medium text-ink">
-              {selectedIds.size} selected
-            </span>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={clearSelected}
-                className="px-2.5 py-1 rounded-md text-[11px] font-medium text-ink-muted hover:text-ink hover:bg-white/[0.06] transition-colors duration-150"
-              >
-                Clear
-              </button>
-              <button
-                type="button"
-                onClick={handleLocateMany}
-                disabled={locateBusy}
-                className={cn(
-                  'px-3 py-1 rounded-md text-[11px] font-semibold bg-accent-lineage text-white shadow-sm hover:brightness-110 transition-all duration-150 flex items-center gap-1.5',
-                  locateBusy && 'opacity-70 cursor-progress',
-                )}
-              >
-                {locateBusy ? (
-                  <LucideIcons.Loader2 className="w-3 h-3 animate-spin" />
-                ) : (
-                  <LucideIcons.Crosshair className="w-3 h-3" />
-                )}
-                Locate {selectedIds.size} on canvas
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
   )
 }

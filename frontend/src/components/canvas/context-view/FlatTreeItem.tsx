@@ -90,9 +90,10 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
     return s.changes.some(c => descendantIds.has(c.targetId) || (c.targetUrn ? descendantIds.has(c.targetUrn) : false))
   })
 
-  // Pulse-on-arrival from a jump-to-node reveal. Auto-clears via the
-  // store's setTimeout (~700ms).
-  const isPulsing = useCanvasStore((s) => s.pulseNodeId === node.id)
+  // Pulse-on-arrival from a jump-to-node reveal. Backed by a Set so
+  // multi-locate flows can pulse many nodes concurrently. Auto-clears
+  // per-id via the store's setTimeout (~900ms).
+  const isPulsing = useCanvasStore((s) => s.pulseNodeIds.has(node.id))
 
   const stagedColor = directChange ? stagedChangeColor(directChange.type) : (hasDescendantChange ? 'cascade' : null)
   const stagedSummary = directChange?.summary

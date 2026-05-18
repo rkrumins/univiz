@@ -52,9 +52,10 @@ export const GenericNode = memo(function GenericNode({
   dragging,
   isConnectable,
 }: GenericNodeProps) {
-  // Pulse-on-arrival ring. Set by the canvas store after a jump-to-node
-  // reveal completes. Auto-clears after the animation (~700ms).
-  const isPulsing = useCanvasStore((s) => s.pulseNodeId === id)
+  // Pulse-on-arrival ring. Driven by the canvas store's Set so multiple
+  // simultaneous reveals (multi-locate) can all pulse at once. Auto-clears
+  // per-id after the animation duration (~900ms).
+  const isPulsing = useCanvasStore((s) => s.pulseNodeIds.has(id))
   // Handle both nested (data.data) and flat (data) structures
   const rawData = (data as Record<string, unknown>)
   const entityData: GenericNodeData = rawData.data

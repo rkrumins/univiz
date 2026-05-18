@@ -48,7 +48,7 @@ beforeEach(() => {
     nodes: [],
     edges: [],
     visibleEdges: [],
-    pulseNodeId: null,
+    pulseNodeIds: new Set(),
   })
 })
 
@@ -371,7 +371,7 @@ describe('useRevealNode — pulse on arrival', () => {
     })
 
     expect(focus).toHaveBeenCalled()
-    expect(useCanvasStore.getState().pulseNodeId).toBe(TARGET)
+    expect(useCanvasStore.getState().pulseNodeIds.has(TARGET)).toBe(true)
   })
 
   it('skipFocus: true suppresses focus() but still pulses', async () => {
@@ -397,6 +397,6 @@ describe('useRevealNode — pulse on arrival', () => {
     })
 
     expect(focus).not.toHaveBeenCalled()
-    expect(useCanvasStore.getState().pulseNodeId).toBe(TARGET)
+    expect(useCanvasStore.getState().pulseNodeIds.has(TARGET)).toBe(true)
   })
 })
