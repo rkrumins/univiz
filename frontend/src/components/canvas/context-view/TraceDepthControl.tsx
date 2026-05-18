@@ -102,7 +102,7 @@ export function TraceDepthControl({
         onClick={() => setOpen(o => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title={`Trace depth — ${upstreamDepth} upstream, ${downstreamDepth} downstream`}
+        title={`Trace depth setting — ${upstreamDepth} upstream hops, ${downstreamDepth} downstream hops. Click to adjust.`}
         className={cn(
           'flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300',
           open
@@ -110,16 +110,20 @@ export function TraceDepthControl({
             : 'bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]',
         )}
       >
-        <Workflow className="w-3.5 h-3.5" />
+        <Workflow className="w-3.5 h-3.5 text-accent-lineage/80" />
+        {/* Explicit "Depth" label — without it the chip reads as "↑25 ↓25"
+            which the user mistakes for upstream/downstream edge counts. The
+            label anchors the values as a configuration, not as data. */}
+        <span className="text-ink/85 font-medium">Depth</span>
+        <span className="w-px h-3 bg-black/15 dark:bg-white/10" aria-hidden />
         <span className="flex items-center gap-1 tabular-nums">
           <ArrowUp className="w-3 h-3 text-blue-500 dark:text-blue-400" strokeWidth={2.4} />
           <span className="text-blue-600 dark:text-blue-400 font-semibold">{upstreamDepth}</span>
-          <span className="opacity-30 mx-0.5">·</span>
-          <ArrowDown className="w-3 h-3 text-green-500 dark:text-green-400" strokeWidth={2.4} />
+          <ArrowDown className="w-3 h-3 text-green-500 dark:text-green-400 ml-1.5" strokeWidth={2.4} />
           <span className="text-green-600 dark:text-green-400 font-semibold">{downstreamDepth}</span>
         </span>
         <ChevronDown
-          className={cn('w-3 h-3 transition-transform duration-200', open && 'rotate-180')}
+          className={cn('w-3 h-3 transition-transform duration-200 text-ink-muted/60', open && 'rotate-180')}
         />
       </button>
 
