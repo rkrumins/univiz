@@ -1,23 +1,22 @@
 /**
- * TraceDepthControl — compact header affordance for the trace depth.
+ * TraceDepthControl — header affordance for the active trace's depth.
  *
- * Always renders the current upstream/downstream depths so users see
- * the active scope at a glance. The popover exposes per-direction
- * steppers (0–50) plus a "10/10" preset button. When a trace is
- * already active, edits fire `onChange` which the parent wires to
- * `trace.setConfig` + `retrace()` so the canvas reflects the new
- * depth without a manual re-trace.
+ * Mounted next to the Trace button and rendered ONLY when a trace is
+ * active. The trigger shows the current upstream/downstream hop counts
+ * with EntityDrawer-aligned colors (blue = upstream / Root Cause, green =
+ * downstream / Impact). The popover exposes a slider + stepper per
+ * direction plus preset shortcuts. Edits propagate via `onChange`; the
+ * parent wires this to `trace.setConfig` + `retrace()` so the canvas
+ * reflects the change without a manual re-trace.
  *
- * Depth values:
- *   - 0     = direction disabled (server-side filter; matches the
- *             dock direction-arrow contract)
- *   - 1..50 = literal hop count passed to /trace/v2
+ * Depth values: 0 disables the side (matches the dock direction-arrow
+ * contract), 1..MAX_DEPTH is the literal hop count passed to /trace/v2.
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ArrowUp, ArrowDown, ChevronDown, Minus, Plus, Layers } from 'lucide-react'
+import { ArrowUp, ArrowDown, ChevronDown, Minus, Plus, Workflow } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 export interface TraceDepthControlProps {
@@ -26,11 +25,23 @@ export interface TraceDepthControlProps {
   onChange: (dir: 'upstream' | 'downstream', value: number) => void
 }
 
-const POPOVER_WIDTH = 280
-const MAX_DEPTH = 50
+const POPOVER_WIDTH = 360
+const MAX_DEPTH = 100
 const MIN_DEPTH = 0
 
-function clamp(v: number): number {
+interface DepthPreset {
+  label: string
+  upstream: number
+  downstream: number
+}
+
+const DEPTH_PRESETS: DepthPreset[] = [
+  { label: 'Default', upstream: 25, downstream: 25 },
+  { label: 'Deep', upstream: 50, downstream: 50 },
+  { label: 'Max', upstream: 100, downstream: 100 },
+]
+
+function clampDepth(v: number): number {
   if (Number.isNaN(v)) return 0
   return Math.max(MIN_DEPTH, Math.min(MAX_DEPTH, Math.round(v)))
 }
@@ -83,8 +94,6 @@ export function TraceDepthControl({
     }
   }, [open])
 
-  const summary = `${upstreamDepth}/${downstreamDepth}`
-
   return (
     <>
       <button
@@ -95,24 +104,23 @@ export function TraceDepthControl({
         aria-expanded={open}
         title={`Trace depth — ${upstreamDepth} upstream, ${downstreamDepth} downstream`}
         className={cn(
-          'flex items-center gap-1.5 px-2.5 py-2 rounded-xl text-xs font-medium transition-all duration-300',
+          'flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300',
           open
-            ? 'bg-accent-lineage/15 border border-accent-lineage/35 text-accent-lineage shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/30'
+            ? 'bg-accent-lineage/15 border border-accent-lineage/35 text-ink shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/30'
             : 'bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]',
         )}
       >
-        <Layers className="w-3.5 h-3.5" />
-        <span className="flex items-center gap-0.5 tabular-nums">
-          <ArrowUp className="w-3 h-3 opacity-70" strokeWidth={2.4} />
-          <span>{upstreamDepth}</span>
-          <span className="opacity-40 mx-0.5">·</span>
-          <ArrowDown className="w-3 h-3 opacity-70" strokeWidth={2.4} />
-          <span>{downstreamDepth}</span>
+        <Workflow className="w-3.5 h-3.5" />
+        <span className="flex items-center gap-1 tabular-nums">
+          <ArrowUp className="w-3 h-3 text-blue-500 dark:text-blue-400" strokeWidth={2.4} />
+          <span className="text-blue-600 dark:text-blue-400 font-semibold">{upstreamDepth}</span>
+          <span className="opacity-30 mx-0.5">·</span>
+          <ArrowDown className="w-3 h-3 text-green-500 dark:text-green-400" strokeWidth={2.4} />
+          <span className="text-green-600 dark:text-green-400 font-semibold">{downstreamDepth}</span>
         </span>
         <ChevronDown
           className={cn('w-3 h-3 transition-transform duration-200', open && 'rotate-180')}
         />
-        <span className="sr-only">Current depth {summary}</span>
       </button>
 
       {typeof document !== 'undefined' && createPortal(
@@ -135,24 +143,29 @@ export function TraceDepthControl({
               }}
               className="rounded-xl bg-canvas-elevated/95 backdrop-blur-xl border border-black/[0.10] dark:border-white/[0.08] shadow-2xl shadow-black/20 dark:shadow-black/40 overflow-hidden"
             >
-              <div className="px-3 pt-3 pb-2">
-                <div className="flex items-center gap-1.5 px-1 text-[10px] font-semibold tracking-[0.1em] uppercase text-ink-muted/80">
-                  <Layers className="w-3 h-3" />
-                  <span>Trace Depth</span>
+              <div className="px-3 pt-3 pb-1 flex items-center gap-2 border-b border-black/[0.06] dark:border-white/[0.04]">
+                <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-accent-lineage/25 to-purple-500/15 flex items-center justify-center">
+                  <Workflow className="w-3.5 h-3.5 text-accent-lineage" strokeWidth={2.2} />
                 </div>
-                <p className="px-1 pt-1.5 pb-2 text-[11px] text-ink-muted/80 leading-snug">
-                  Hop count for upstream and downstream traversal. Set to 0 to disable that side.
+                <div className="text-[12px] font-semibold text-ink tracking-tight">Trace Depth</div>
+              </div>
+
+              <div className="px-3 pt-2.5 pb-2">
+                <p className="px-1 pb-2 text-[11px] text-ink-muted/80 leading-snug">
+                  Hop count per direction. Set a side to 0 to disable it; the dock arrows mirror this.
                 </p>
 
                 <DepthRow
                   label="Upstream"
-                  icon={<ArrowUp className="w-3.5 h-3.5" strokeWidth={2.4} />}
+                  sublabel="Root Cause"
+                  variant="upstream"
                   value={upstreamDepth}
                   onChange={v => onChange('upstream', v)}
                 />
                 <DepthRow
                   label="Downstream"
-                  icon={<ArrowDown className="w-3.5 h-3.5" strokeWidth={2.4} />}
+                  sublabel="Impact"
+                  variant="downstream"
                   value={downstreamDepth}
                   onChange={v => onChange('downstream', v)}
                 />
@@ -160,27 +173,32 @@ export function TraceDepthControl({
 
               <div className="h-px bg-black/[0.08] dark:bg-white/[0.06] mx-3" />
 
-              <div className="px-3 py-2.5 flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    onChange('upstream', 10)
-                    onChange('downstream', 10)
-                  }}
-                  className="flex-1 px-2 py-1.5 rounded-lg text-[11px] font-medium bg-accent-lineage/10 hover:bg-accent-lineage/20 text-accent-lineage border border-accent-lineage/25 transition-colors"
-                >
-                  Default 10 / 10
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onChange('upstream', 25)
-                    onChange('downstream', 25)
-                  }}
-                  className="flex-1 px-2 py-1.5 rounded-lg text-[11px] font-medium bg-black/[0.04] hover:bg-black/[0.08] text-ink-muted hover:text-ink border border-black/[0.08] dark:bg-white/[0.04] dark:border-white/[0.06] dark:hover:bg-white/[0.08] transition-colors"
-                >
-                  Deep 25 / 25
-                </button>
+              <div className="px-3 py-2.5 flex items-center gap-1.5">
+                {DEPTH_PRESETS.map(preset => {
+                  const active = upstreamDepth === preset.upstream && downstreamDepth === preset.downstream
+                  return (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => {
+                        onChange('upstream', preset.upstream)
+                        onChange('downstream', preset.downstream)
+                      }}
+                      className={cn(
+                        'flex-1 px-2 py-1.5 rounded-lg text-[11px] font-medium border transition-colors',
+                        active
+                          ? 'bg-accent-lineage/15 text-accent-lineage border-accent-lineage/40 shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/35'
+                          : 'bg-black/[0.04] text-ink-muted hover:text-ink hover:bg-black/[0.08] border-black/[0.10] dark:bg-white/[0.04] dark:border-white/[0.06] dark:hover:bg-white/[0.08]',
+                      )}
+                    >
+                      <span className="block leading-none">{preset.label}</span>
+                      <span className="block text-[10px] font-normal opacity-70 mt-0.5 tabular-nums">
+                        {preset.upstream}/{preset.downstream}
+                      </span>
+                    </button>
+                  )
+                })}
               </div>
             </motion.div>
           )}
@@ -191,51 +209,114 @@ export function TraceDepthControl({
   )
 }
 
+type Variant = 'upstream' | 'downstream'
+
+const VARIANT_CLASSES: Record<Variant, {
+  icon: string
+  text: string
+  sub: string
+  sliderTrack: string
+  sliderThumb: string
+  sliderFocus: string
+}> = {
+  upstream: {
+    icon: 'text-blue-500 dark:text-blue-400',
+    text: 'text-blue-600 dark:text-blue-400',
+    sub: 'text-blue-500/60 dark:text-blue-400/60',
+    sliderTrack: 'bg-blue-500/15 dark:bg-blue-400/15',
+    sliderThumb: '[&::-webkit-slider-thumb]:bg-blue-500 [&::-moz-range-thumb]:bg-blue-500',
+    sliderFocus: 'focus:bg-blue-500/10',
+  },
+  downstream: {
+    icon: 'text-green-500 dark:text-green-400',
+    text: 'text-green-600 dark:text-green-400',
+    sub: 'text-green-500/60 dark:text-green-400/60',
+    sliderTrack: 'bg-green-500/15 dark:bg-green-400/15',
+    sliderThumb: '[&::-webkit-slider-thumb]:bg-green-500 [&::-moz-range-thumb]:bg-green-500',
+    sliderFocus: 'focus:bg-green-500/10',
+  },
+}
+
+/**
+ * One row of the Trace Depth control — paired slider and stepper for a
+ * single direction. The slider drives coarse scrubbing; the number
+ * input + minus/plus buttons handle precise edits and keyboard input.
+ * All three controls share `onChange` so they stay in sync. Direction
+ * is color-coded to match EntityDrawer's Root Cause (blue) / Impact
+ * (green) treatment.
+ */
 function DepthRow({
   label,
-  icon,
+  sublabel,
+  variant,
   value,
   onChange,
 }: {
   label: string
-  icon: React.ReactNode
+  sublabel: string
+  variant: Variant
   value: number
   onChange: (v: number) => void
 }) {
+  const c = VARIANT_CLASSES[variant]
+  const Icon = variant === 'upstream' ? ArrowUp : ArrowDown
   return (
-    <div className="flex items-center gap-2 px-1 py-1.5">
-      <div className="flex items-center gap-1.5 flex-1 text-[12px] font-medium text-ink">
-        <span className="text-ink-muted">{icon}</span>
-        <span>{label}</span>
-      </div>
-      <div className="flex items-stretch rounded-lg overflow-hidden border border-black/[0.10] dark:border-white/[0.08] bg-black/[0.03] dark:bg-white/[0.03]">
-        <button
-          type="button"
-          onClick={() => onChange(clamp(value - 1))}
-          disabled={value <= MIN_DEPTH}
-          aria-label={`Decrease ${label.toLowerCase()} depth`}
-          className="px-1.5 py-1 text-ink-muted hover:text-ink hover:bg-black/[0.06] dark:hover:bg-white/[0.06] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-        >
-          <Minus className="w-3 h-3" strokeWidth={2.4} />
-        </button>
+    <div className="px-1 py-1.5">
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 w-[110px] flex-shrink-0">
+          <Icon className={cn('w-3.5 h-3.5', c.icon)} strokeWidth={2.4} />
+          <div className="flex flex-col leading-tight">
+            <span className={cn('text-[12px] font-medium', c.text)}>{label}</span>
+            <span className={cn('text-[10px]', c.sub)}>{sublabel}</span>
+          </div>
+        </div>
         <input
-          type="number"
+          type="range"
           min={MIN_DEPTH}
           max={MAX_DEPTH}
           value={value}
-          onChange={e => onChange(clamp(Number(e.target.value)))}
-          aria-label={`${label} depth`}
-          className="w-10 text-center text-[12px] font-semibold tabular-nums bg-transparent text-ink focus:outline-none focus:bg-accent-lineage/10 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+          onChange={e => onChange(clampDepth(Number(e.target.value)))}
+          aria-label={`${label} depth slider`}
+          className={cn(
+            'flex-1 h-1.5 rounded-full appearance-none cursor-pointer',
+            c.sliderTrack,
+            '[&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-canvas-elevated [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-grab [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:active:scale-110',
+            '[&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-canvas-elevated [&::-moz-range-thumb]:cursor-grab',
+            c.sliderThumb,
+          )}
         />
-        <button
-          type="button"
-          onClick={() => onChange(clamp(value + 1))}
-          disabled={value >= MAX_DEPTH}
-          aria-label={`Increase ${label.toLowerCase()} depth`}
-          className="px-1.5 py-1 text-ink-muted hover:text-ink hover:bg-black/[0.06] dark:hover:bg-white/[0.06] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-        >
-          <Plus className="w-3 h-3" strokeWidth={2.4} />
-        </button>
+        <div className="flex items-stretch rounded-lg overflow-hidden border border-black/[0.10] dark:border-white/[0.08] bg-black/[0.03] dark:bg-white/[0.03] flex-shrink-0">
+          <button
+            type="button"
+            onClick={() => onChange(clampDepth(value - 1))}
+            disabled={value <= MIN_DEPTH}
+            aria-label={`Decrease ${label.toLowerCase()} depth`}
+            className="px-1.5 py-1 text-ink-muted hover:text-ink hover:bg-black/[0.06] dark:hover:bg-white/[0.06] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            <Minus className="w-3 h-3" strokeWidth={2.4} />
+          </button>
+          <input
+            type="number"
+            min={MIN_DEPTH}
+            max={MAX_DEPTH}
+            value={value}
+            onChange={e => onChange(clampDepth(Number(e.target.value)))}
+            aria-label={`${label} depth`}
+            className={cn(
+              'w-10 text-center text-[12px] font-semibold tabular-nums bg-transparent text-ink focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none',
+              c.sliderFocus,
+            )}
+          />
+          <button
+            type="button"
+            onClick={() => onChange(clampDepth(value + 1))}
+            disabled={value >= MAX_DEPTH}
+            aria-label={`Increase ${label.toLowerCase()} depth`}
+            className="px-1.5 py-1 text-ink-muted hover:text-ink hover:bg-black/[0.06] dark:hover:bg-white/[0.06] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            <Plus className="w-3 h-3" strokeWidth={2.4} />
+          </button>
+        </div>
       </div>
     </div>
   )

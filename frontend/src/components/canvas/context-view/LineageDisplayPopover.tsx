@@ -1,16 +1,28 @@
 /**
- * LineageDisplayPopover — consolidates edge-rendering preferences (density +
- * direction arrows) behind a single trigger in the Context View toolbar.
+ * LineageDisplayPopover — Lineage Settings popover for the Context View
+ * toolbar. Houses two grouped sections:
  *
- * Replaces the top-level Stubs/Auto/Raw segmented control and Direction
- * button. Settings are most useful as a grouped, well-described surface
- * rather than competing chips alongside primary actions.
+ *   1. Edge Density — Stubs / Auto / Raw rendering mode
+ *   2. Direction   — arrow-marker toggle
+ *
+ * Visual identity mirrors `TraceDepthControl` so the two header chips
+ * read as siblings: gradient-icon title bar, uppercase section labels
+ * with icons, active states keyed off `accent-lineage`. The trigger
+ * summarises the active configuration so the user doesn't need to open
+ * the popover to read it.
  */
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import * as LucideIcons from 'lucide-react'
+import {
+  ChevronDown,
+  Eye,
+  Layers,
+  MoveRight,
+  Settings2,
+  Sliders,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { LineageRenderMode } from '@/store/preferences'
 
@@ -55,7 +67,7 @@ const MODE_SHORT_LABEL: Record<LineageRenderMode, string> = {
   raw: 'Raw',
 }
 
-const POPOVER_WIDTH = 300
+const POPOVER_WIDTH = 320
 
 export function LineageDisplayPopover({
   lineageRenderMode,
@@ -116,23 +128,28 @@ export function LineageDisplayPopover({
         onClick={() => setOpen(o => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title="Edge density and direction arrows"
+        title="Lineage settings — edge density and direction arrows"
         className={cn(
-          'flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300',
+          'flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300',
           open
-            ? 'bg-accent-lineage/15 border border-accent-lineage/35 text-accent-lineage shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/30'
-            : 'bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]'
+            ? 'bg-accent-lineage/15 border border-accent-lineage/35 text-ink shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/30'
+            : 'bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]',
         )}
       >
-        <LucideIcons.Sliders className="w-3.5 h-3.5" />
-        <span className="tabular-nums">{MODE_SHORT_LABEL[lineageRenderMode]}</span>
-        {showEdgeDirection && (
-          <span className="flex items-center gap-1.5 text-cyan-700 dark:text-cyan-300">
-            <span className="w-px h-3 bg-cyan-500/30 dark:bg-cyan-400/30" />
-            <LucideIcons.MoveRight className="w-3.5 h-3.5" strokeWidth={2.2} />
-          </span>
-        )}
-        <LucideIcons.ChevronDown
+        <Sliders className="w-3.5 h-3.5" />
+        <span className="flex items-center gap-1 tabular-nums">
+          <Eye className="w-3 h-3 text-accent-lineage/80 dark:text-accent-lineage" strokeWidth={2.4} />
+          <span className="text-accent-lineage font-semibold">{MODE_SHORT_LABEL[lineageRenderMode]}</span>
+          <span className="opacity-30 mx-0.5">·</span>
+          <MoveRight
+            className={cn(
+              'w-3 h-3',
+              showEdgeDirection ? 'text-cyan-500 dark:text-cyan-400' : 'text-ink-muted/40 dark:text-white/25',
+            )}
+            strokeWidth={2.4}
+          />
+        </span>
+        <ChevronDown
           className={cn('w-3 h-3 transition-transform duration-200', open && 'rotate-180')}
         />
       </button>
@@ -150,7 +167,7 @@ export function LineageDisplayPopover({
               exit={{ opacity: 0, y: -6, scale: 0.97 }}
               transition={{ duration: 0.15, ease: 'easeOut' }}
               role="dialog"
-              aria-label="Lineage display settings"
+              aria-label="Lineage settings"
               style={{
                 position: 'fixed',
                 top: anchor.top,
@@ -160,110 +177,134 @@ export function LineageDisplayPopover({
               }}
               className="rounded-xl bg-canvas-elevated/95 backdrop-blur-xl border border-black/[0.10] dark:border-white/[0.08] shadow-2xl shadow-black/20 dark:shadow-black/40 overflow-hidden"
             >
-            {/* Edge Density */}
-            <div className="px-3 pt-3 pb-2">
-              <div className="flex items-center gap-1.5 px-1 text-[10px] font-semibold tracking-[0.1em] uppercase text-ink-muted/80">
-                <LucideIcons.Layers className="w-3 h-3" />
-                <span>Edge Density</span>
+              {/* Title bar — mirrors TraceDepthControl's header so the two
+                  popovers read as a matched pair. */}
+              <div className="px-3 pt-3 pb-1 flex items-center gap-2 border-b border-black/[0.06] dark:border-white/[0.04]">
+                <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-accent-lineage/25 to-purple-500/15 flex items-center justify-center">
+                  <Settings2 className="w-3.5 h-3.5 text-accent-lineage" strokeWidth={2.2} />
+                </div>
+                <div className="text-[12px] font-semibold text-ink tracking-tight">Lineage Settings</div>
               </div>
-              <div
-                role="radiogroup"
-                aria-label="Edge density"
-                className="mt-2 flex flex-col gap-0.5"
-              >
-                {DENSITY_OPTIONS.map(opt => {
-                  const active = lineageRenderMode === opt.mode
-                  return (
-                    <button
-                      key={opt.mode}
-                      type="button"
-                      role="radio"
-                      aria-checked={active}
-                      onClick={() => onSetLineageRenderMode(opt.mode)}
-                      className={cn(
-                        'flex items-start gap-2.5 px-2.5 py-2 rounded-lg text-left transition-colors',
-                        active
-                          ? 'bg-accent-lineage/12 dark:bg-accent-lineage/15'
-                          : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'
-                      )}
-                    >
-                      <div
+
+              {/* Edge Density */}
+              <div className="px-3 pt-2.5 pb-2">
+                <div className="flex items-center gap-1.5 px-1 text-[10px] font-semibold tracking-[0.1em] uppercase text-ink-muted/80">
+                  <Layers className="w-3 h-3" />
+                  <span>Edge Density</span>
+                </div>
+                <p className="px-1 pt-1 pb-2 text-[11px] text-ink-muted/80 leading-snug">
+                  How many edges materialise on the canvas at once.
+                </p>
+                <div
+                  role="radiogroup"
+                  aria-label="Edge density"
+                  className="flex flex-col gap-1"
+                >
+                  {DENSITY_OPTIONS.map(opt => {
+                    const active = lineageRenderMode === opt.mode
+                    return (
+                      <button
+                        key={opt.mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => onSetLineageRenderMode(opt.mode)}
                         className={cn(
-                          'mt-0.5 w-3.5 h-3.5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-colors',
-                          active ? 'border-accent-lineage' : 'border-ink-muted/40'
+                          'flex items-start gap-2.5 px-2.5 py-2 rounded-lg border text-left transition-colors',
+                          active
+                            ? 'bg-accent-lineage/15 border-accent-lineage/40 shadow-sm shadow-accent-lineage/10 dark:bg-accent-lineage/20 dark:border-accent-lineage/35'
+                            : 'bg-black/[0.02] border-transparent hover:bg-black/[0.05] hover:border-black/[0.08] dark:bg-white/[0.02] dark:hover:bg-white/[0.05] dark:hover:border-white/[0.06]',
                         )}
                       >
-                        {active && (
-                          <div className="w-1.5 h-1.5 rounded-full bg-accent-lineage" />
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1">
                         <div
                           className={cn(
-                            'text-[12px] font-medium leading-tight flex items-baseline gap-1.5',
-                            active ? 'text-accent-lineage' : 'text-ink'
+                            'mt-0.5 w-3.5 h-3.5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-colors',
+                            active ? 'border-accent-lineage' : 'border-ink-muted/40',
                           )}
                         >
-                          <span>{opt.label}</span>
-                          <span className="text-[10px] text-ink-muted/60 font-normal">
-                            ({opt.technical})
-                          </span>
+                          {active && (
+                            <div className="w-1.5 h-1.5 rounded-full bg-accent-lineage" />
+                          )}
                         </div>
-                        <div className="text-[11px] text-ink-muted/80 leading-snug mt-0.5">
-                          {opt.description}
+                        <div className="min-w-0 flex-1">
+                          <div
+                            className={cn(
+                              'text-[12px] font-medium leading-tight flex items-baseline gap-1.5',
+                              active ? 'text-accent-lineage' : 'text-ink',
+                            )}
+                          >
+                            <span>{opt.label}</span>
+                            <span className="text-[10px] text-ink-muted/60 font-normal">
+                              ({opt.technical})
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-ink-muted/80 leading-snug mt-0.5">
+                            {opt.description}
+                          </div>
                         </div>
-                      </div>
-                    </button>
-                  )
-                })}
+                      </button>
+                    )
+                  })}
+                </div>
               </div>
-            </div>
 
-            <div className="h-px bg-black/[0.08] dark:bg-white/[0.06] mx-3" />
+              <div className="h-px bg-black/[0.08] dark:bg-white/[0.06] mx-3" />
 
-            {/* Direction toggle */}
-            <div className="px-3 py-3">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={showEdgeDirection}
-                onClick={onToggleEdgeDirection}
-                className="w-full flex items-center gap-3 px-1.5 py-1 rounded-lg hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors text-left"
-              >
-                <div
+              {/* Direction */}
+              <div className="px-3 pt-2.5 pb-3">
+                <div className="flex items-center gap-1.5 px-1 text-[10px] font-semibold tracking-[0.1em] uppercase text-ink-muted/80">
+                  <MoveRight className="w-3 h-3" />
+                  <span>Direction</span>
+                </div>
+                <p className="px-1 pt-1 pb-2 text-[11px] text-ink-muted/80 leading-snug">
+                  Show arrow markers on edges to indicate flow direction.
+                </p>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={showEdgeDirection}
+                  onClick={onToggleEdgeDirection}
                   className={cn(
-                    'flex-shrink-0 w-[30px] h-[18px] rounded-full relative transition-colors duration-200',
+                    'w-full flex items-center gap-3 px-2.5 py-2 rounded-lg border text-left transition-colors',
                     showEdgeDirection
-                      ? 'bg-cyan-500/85 dark:bg-cyan-400/80'
-                      : 'bg-ink-muted/25 dark:bg-white/15'
+                      ? 'bg-cyan-500/12 border-cyan-500/35 shadow-sm shadow-cyan-500/10 dark:bg-cyan-400/15 dark:border-cyan-400/30'
+                      : 'bg-black/[0.02] border-transparent hover:bg-black/[0.05] hover:border-black/[0.08] dark:bg-white/[0.02] dark:hover:bg-white/[0.05] dark:hover:border-white/[0.06]',
                   )}
                 >
                   <div
                     className={cn(
-                      'absolute top-[2px] w-3.5 h-3.5 rounded-full bg-white shadow-sm transition-all duration-200',
-                      showEdgeDirection ? 'left-[13px]' : 'left-[2px]'
-                    )}
-                  />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div
-                    className={cn(
-                      'text-[12px] font-medium leading-tight flex items-center gap-1.5',
-                      showEdgeDirection ? 'text-cyan-700 dark:text-cyan-300' : 'text-ink'
+                      'flex-shrink-0 w-[32px] h-[18px] rounded-full relative transition-colors duration-200',
+                      showEdgeDirection
+                        ? 'bg-cyan-500/85 dark:bg-cyan-400/80'
+                        : 'bg-ink-muted/25 dark:bg-white/15',
                     )}
                   >
-                    <LucideIcons.MoveRight className="w-3.5 h-3.5" strokeWidth={2.2} />
-                    <span>Direction</span>
+                    <div
+                      className={cn(
+                        'absolute top-[2px] w-3.5 h-3.5 rounded-full bg-white shadow-sm transition-all duration-200',
+                        showEdgeDirection ? 'left-[15px]' : 'left-[2px]',
+                      )}
+                    />
                   </div>
-                  <div className="text-[11px] text-ink-muted/80 leading-snug mt-0.5">
-                    Show arrow markers on edges
+                  <div className="min-w-0 flex-1">
+                    <div
+                      className={cn(
+                        'text-[12px] font-medium leading-tight flex items-center gap-1.5',
+                        showEdgeDirection ? 'text-cyan-700 dark:text-cyan-300' : 'text-ink',
+                      )}
+                    >
+                      <MoveRight className="w-3.5 h-3.5" strokeWidth={2.2} />
+                      <span>Arrow markers</span>
+                    </div>
+                    <div className="text-[11px] text-ink-muted/80 leading-snug mt-0.5">
+                      {showEdgeDirection ? 'Currently visible' : 'Currently hidden'}
+                    </div>
                   </div>
-                </div>
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>,
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>,
         document.body,
       )}
     </>

@@ -186,16 +186,6 @@ export function ContextViewHeader({
             )} />
           </button>
 
-          {/* Trace depth — current upstream/downstream hop counts, with
-              steppers to adjust. Always visible alongside Lineage so the
-              active scope is legible at a glance. Re-runs the trace on
-              edit when one is active (handled by the parent). */}
-          <TraceDepthControl
-            upstreamDepth={traceUpstreamDepth}
-            downstreamDepth={traceDownstreamDepth}
-            onChange={onSetTraceDepth}
-          />
-
           {/* Display popover — consolidates Edge Density (Stubs/Auto/Raw)
               and Direction arrows behind a single trigger. Hidden when
               Lineage is off: with no mesh rendering, these settings have
@@ -237,6 +227,18 @@ export function ContextViewHeader({
               <LucideIcons.Workflow className="w-4 h-4" strokeWidth={2.2} />
               <span>Trace Lineage</span>
             </button>
+          )}
+
+          {/* Trace Depth — visible only during an active trace. Sits right
+              next to the Trace toggle so the active scope (↑N upstream,
+              ↓N downstream) is one glance away. Blue / green colors
+              mirror EntityDrawer's Root Cause / Impact treatment. */}
+          {traceActive && (
+            <TraceDepthControl
+              upstreamDepth={traceUpstreamDepth}
+              downstreamDepth={traceDownstreamDepth}
+              onChange={onSetTraceDepth}
+            />
           )}
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
