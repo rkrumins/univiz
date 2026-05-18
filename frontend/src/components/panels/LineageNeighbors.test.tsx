@@ -16,7 +16,7 @@
  */
 
 import React from 'react'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -447,3 +447,85 @@ describe('LineageNeighbors — neighbor click', () => {
     )
   })
 })
+
+describe('LineageNeighbors — multi-select', () => {
+  it('hides row checkboxes by default when nothing is selected (hover-reveal)', async () => {
+    const user = userEvent.setup()
+    seedCanvas([makeEdge('e1', UPSTREAM_A, FOCAL, 'FLOWS_TO')])
+    render(<LineageNeighbors nodeId={FOCAL} onLocateMany={vi.fn()} />)
+    await user.click(screen.getByText('Data Sources'))
+
+    // Checkbox is rendered (so it can fade in on hover) but starts at
+    // opacity-0 — the hover-reveal contract.
+    const checkbox = screen.getByRole('button', { name: /select neighbor/i })
+    expect(checkbox).toHaveClass('opacity-0')
+    expect(checkbox).toHaveClass('group-hover:opacity-100')
+  })
+
+  it('Select all toggles every visible neighbor, then deselects on a second click', async () => {
+    const user = userEvent.setup()
+    seedCanvas([
+      makeEdge('e1', UPSTREAM_A, FOCAL, 'FLOWS_TO'),
+      makeEdge('e2', UPSTREAM_B, FOCAL, 'FLOWS_TO'),
+    ])
+    render(<LineageNeighbors nodeId={FOCAL} onLocateMany={vi.fn()} />)
+    await user.click(screen.getByText('Data Sources'))
+
+    // Target the panel-wide select-all button via its specific aria-label
+    // ("…visible neighbors") so we don't collide with per-group checkboxes
+    // whose accessible name is "Select all <Type>".
+    const selectAllBtn = screen.getByRole('button', {
+      name: /select all .* visible neighbors/i,
+    })
+    await user.click(selectAllBtn)
+
+    // Action bar appears with the count.
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+
+    // Button flipped to "Deselect all visible neighbors".
+    const deselectAllBtn = screen.getByRole('button', {
+      name: /deselect all visible neighbors/i,
+    })
+    await user.click(deselectAllBtn)
+    expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
+  })
+
+  it('shift-click on a second row selects the range between them', async () => {
+    const user = userEvent.setup()
+    // Three neighbors in the same group (all "table") so they sit
+    // contiguously in visible order.
+    seedCanvas([
+      makeEdge('e1', 'urn:demo:table:a', FOCAL, 'FLOWS_TO'),
+      makeEdge('e2', 'urn:demo:table:b', FOCAL, 'FLOWS_TO'),
+      makeEdge('e3', 'urn:demo:table:c', FOCAL, 'FLOWS_TO'),
+    ], {
+      nodes: [
+        ...baseNodes,
+        makeNode('urn:demo:table:a', 'table', 'Table A'),
+        makeNode('urn:demo:table:b', 'table', 'Table B'),
+        makeNode('urn:demo:table:c', 'table', 'Table C'),
+      ],
+    })
+    render(<LineageNeighbors nodeId={FOCAL} onLocateMany={vi.fn()} />)
+    await user.click(screen.getByText('Data Sources'))
+
+    // Click first checkbox normally.
+    const firstClick = screen.getAllByRole('button', { name: /select neighbor/i })
+    expect(firstClick).toHaveLength(3)
+    await user.click(firstClick[0])
+
+    // Re-query after the click (the action bar mounts + React may
+    // re-render row checkboxes). Then fire the shift-click via
+    // fireEvent — user-event v14's keyboard-held-shift doesn't reliably
+    // propagate through the synthetic click event in jsdom.
+    const afterFirst = screen.getAllByRole(
+      'button',
+      { name: /select neighbor|deselect neighbor/i },
+    )
+    fireEvent.click(afterFirst[2], { shiftKey: true })
+
+    // All three rows should be selected (range A→C inclusive).
+    expect(screen.getByText('3 selected')).toBeInTheDocument()
+  })
+})
+

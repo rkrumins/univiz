@@ -242,10 +242,12 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     // Select and scroll to node
     selectNode(nodeId)
 
-    // Scroll to node after expansion
+    // Scroll to node after expansion, then pulse so the user sees where
+    // they landed (matches the jump-to-node feedback in other canvases).
     setTimeout(() => {
       const element = document.getElementById(`hierarchy-node-${nodeId}`)
       element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      useCanvasStore.getState().pulseNode(nodeId)
     }, 100)
   }, [flatNodes, selectNode])
 

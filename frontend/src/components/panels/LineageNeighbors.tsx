@@ -35,7 +35,13 @@ interface LineageNeighborsProps {
    *  return a promise — the clicked row shows an inline spinner until it
    *  resolves. */
   onFocusNode?: (nodeId: string) => void | Promise<void>
+  /** Reveal a set of neighbors at once and fit the canvas around them.
+   *  Used by the multi-select action bar. Implementations may run each
+   *  reveal in parallel; the drawer doesn't swap when this fires. */
+  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
 }
+
+type SortMode = 'default' | 'name-asc' | 'name-desc'
 
 type Direction = 'incoming' | 'outgoing'
 
@@ -47,7 +53,7 @@ interface NeighborRecord {
   edgeTypeNorm: string
 }
 
-export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps) {
+export function LineageNeighbors({ nodeId, onFocusNode, onLocateMany }: LineageNeighborsProps) {
   const rawEdges = useCanvasStore((s) => s.edges)
   const visibleEdges = useCanvasStore((s) => s.visibleEdges)
   // Mirror the canvas: prefer the projected/aggregated visible set; fall
@@ -143,6 +149,7 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
           expanded={expanded === 'incoming'}
           onToggle={() => toggle('incoming')}
           onNeighborClick={handleNeighborClick}
+          onLocateMany={onLocateMany}
         />
         <DirectionCard
           direction="outgoing"
@@ -153,6 +160,7 @@ export function LineageNeighbors({ nodeId, onFocusNode }: LineageNeighborsProps)
           expanded={expanded === 'outgoing'}
           onToggle={() => toggle('outgoing')}
           onNeighborClick={handleNeighborClick}
+          onLocateMany={onLocateMany}
         />
       </div>
     </div>
@@ -172,6 +180,7 @@ interface DirectionCardProps {
   expanded: boolean
   onToggle: () => void
   onNeighborClick: (neighborId: string) => void | Promise<void>
+  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
 }
 
 function DirectionCard({
@@ -183,6 +192,7 @@ function DirectionCard({
   expanded,
   onToggle,
   onNeighborClick,
+  onLocateMany,
 }: DirectionCardProps) {
   const isIncoming = direction === 'incoming'
   const ArrowIcon = isIncoming
@@ -293,6 +303,7 @@ function DirectionCard({
                 records={records}
                 direction={direction}
                 onNeighborClick={onNeighborClick}
+                onLocateMany={onLocateMany}
               />
             </div>
           </motion.div>
@@ -310,12 +321,14 @@ interface ExpandedDetailProps {
   records: NeighborRecord[]
   direction: Direction
   onNeighborClick: (neighborId: string) => void | Promise<void>
+  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
 }
 
 function ExpandedDetail({
   records,
   direction,
   onNeighborClick,
+  onLocateMany,
 }: ExpandedDetailProps) {
   const [activeEntityTypes, setActiveEntityTypes] = useState<Set<string>>(
     new Set(),
@@ -323,6 +336,12 @@ function ExpandedDetail({
   const [activeEdgeTypes, setActiveEdgeTypes] = useState<Set<string>>(new Set())
   const [search, setSearch] = useState('')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const [sortMode, setSortMode] = useState<SortMode>('default')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [locateBusy, setLocateBusy] = useState(false)
+  // Range-select anchor: id of the last single-toggled row. Shift-clicking
+  // another row selects everything between them in visible order.
+  const [lastSelectedId, setLastSelectedId] = useState<string | null>(null)
 
   const entityTypeFacets = useMemo(() => {
     const counts = new Map<string, number>()
@@ -377,8 +396,116 @@ function ExpandedDetail({
       bucket.push(r)
       g.set(t, bucket)
     }
+    // Sort rows within each group per the selected SortMode. Groups
+    // themselves stay ordered by descending size — keeps the most-relevant
+    // entity types at the top regardless of internal row order.
+    if (sortMode !== 'default') {
+      const labelOf = (r: NeighborRecord) => {
+        const d = r.neighborNode?.data
+        return (d?.businessLabel || d?.label || d?.urn || r.neighborId).toLowerCase()
+      }
+      const cmp = sortMode === 'name-asc'
+        ? (a: NeighborRecord, b: NeighborRecord) => labelOf(a).localeCompare(labelOf(b))
+        : (a: NeighborRecord, b: NeighborRecord) => labelOf(b).localeCompare(labelOf(a))
+      for (const [, rows] of g) rows.sort(cmp)
+    }
     return [...g.entries()].sort((a, b) => b[1].length - a[1].length)
-  }, [filtered])
+  }, [filtered, sortMode])
+
+  // Multi-select helpers ------------------------------------------------
+  // Visible-order id list (post filter + sort + group). Drives both
+  // shift-click range-select and the "Select all" button.
+  const flatVisibleIds = useMemo(
+    () => grouped.flatMap(([, rows]) => rows.map((r) => r.neighborId)),
+    [grouped],
+  )
+
+  // Row checkbox click. With shift held, selects every row between the
+  // anchor and this row (inclusive) in visible order. Without shift,
+  // toggles single + updates the anchor. The set-union semantics match
+  // Finder / VSCode shift-click.
+  const handleRowSelectClick = (id: string, shiftKey: boolean) => {
+    if (shiftKey && lastSelectedId && lastSelectedId !== id) {
+      const anchorIdx = flatVisibleIds.indexOf(lastSelectedId)
+      const targetIdx = flatVisibleIds.indexOf(id)
+      if (anchorIdx >= 0 && targetIdx >= 0) {
+        const [lo, hi] =
+          anchorIdx < targetIdx
+            ? [anchorIdx, targetIdx]
+            : [targetIdx, anchorIdx]
+        const range = flatVisibleIds.slice(lo, hi + 1)
+        setSelectedIds(new Set([...selectedIds, ...range]))
+        setLastSelectedId(id)
+        return
+      }
+    }
+    // Single-toggle fallback (no anchor, anchor filtered out, or no shift).
+    const next = new Set(selectedIds)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    setSelectedIds(next)
+    setLastSelectedId(id)
+  }
+
+  // Group-level toggle: if every row in the group is selected, remove
+  // them all; otherwise add the missing ones. Three-state UI (none /
+  // partial / all) collapses to two-state interaction.
+  const handleToggleGroup = (groupIds: string[], allSelected: boolean) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (allSelected) groupIds.forEach((g) => next.delete(g))
+      else groupIds.forEach((g) => next.add(g))
+      return next
+    })
+  }
+
+  // Whole-list toggle for the "Select all" affordance. Operates on the
+  // filtered view so users don't end up with hidden selected items.
+  const allVisibleSelected =
+    flatVisibleIds.length > 0 &&
+    flatVisibleIds.every((id) => selectedIds.has(id))
+  const toggleAllVisible = () => {
+    if (allVisibleSelected) {
+      // Remove only the visible ones — preserves any selections that may
+      // exist outside the current filter (defensive; in practice we prune
+      // those via the useEffect below).
+      setSelectedIds((prev) => {
+        const next = new Set(prev)
+        flatVisibleIds.forEach((id) => next.delete(id))
+        return next
+      })
+    } else {
+      setSelectedIds((prev) => new Set([...prev, ...flatVisibleIds]))
+    }
+  }
+
+  const clearSelected = () => {
+    setSelectedIds(new Set())
+    setLastSelectedId(null)
+  }
+  // Drop any selected ids that fall out of the visible filtered set so
+  // the action-bar count never misrepresents what "Locate" will act on.
+  useEffect(() => {
+    if (selectedIds.size === 0) return
+    const visible = new Set(filtered.map((r) => r.neighborId))
+    let changed = false
+    const next = new Set<string>()
+    for (const id of selectedIds) {
+      if (visible.has(id)) next.add(id)
+      else changed = true
+    }
+    if (changed) setSelectedIds(next)
+  }, [filtered, selectedIds])
+
+  const handleLocateMany = async () => {
+    if (selectedIds.size === 0 || !onLocateMany || locateBusy) return
+    setLocateBusy(true)
+    try {
+      await onLocateMany([...selectedIds])
+    } finally {
+      setLocateBusy(false)
+    }
+  }
 
   const toggleSet = (
     set: Set<string>,
@@ -403,25 +530,59 @@ function ExpandedDetail({
 
   return (
     <div className="p-3 space-y-3">
-      {/* Search — always visible when expanded so the filter affordance is
-          discoverable even with few results. */}
-      <div className="relative">
-        <LucideIcons.Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-muted pointer-events-none" />
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search by name or URN…"
-          className="w-full pl-9 pr-8 py-2 text-xs rounded-lg bg-black/10 dark:bg-white/[0.04] border border-white/10 focus:border-accent-lineage/40 focus:bg-white/[0.06] outline-none transition-colors duration-150 placeholder:text-ink-muted/70"
-        />
-        {search && (
+      {/* Search + sort row — paired so users can re-order while keeping
+          search context. Sort menu is hidden when there's only one row. */}
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <LucideIcons.Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-ink-muted pointer-events-none" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search by name or URN…"
+            className="w-full pl-9 pr-8 py-2 text-xs rounded-lg bg-black/10 dark:bg-white/[0.04] border border-white/10 focus:border-accent-lineage/40 focus:bg-white/[0.06] outline-none transition-colors duration-150 placeholder:text-ink-muted/70"
+          />
+          {search && (
+            <button
+              type="button"
+              onClick={() => setSearch('')}
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-ink-muted hover:text-ink hover:bg-white/10 transition-colors duration-150"
+              title="Clear search"
+            >
+              <LucideIcons.X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+        {records.length > 1 && (
+          <SortMenu value={sortMode} onChange={setSortMode} />
+        )}
+        {onLocateMany && flatVisibleIds.length > 0 && (
           <button
             type="button"
-            onClick={() => setSearch('')}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-ink-muted hover:text-ink hover:bg-white/10 transition-colors duration-150"
-            title="Clear search"
+            onClick={toggleAllVisible}
+            aria-pressed={allVisibleSelected}
+            // Explicit aria-label so this button's accessible name doesn't
+            // collide with the per-group "Select all <Type>" checkbox.
+            aria-label={
+              allVisibleSelected
+                ? 'Deselect all visible neighbors'
+                : `Select all ${flatVisibleIds.length} visible neighbors`
+            }
+            className={cn(
+              'inline-flex items-center gap-1 px-2 py-2 rounded-lg text-[11px] font-medium border transition-colors duration-150 whitespace-nowrap',
+              allVisibleSelected
+                ? 'text-accent-lineage bg-accent-lineage/10 border-accent-lineage/30'
+                : 'text-ink-muted bg-white/[0.04] border-white/10 hover:text-ink hover:border-white/20',
+            )}
           >
-            <LucideIcons.X className="w-3 h-3" />
+            {allVisibleSelected ? (
+              <LucideIcons.CheckSquare className="w-3.5 h-3.5" />
+            ) : (
+              <LucideIcons.Square className="w-3.5 h-3.5" />
+            )}
+            <span className="hidden sm:inline">
+              {allVisibleSelected ? 'Deselect all' : `Select all (${flatVisibleIds.length})`}
+            </span>
           </button>
         )}
       </div>
@@ -497,6 +658,11 @@ function ExpandedDetail({
                 toggleSet(collapsedGroups, setCollapsedGroups, type)
               }
               onNeighborClick={onNeighborClick}
+              selectionEnabled={!!onLocateMany}
+              selectionActive={selectedIds.size > 0}
+              selectedIds={selectedIds}
+              onToggleRow={handleRowSelectClick}
+              onToggleGroup={handleToggleGroup}
             />
           ))
         )}
@@ -511,6 +677,134 @@ function ExpandedDetail({
           </div>
         )}
       </div>
+
+      {/* Multi-select action bar — only renders when at least one row is
+          checked. Slides in from the bottom so it's evident but doesn't
+          steal vertical space when unused. */}
+      <AnimatePresence>
+        {onLocateMany && selectedIds.size > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            transition={{ duration: 0.15 }}
+            className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-accent-lineage/10 border border-accent-lineage/30"
+          >
+            <span className="text-[12px] font-medium text-ink">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={clearSelected}
+                className="px-2.5 py-1 rounded-md text-[11px] font-medium text-ink-muted hover:text-ink hover:bg-white/[0.06] transition-colors duration-150"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                onClick={handleLocateMany}
+                disabled={locateBusy}
+                className={cn(
+                  'px-3 py-1 rounded-md text-[11px] font-semibold bg-accent-lineage text-white shadow-sm hover:brightness-110 transition-all duration-150 flex items-center gap-1.5',
+                  locateBusy && 'opacity-70 cursor-progress',
+                )}
+              >
+                {locateBusy ? (
+                  <LucideIcons.Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <LucideIcons.Crosshair className="w-3 h-3" />
+                )}
+                Locate {selectedIds.size} on canvas
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
+// ============================================
+// Sort menu
+// ============================================
+
+function SortMenu({
+  value,
+  onChange,
+}: {
+  value: SortMode
+  onChange: (mode: SortMode) => void
+}) {
+  const [open, setOpen] = useState(false)
+  // Close on outside click. Simpler than wiring a Radix Popover for the
+  // three options this menu currently exposes.
+  useEffect(() => {
+    if (!open) return
+    const onDocClick = () => setOpen(false)
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  const labels: Record<SortMode, string> = {
+    'default': 'Default',
+    'name-asc': 'Name A → Z',
+    'name-desc': 'Name Z → A',
+  }
+  const ariaLabel = `Sort: ${labels[value]}`
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation()
+          setOpen((o) => !o)
+        }}
+        aria-label={ariaLabel}
+        title={ariaLabel}
+        className={cn(
+          'inline-flex items-center gap-1 px-2 py-2 rounded-lg text-[11px] font-medium border transition-colors duration-150',
+          value === 'default'
+            ? 'text-ink-muted bg-white/[0.04] border-white/10 hover:text-ink hover:border-white/20'
+            : 'text-accent-lineage bg-accent-lineage/10 border-accent-lineage/30',
+        )}
+      >
+        <LucideIcons.ArrowUpDown className="w-3.5 h-3.5" />
+        {value !== 'default' && (
+          <span className="hidden sm:inline">{labels[value]}</span>
+        )}
+      </button>
+      {open && (
+        <div
+          className="absolute right-0 top-full mt-1 z-20 min-w-[140px] rounded-lg border border-white/10 bg-canvas-elevated/98 backdrop-blur-2xl shadow-lg overflow-hidden"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          {(Object.keys(labels) as SortMode[]).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => {
+                onChange(mode)
+                setOpen(false)
+              }}
+              className={cn(
+                'w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-left transition-colors duration-150',
+                value === mode
+                  ? 'bg-accent-lineage/15 text-accent-lineage'
+                  : 'text-ink-muted hover:bg-white/[0.06] hover:text-ink',
+              )}
+            >
+              {value === mode ? (
+                <LucideIcons.Check className="w-3 h-3" />
+              ) : (
+                <span className="w-3" />
+              )}
+              {labels[mode]}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -636,6 +930,13 @@ interface EntityTypeGroupProps {
   collapsed: boolean
   onToggleCollapse: () => void
   onNeighborClick: (neighborId: string) => void | Promise<void>
+  selectionEnabled: boolean
+  /** True when any row across the whole panel is selected. Drives the
+   *  hover-vs-always-on behaviour of the per-row checkbox. */
+  selectionActive: boolean
+  selectedIds: Set<string>
+  onToggleRow: (id: string, shiftKey: boolean) => void
+  onToggleGroup: (groupIds: string[], allSelected: boolean) => void
 }
 
 function EntityTypeGroup({
@@ -645,6 +946,11 @@ function EntityTypeGroup({
   collapsed,
   onToggleCollapse,
   onNeighborClick,
+  selectionEnabled,
+  selectionActive,
+  selectedIds,
+  onToggleRow,
+  onToggleGroup,
 }: EntityTypeGroupProps) {
   const schema = useSchemaStore((s) => s.schema)
   const entityType = schema?.entityTypes.find((t) => t.id === type)
@@ -658,42 +964,86 @@ function EntityTypeGroup({
       ] as React.ComponentType<{ className?: string }> | undefined)) ||
     undefined
 
+  // Group selection: tri-state derived from the rows' selection status.
+  // "Partial" means some-but-not-all are selected — shown as a dash icon
+  // to mirror standard tri-state checkbox UX (macOS Finder, Gmail).
+  const groupIds = useMemo(() => rows.map((r) => r.neighborId), [rows])
+  const allGroupSelected = groupIds.every((id) => selectedIds.has(id))
+  const someGroupSelected =
+    !allGroupSelected && groupIds.some((id) => selectedIds.has(id))
+
   return (
     <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] overflow-hidden">
-      <button
-        type="button"
-        onClick={onToggleCollapse}
-        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/[0.04] transition-colors duration-150"
-      >
-        <LucideIcons.ChevronDown
-          className={cn(
-            'w-3.5 h-3.5 text-ink-muted/70 transition-transform duration-200',
-            collapsed && '-rotate-90',
-          )}
-        />
-        <div
-          className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
-          style={{ backgroundColor: `${color}1f` }}
+      <div className="group/header flex items-center gap-2 px-3 py-2 hover:bg-white/[0.04] transition-colors duration-150">
+        {selectionEnabled && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              onToggleGroup(groupIds, allGroupSelected)
+            }}
+            aria-label={
+              allGroupSelected
+                ? `Deselect all ${displayName}`
+                : `Select all ${displayName}`
+            }
+            aria-pressed={allGroupSelected}
+            className={cn(
+              'w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-all duration-150',
+              allGroupSelected
+                ? 'bg-accent-lineage border-accent-lineage text-white'
+                : someGroupSelected
+                  ? 'bg-accent-lineage/30 border-accent-lineage/60 text-accent-lineage'
+                  : 'border-white/20 hover:border-accent-lineage/60',
+              // Mirror the row-checkbox hover-reveal logic so the group
+              // checkbox doesn't feel like a separate affordance.
+              !allGroupSelected && !someGroupSelected && !selectionActive
+                ? 'opacity-0 group-hover/header:opacity-100'
+                : 'opacity-100',
+            )}
+          >
+            {allGroupSelected ? (
+              <LucideIcons.Check className="w-2.5 h-2.5" />
+            ) : someGroupSelected ? (
+              <LucideIcons.Minus className="w-2.5 h-2.5" />
+            ) : null}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          className="flex items-center gap-2 flex-1 min-w-0 text-left"
         >
-          {IconCmp ? (
-            <IconCmp className="w-3 h-3" />
-          ) : (
-            <span
-              className="w-1.5 h-1.5 rounded-full"
-              style={{ backgroundColor: color }}
-            />
-          )}
-        </div>
-        <span
-          className="text-[11px] font-semibold uppercase tracking-wide"
-          style={{ color }}
-        >
-          {displayName}
-        </span>
-        <span className="ml-auto inline-flex items-center justify-center min-w-[20px] h-[18px] px-1.5 rounded-full bg-white/[0.06] text-[10px] font-medium text-ink-muted tabular-nums">
-          {rows.length}
-        </span>
-      </button>
+          <LucideIcons.ChevronDown
+            className={cn(
+              'w-3.5 h-3.5 text-ink-muted/70 transition-transform duration-200',
+              collapsed && '-rotate-90',
+            )}
+          />
+          <div
+            className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
+            style={{ backgroundColor: `${color}1f` }}
+          >
+            {IconCmp ? (
+              <IconCmp className="w-3 h-3" />
+            ) : (
+              <span
+                className="w-1.5 h-1.5 rounded-full"
+                style={{ backgroundColor: color }}
+              />
+            )}
+          </div>
+          <span
+            className="text-[11px] font-semibold uppercase tracking-wide truncate"
+            style={{ color }}
+          >
+            {displayName}
+          </span>
+          <span className="ml-auto inline-flex items-center justify-center min-w-[20px] h-[18px] px-1.5 rounded-full bg-white/[0.06] text-[10px] font-medium text-ink-muted tabular-nums">
+            {rows.length}
+          </span>
+        </button>
+      </div>
       <AnimatePresence initial={false}>
         {!collapsed && (
           <motion.div
@@ -710,6 +1060,12 @@ function EntityTypeGroup({
                   record={r}
                   direction={direction}
                   onClick={() => onNeighborClick(r.neighborId)}
+                  selectionEnabled={selectionEnabled}
+                  selectionActive={selectionActive}
+                  selected={selectedIds.has(r.neighborId)}
+                  onToggleSelected={(shiftKey) =>
+                    onToggleRow(r.neighborId, shiftKey)
+                  }
                 />
               ))}
             </div>
@@ -724,10 +1080,23 @@ function NeighborRow({
   record,
   direction,
   onClick,
+  selectionEnabled,
+  selectionActive,
+  selected,
+  onToggleSelected,
 }: {
   record: NeighborRecord
   direction: Direction
   onClick: () => void | Promise<void>
+  selectionEnabled: boolean
+  /** True when any row in the panel is currently selected. Keeps the
+   *  per-row checkbox visible so the user can extend the selection
+   *  without hunting for the hover-reveal target. */
+  selectionActive: boolean
+  selected: boolean
+  /** Receives the shift modifier so the parent can implement
+   *  shift-click range-select semantics. */
+  onToggleSelected: (shiftKey: boolean) => void
 }) {
   const [busy, setBusy] = useState(false)
   const { neighborNode, edgeTypeNorm, neighborId } = record
@@ -760,16 +1129,51 @@ function NeighborRow({
   }
 
   return (
-    <button
-      type="button"
-      onClick={handleClick}
-      disabled={busy}
+    <div
       className={cn(
-        'group relative w-full flex items-center gap-2.5 px-3 py-2 hover:bg-white/[0.05] transition-colors duration-150 text-left',
+        'group relative w-full flex items-center gap-2.5 px-3 py-2 transition-colors duration-150',
+        selected
+          ? 'bg-accent-lineage/10 hover:bg-accent-lineage/15'
+          : 'hover:bg-white/[0.05]',
         busy && 'cursor-progress',
       )}
-      title={data?.urn ?? neighborId}
     >
+      {/* Multi-select checkbox — visibility follows the hover-reveal
+          contract:
+          - Selected rows: always visible (filled).
+          - Any-row-selected anywhere in panel: always visible (hollow).
+          - Idle: hidden, fades in on row hover.
+          stopPropagation keeps checkbox clicks from also firing the
+          row's reveal navigation. */}
+      {selectionEnabled && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleSelected(e.shiftKey)
+          }}
+          aria-label={selected ? 'Deselect neighbor' : 'Select neighbor'}
+          aria-pressed={selected}
+          className={cn(
+            'w-4 h-4 rounded border flex items-center justify-center flex-shrink-0',
+            'transition-opacity duration-150',
+            selected
+              ? 'bg-accent-lineage border-accent-lineage text-white opacity-100'
+              : selectionActive
+                ? 'border-white/20 hover:border-accent-lineage/60 opacity-100'
+                : 'border-white/20 hover:border-accent-lineage/60 opacity-0 group-hover:opacity-100',
+          )}
+        >
+          {selected && <LucideIcons.Check className="w-2.5 h-2.5" />}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy}
+        className="flex-1 flex items-center gap-2.5 min-w-0 text-left"
+        title={data?.urn ?? neighborId}
+      >
       <div
         className={cn(
           'w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 transition-colors duration-150',
@@ -810,7 +1214,8 @@ function NeighborRow({
           )}
         />
       )}
-    </button>
+      </button>
+    </div>
   )
 }
 

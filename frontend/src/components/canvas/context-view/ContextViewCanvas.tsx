@@ -1086,6 +1086,44 @@ export function ContextViewCanvas({
     },
   })
 
+  // Multi-locate: reveal each target with skipFocus so per-node scrolls
+  // don't fight each other during the cascade, then compute the
+  // horizontal bounding-box of all revealed targets and centre the union
+  // in the layered scroll container. Vertical seek defers to the first
+  // target's scrollIntoView — vertical union centring would risk scrolling
+  // past important rows in tall columns.
+  const locateManyOnCanvas = useCallback(
+    async (ids: string[]) => {
+      await Promise.allSettled(
+        ids.map((id) => revealAndFocus(id, { skipFocus: true })),
+      )
+      // Let any expand-driven re-layout commit before measuring.
+      await new Promise<void>((r) => requestAnimationFrame(() => r()))
+
+      const container = horizontalScrollRef.current
+      if (!container) return
+      const els = ids
+        .map((id) => document.getElementById(`layer-node-${id}`))
+        .filter((el): el is HTMLElement => !!el)
+      if (els.length === 0) return
+
+      const containerRect = container.getBoundingClientRect()
+      const rects = els.map((el) => el.getBoundingClientRect())
+      const minLeft = Math.min(...rects.map((r) => r.left))
+      const maxRight = Math.max(...rects.map((r) => r.right))
+      const unionCenterX = (minLeft + maxRight) / 2
+      const viewportCenterX = containerRect.left + containerRect.width / 2
+      const horizontalDelta = unionCenterX - viewportCenterX
+
+      container.scrollTo({
+        left: container.scrollLeft + horizontalDelta,
+        behavior: 'smooth',
+      })
+      els[0]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    },
+    [revealAndFocus],
+  )
+
   // Hydration phase mirrored into the canvas store by CanvasRouter — drives
   // the ghost-card stack in empty layers and the GhostLineageOverlay.
   // Anything-not-complete counts as hydrating so that:
@@ -1933,6 +1971,7 @@ export function ContextViewCanvas({
             onTraceDown={(nodeId) => traceDownstreamWithSmartLevel(nodeId)}
             onFullTrace={(nodeId) => traceFullLineageWithSmartLevel(nodeId)}
             onFocusNode={revealAndFocus}
+            onLocateMany={locateManyOnCanvas}
           />
         )}
         {!drawerNodeId && isEdgePanelOpen && (
