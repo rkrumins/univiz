@@ -1,0 +1,26 @@
+# Nginx ingress (ingress-nginx controller). Plain HTTP. All traffic goes to
+# the frontend, which internally proxies /api/* and /graph/* to the backends.
+# EDIT the host to your real domain (and keep CORS_ALLOWED_ORIGINS in sync).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dataviz
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/part-of: dataviz
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: dataviz.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

@@ -1,0 +1,70 @@
+# Headless batch executor — consumes jobs from Redis Streams. No Service
+# (no inbound API; port 8090 is health-only). Scale horizontally via replicas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-worker
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: aggregation-worker
+    app.kubernetes.io/part-of: dataviz
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aggregation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aggregation-worker
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      # Drain in-flight jobs on rollout/scale-down instead of SIGKILL at 30s.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # Wait for the control plane (Alembic + aggregation schema owner)
+        # before consuming jobs — replaces compose depends_on.
+        - name: wait-for-controlplane
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - "until curl -sf http://aggregation-controlplane:8091/health; do echo waiting for controlplane; sleep 3; done"
+      containers:
+        - name: aggregation-worker
+          # Build backend/Dockerfile.aggregation and push to Docker Hub.
+          image: docker.io/synodic/aggregation-worker:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 8090
+          envFrom:
+            - configMapRef:
+                name: dataviz-config
+            - secretRef:
+                name: dataviz-secrets
+          env:
+            - name: SYNODIC_ROLE
+              value: "worker"
+            # Long FalkorDB timeout — heavy MERGE operations.
+            - name: FALKORDB_SOCKET_TIMEOUT
+              value: "60"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

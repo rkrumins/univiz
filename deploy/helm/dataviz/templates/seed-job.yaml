@@ -1,0 +1,55 @@
+{{- if .Values.seed.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataviz-seed
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+    app.kubernetes.io/component: seed
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "dataviz.labels" . | nindent 8 }}
+        app.kubernetes.io/component: seed
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: seed
+          image: {{ include "dataviz.image" (dict "ctx" $ "name" "seed") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: FALKORDB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: dataviz-config
+                  key: FALKORDB_HOST
+            - name: FALKORDB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: dataviz-config
+                  key: FALKORDB_PORT
+            - name: FALKORDB_GRAPH_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: dataviz-config
+                  key: FALKORDB_GRAPH_NAME
+            - name: SEED_SCENARIOS
+              value: {{ .Values.seed.scenarios | quote }}
+            - name: SEED_SCALE
+              value: {{ .Values.seed.scale | quote }}
+            - name: SEED_BREADTH
+              value: {{ .Values.seed.breadth | quote }}
+            - name: SEED_DEPTH
+              value: {{ .Values.seed.depth | quote }}
+{{- end }}

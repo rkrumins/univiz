@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aggregation-worker
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+    app.kubernetes.io/name: aggregation-worker
+spec:
+  replicas: {{ .Values.services.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aggregation-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aggregation-worker
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.services.worker.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.ordering.enabled }}
+      initContainers:
+        {{- include "dataviz.waitForControlplane" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: aggregation-worker
+          image: {{ include "dataviz.image" (dict "ctx" $ "name" "aggregation-worker") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8090
+          envFrom:
+            - configMapRef:
+                name: dataviz-config
+            - secretRef:
+                name: {{ include "dataviz.secretName" . }}
+          env:
+            - name: SYNODIC_ROLE
+              value: "worker"
+            - name: FALKORDB_SOCKET_TIMEOUT
+              value: "60"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.services.worker.resources | nindent 12 }}

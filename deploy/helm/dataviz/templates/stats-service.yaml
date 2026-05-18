@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stats-service
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+    app.kubernetes.io/name: stats-service
+spec:
+  replicas: {{ .Values.services.stats.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stats-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stats-service
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.services.stats.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.ordering.enabled }}
+      initContainers:
+        {{- include "dataviz.waitForControlplane" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: stats-service
+          image: {{ include "dataviz.image" (dict "ctx" $ "name" "stats-service") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8092
+          envFrom:
+            - configMapRef:
+                name: dataviz-config
+            - secretRef:
+                name: {{ include "dataviz.secretName" . }}
+          env:
+            - name: SYNODIC_ROLE
+              value: "stats"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.services.stats.resources | nindent 12 }}

@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dataviz-config
+  labels:
+    {{- include "dataviz.labels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
+  GRAPH_PROVIDER: {{ .Values.config.graphProvider | quote }}
+  FALKORDB_HOST: {{ .Values.config.falkordb.host | quote }}
+  FALKORDB_PORT: {{ .Values.config.falkordb.port | quote }}
+  FALKORDB_GRAPH_NAME: {{ .Values.config.falkordb.graphName | quote }}
+  JWT_ALGORITHM: {{ .Values.config.jwt.algorithm | quote }}
+  JWT_EXPIRY_MINUTES: {{ .Values.config.jwt.expiryMinutes | quote }}
+  ADMIN_EMAIL: {{ .Values.config.adminEmail | quote }}
+  AGGREGATION_DISPATCH_MODE: "redis"
+  AGGREGATION_PROXY_ENABLED: "true"
+  AGGREGATION_SERVICE_URL: "http://aggregation-controlplane:8091"
+  AGGREGATION_API_PORT: "8091"
+  WORKER_CONCURRENCY: {{ .Values.config.aggregation.workerConcurrency | quote }}
+  AGGREGATION_JOB_TIMEOUT_SECS: {{ .Values.config.aggregation.jobTimeoutSecs | quote }}
+  MAX_CONCURRENT_PER_GRAPH: {{ .Values.config.aggregation.maxConcurrentPerGraph | quote }}
+  STATS_SCHEDULER_TICK_SECS: {{ .Values.config.stats.schedulerTickSecs | quote }}
+  STATS_WORKER_CONCURRENCY: {{ .Values.config.stats.workerConcurrency | quote }}
+  STATS_MAX_CONCURRENT_PER_GRAPH: {{ .Values.config.stats.maxConcurrentPerGraph | quote }}
+  STATS_DEFAULT_INTERVAL_SECS: {{ .Values.config.stats.defaultIntervalSecs | quote }}
+  STATS_MIN_INTERVAL_SECS: {{ .Values.config.stats.minIntervalSecs | quote }}
+  STATS_MAX_DELIVERY_ATTEMPTS: {{ .Values.config.stats.maxDeliveryAttempts | quote }}
+  STATS_DRAIN_TIMEOUT_SECS: {{ .Values.config.stats.drainTimeoutSecs | quote }}
+  STATS_HEALTH_PORT: "8092"
+  STATS_POLL_TIMEOUT_SECS: {{ .Values.config.stats.pollTimeoutSecs | quote }}
+  STATS_POLL_TIMEOUT_LARGE_SECS: {{ .Values.config.stats.pollTimeoutLargeSecs | quote }}
+  STATS_POLL_LARGE_THRESHOLD: {{ .Values.config.stats.pollLargeThreshold | quote }}

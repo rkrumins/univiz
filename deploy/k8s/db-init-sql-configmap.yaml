@@ -1,0 +1,32 @@
+# SQL applied to the EXTERNAL Postgres before the app starts.
+# Verbatim copy of deploy/postgres-init/*.sql — these only auto-run inside
+# the compose Postgres container, so on Cloud SQL we apply them via a Job.
+# Both scripts are idempotent.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dataviz-db-init-sql
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/part-of: dataviz
+data:
+  01-roles.sql: |
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'synodic') THEN
+            CREATE ROLE synodic LOGIN PASSWORD 'synodic';
+        END IF;
+    END
+    $$;
+
+    SELECT 'CREATE DATABASE synodic OWNER synodic'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'synodic')\gexec
+
+    GRANT ALL PRIVILEGES ON DATABASE synodic TO synodic;
+  02-schemas.sql: |
+    \connect synodic synodic
+
+    CREATE SCHEMA IF NOT EXISTS aggregation AUTHORIZATION synodic;
+
+    GRANT ALL ON SCHEMA public TO synodic;
+    GRANT ALL ON SCHEMA aggregation TO synodic;

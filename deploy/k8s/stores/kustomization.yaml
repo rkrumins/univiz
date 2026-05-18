@@ -1,0 +1,22 @@
+# OPT-IN in-cluster stateful backing stores (FalkorDB, Redis, Postgres).
+#
+#   kubectl apply -k deploy/k8s/stores
+#
+# Use this INSTEAD of external/managed Cloud SQL + Memorystore + FalkorDB.
+# After applying, point the app at the in-cluster Services:
+#   ConfigMap: FALKORDB_HOST=falkordb
+#   Secret:    REDIS_URL=redis://redis:6379/0
+#              MANAGEMENT_DB_URL=postgresql+asyncpg://synodic:<pw>@postgres:5432/synodic
+#              POSTGRES_PASSWORD=<pw>   (consumed by the postgres StatefulSet)
+#
+# Postgres self-bootstraps the role + 'aggregation' schema on first boot,
+# so DO NOT also run deploy/k8s/db-init-job.yaml in that case.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: dataviz
+
+resources:
+  - falkordb.yaml
+  - redis.yaml
+  - postgres.yaml

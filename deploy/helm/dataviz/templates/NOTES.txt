@@ -1,0 +1,39 @@
+dataviz deployed to namespace "{{ .Release.Namespace }}" (release {{ .Release.Name }}).
+
+{{- $inCluster := or .Values.stores.falkordb.enabled .Values.stores.redis.enabled .Values.stores.postgres.enabled }}
+Prerequisites (NOT managed by this chart):
+  1. ingress-nginx controller installed in the cluster.
+{{- if $inCluster }}
+  2. In-cluster stores enabled: falkordb={{ .Values.stores.falkordb.enabled }}
+     redis={{ .Values.stores.redis.enabled }} postgres={{ .Values.stores.postgres.enabled }}
+     (each runs as a StatefulSet with a PVC; ensure a default StorageClass).
+     Point the app at Service DNS: falkordb / redis / postgres.
+{{- else }}
+  2. External Postgres (Cloud SQL), Redis (Memorystore), and FalkorDB
+     reachable from the cluster.
+{{- end }}
+  3. The 6 images built from the repo Dockerfiles and pushed to Docker Hub:
+       {{ .Values.image.registry }}/{{ .Values.image.org }}/<name>:{{ .Values.image.tag }}
+     where <name> = viz-service, graph-service, aggregation-controlplane,
+     aggregation-worker, stats-service, frontend
+{{ if .Values.dbInit.enabled }}
+The pre-install/pre-upgrade db-init Job applied roles + the 'aggregation'
+schema to your external Postgres. Check it with:
+  kubectl -n {{ .Release.Namespace }} logs job/dataviz-db-init
+{{ end }}
+Watch rollout:
+  kubectl -n {{ .Release.Namespace }} get pods -w
+
+Access the app:
+{{- if .Values.ingress.enabled }}
+  Point DNS for {{ .Values.ingress.host }} at the ingress-nginx external IP:
+    kubectl -n ingress-nginx get svc ingress-nginx-controller
+  Then open:  http://{{ .Values.ingress.host }}/
+{{- else }}
+  Ingress is disabled. Port-forward instead:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/frontend 8080:80
+    open http://localhost:8080/
+{{- end }}
+
+Reminder: keep config.corsAllowedOrigins in sync with ingress.host, or the
+browser will block API calls.
