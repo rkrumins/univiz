@@ -72,7 +72,7 @@ import { LayerColumn } from './LayerColumn'
 import { LineageFlowOverlay, EXTREMITY_EDGE_GUTTER_PX } from './LineageFlowOverlay'
 import { GhostLineageOverlay } from './GhostLineageOverlay'
 import { ContextViewHeader } from './ContextViewHeader'
-import { useLoadingToast, useToast } from '@/components/ui/toast'
+import { useLoadingToast, useToast, useToastStore } from '@/components/ui/toast'
 import { useStagedChangesStore } from '@/store/stagedChangesStore'
 import { StagedChangesPanel } from './StagedChangesPanel'
 import { TraceBottomDock } from '../trace/TraceBottomDock'
@@ -632,30 +632,52 @@ export function ContextViewCanvas({
   // column-level lineage (TRANSFORMS, AGGREGATED, or any other ontology-
   // classified lineage edge type). The previous "auto-coarsen" hack broke
   // fine-grained TRANSFORMS lineage; removed.
+  //
+  // Every entry point gates on `hydrationPhase === 'complete'`. Firing a
+  // trace mid-hydration returns nothing (backend has only loaded a partial
+  // edge set yet) — the user is presented with a warning toast instead.
+  // Reading the stores via getState() inside the callback avoids re-render
+  // churn and side-steps the temporal-dead-zone of capturing variables
+  // declared later in the component body.
+  const guardTraceHydration = useCallback((): boolean => {
+    if (useCanvasStore.getState().hydrationPhase === 'complete') return true
+    useToastStore.getState().addToast({
+      type: 'warning',
+      message: 'Trace is unavailable until lineage finishes loading. Please wait a moment.',
+      key: 'trace-not-ready',
+    })
+    return false
+  }, [])
+
   const startTraceWithSmartLevel = useCallback((nodeId: string) => {
+    if (!guardTraceHydration()) return
     trace.setConfig({ level: 'auto', lineageEdgeTypes })
     return trace.startTrace(nodeId)
-  }, [trace, lineageEdgeTypes])
+  }, [trace, lineageEdgeTypes, guardTraceHydration])
 
   const toggleTraceWithSmartLevel = useCallback((nodeId: string) => {
+    if (!guardTraceHydration()) return
     trace.setConfig({ level: 'auto', lineageEdgeTypes })
     return trace.toggleTrace(nodeId)
-  }, [trace, lineageEdgeTypes])
+  }, [trace, lineageEdgeTypes, guardTraceHydration])
 
   const traceUpstreamWithSmartLevel = useCallback((nodeId: string) => {
+    if (!guardTraceHydration()) return
     trace.setConfig({ level: 'auto', lineageEdgeTypes })
     return trace.traceUpstream(nodeId)
-  }, [trace, lineageEdgeTypes])
+  }, [trace, lineageEdgeTypes, guardTraceHydration])
 
   const traceDownstreamWithSmartLevel = useCallback((nodeId: string) => {
+    if (!guardTraceHydration()) return
     trace.setConfig({ level: 'auto', lineageEdgeTypes })
     return trace.traceDownstream(nodeId)
-  }, [trace, lineageEdgeTypes])
+  }, [trace, lineageEdgeTypes, guardTraceHydration])
 
   const traceFullLineageWithSmartLevel = useCallback((nodeId: string) => {
+    if (!guardTraceHydration()) return
     trace.setConfig({ level: 'auto', lineageEdgeTypes })
     return trace.traceFullLineage(nodeId)
-  }, [trace, lineageEdgeTypes])
+  }, [trace, lineageEdgeTypes, guardTraceHydration])
 
   // Wire up the forward-declared refs (used by hooks that fire earlier in
   // render order, before granularityOptions is in scope).
@@ -1625,6 +1647,7 @@ export function ContextViewCanvas({
         canTrace={selectedNodeIds.length === 1 && !selectedNodeIds[0].startsWith('logical:')}
         onStartTrace={() => { if (selectedNodeIds[0]) startTraceWithSmartLevel(selectedNodeIds[0]) }}
         onExitTrace={exitTrace}
+        lineageReady={hydrationPhase === 'complete'}
         traceUpstreamDepth={trace.config.upstreamDepth}
         traceDownstreamDepth={trace.config.downstreamDepth}
         onSetTraceDepth={(dir, value) => {

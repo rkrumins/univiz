@@ -14,6 +14,7 @@ import { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useToast } from '@/components/ui/toast'
 import type { HierarchyNode } from './types'
 import type { LineageRenderMode } from '@/store/preferences'
 import { LineageDisplayPopover } from './LineageDisplayPopover'
@@ -47,6 +48,12 @@ export interface ContextViewHeaderProps {
   canTrace: boolean
   onStartTrace: () => void
   onExitTrace: () => void
+  /** True once the canvas finishes hydrating (entities + edges). When
+   *  false, Trace is unsafe to fire — the backend hasn't fully loaded the
+   *  lineage graph yet and the trace would return nothing. The header
+   *  surfaces this as a distinct "loading" button state with a toast on
+   *  attempted click. */
+  lineageReady: boolean
 
   // Trace depth — visible affordance under the Lineage controls so users
   // can see and adjust the current upstream/downstream hop count. Edits
@@ -95,6 +102,7 @@ export function ContextViewHeader({
   canTrace,
   onStartTrace,
   onExitTrace,
+  lineageReady,
   traceUpstreamDepth,
   traceDownstreamDepth,
   onSetTraceDepth,
@@ -113,6 +121,17 @@ export function ContextViewHeader({
   onRedo,
 }: ContextViewHeaderProps) {
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const { showToast } = useToast()
+
+  // Warn the user when they try to trace before the lineage data has
+  // finished hydrating. Keyed so rapid repeat clicks coalesce instead of
+  // stacking dozens of identical toasts.
+  const warnLineageNotReady = () => {
+    showToast(
+      'warning',
+      'Trace is unavailable until lineage finishes loading. Please wait a moment.',
+    )
+  }
 
   return (
     <div className="flex-shrink-0 bg-gradient-to-r from-canvas-elevated/90 via-canvas-elevated/95 to-canvas-elevated/90 backdrop-blur-xl border-b border-black/[0.08] dark:border-white/[0.06] px-6 py-3 relative">
@@ -201,7 +220,13 @@ export function ContextViewHeader({
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
 
-          {/* Trace toggle */}
+          {/* Trace toggle — three visual states:
+              1. `traceActive` → Exit Trace (rose, pulsing dot)
+              2. `!lineageReady` → "Loading lineage…" (indigo pulse + spinner).
+                 Stays clickable to fire a warning toast, so the affordance
+                 reads as "not yet" rather than "broken".
+              3. ready → Trace Lineage (existing indigo gradient). Hard-
+                 disabled when no entity selected. */}
           {traceActive ? (
             <button
               onClick={onExitTrace}
@@ -211,6 +236,25 @@ export function ContextViewHeader({
               <LucideIcons.X className="w-4 h-4" strokeWidth={2.4} />
               <span>Exit Trace</span>
               <span className="w-2 h-2 rounded-full bg-rose-500 dark:bg-rose-300 dark:shadow-lg dark:shadow-rose-300/60 animate-pulse" />
+            </button>
+          ) : !lineageReady ? (
+            <button
+              onClick={warnLineageNotReady}
+              aria-busy="true"
+              title="Lineage data is still loading — Trace will become available once it finishes"
+              className={cn(
+                "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all duration-300 cursor-wait",
+                "bg-gradient-to-r from-accent-lineage/12 to-purple-500/[0.06] text-accent-lineage/85 border border-accent-lineage/30",
+                "dark:from-accent-lineage/18 dark:to-purple-500/10 dark:text-accent-lineage dark:border-accent-lineage/25",
+                "shadow-sm shadow-accent-lineage/10",
+              )}
+            >
+              <LucideIcons.Loader2 className="w-4 h-4 animate-spin" strokeWidth={2.4} />
+              <span>Loading lineage…</span>
+              <span
+                className="w-2 h-2 rounded-full bg-accent-lineage dark:shadow-lg dark:shadow-accent-lineage/60 animate-pulse"
+                aria-hidden
+              />
             </button>
           ) : (
             <button
