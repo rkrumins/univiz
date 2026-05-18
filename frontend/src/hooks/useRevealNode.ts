@@ -39,7 +39,16 @@ export interface UseRevealNodeOptions {
   provider: GraphDataProvider
 }
 
-export function useRevealNode(opts: UseRevealNodeOptions): (nodeId: string) => Promise<void> {
+export interface RevealOptions {
+  /** Skip the canvas-specific focus call. Used by batch flows
+   *  (multi-select "Locate on canvas") where the caller will do a single
+   *  fitView/scroll at the end instead of N competing per-node scrolls. */
+  skipFocus?: boolean
+}
+
+export function useRevealNode(
+  opts: UseRevealNodeOptions,
+): (nodeId: string, revealOpts?: RevealOptions) => Promise<void> {
   // Stash latest opts in a ref so the returned reveal function has a stable
   // identity yet always sees the current parentMap / setters. Without this
   // the callback would re-create every time the parent canvas re-runs the
@@ -47,7 +56,7 @@ export function useRevealNode(opts: UseRevealNodeOptions): (nodeId: string) => P
   const optsRef = useRef(opts)
   optsRef.current = opts
 
-  return useCallback(async (nodeId: string) => {
+  return useCallback(async (nodeId: string, revealOpts?: RevealOptions) => {
     const { setExpandedNodes, loadChildren, focus, provider } = optsRef.current
 
     // ── 1. Make sure the target node exists in the store ──────────────────
@@ -120,6 +129,16 @@ export function useRevealNode(opts: UseRevealNodeOptions): (nodeId: string) => P
     await new Promise<void>((r) => requestAnimationFrame(() => r()))
 
     // ── 4. Hand off to the canvas-specific focus implementation ──────────
-    focus(nodeId)
+    // Skipped by batch flows ("Locate N on canvas") that prefer a single
+    // fitView/scrollTo at the end over N competing per-node scrolls.
+    if (!revealOpts?.skipFocus) {
+      focus(nodeId)
+    }
+
+    // ── 5. Pulse the target so the user sees where they landed ──────────
+    // Always fires — for single reveals it marks the freshly-centered
+    // node; for batch reveals it marks each one in place so users can
+    // spot them after the trailing fitView/scrollTo settles.
+    useCanvasStore.getState().pulseNode(nodeId)
   }, [])
 }

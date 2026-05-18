@@ -68,6 +68,14 @@ interface CanvasState {
   visibleEdges: LineageEdge[]
   setVisibleEdges: (edges: LineageEdge[]) => void
 
+  // One-shot pulse highlight — set after a "jump to node" reveal completes
+  // so the user sees a visible confirmation of where they landed. Auto-
+  // clears after the pulse animation duration (700ms). Read by node
+  // components (GenericNode, FlatTreeItem) to apply a `lineage-pulse`
+  // class.
+  pulseNodeId: string | null
+  pulseNode: (id: string) => void
+
   // Selection
   selectedNodeIds: string[]
   selectedEdgeIds: string[]
@@ -183,6 +191,17 @@ export const useCanvasStore = create<CanvasState>()(
       setEdges: (edges) => set({ edges, _edgeIndex: new Set(edges.map((e) => e.id)) }),
       visibleEdges: [],
       setVisibleEdges: (visibleEdges) => set({ visibleEdges }),
+      pulseNodeId: null,
+      pulseNode: (id) => {
+        set({ pulseNodeId: id })
+        // Auto-clear after the animation duration. The id-guard prevents a
+        // newer pulse from being prematurely cleared by an older timeout.
+        setTimeout(() => {
+          if (useCanvasStore.getState().pulseNodeId === id) {
+            set({ pulseNodeId: null })
+          }
+        }, 700)
+      },
       addNodes: (newNodes) => set((state) => {
         const existingIds = state._nodeIndex
         const uniqueNodes = newNodes.filter((n) => !existingIds.has(n.id))

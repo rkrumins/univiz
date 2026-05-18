@@ -45,6 +45,9 @@ interface EntityDrawerProps {
    *  pans/scrolls to the target. May return a promise; the drawer's
    *  neighbor row awaits it to show a loading spinner. */
   onFocusNode?: (nodeId: string) => void | Promise<void>
+  /** Reveal a set of neighbors at once and fit the canvas around them.
+   *  Used by the LineageNeighbors multi-select action bar. */
+  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
   /** External link URL builder */
   getExternalUrl?: (urn: string) => string | null
 }
@@ -60,6 +63,7 @@ export function EntityDrawer({
   onTraceDown,
   onFullTrace,
   onFocusNode,
+  onLocateMany,
   getExternalUrl,
 }: EntityDrawerProps) {
   const { drawerNodeId, nodes, updateNode, clearSelection, closeNodeDrawer } = useCanvasStore()
@@ -483,6 +487,7 @@ export function EntityDrawer({
               onCopyUrn={handleCopyUrn}
               copiedUrn={copiedUrn}
               onFocusNode={onFocusNode}
+              onLocateMany={onLocateMany}
             />
           )}
 
@@ -700,6 +705,7 @@ interface ViewModeContentProps {
   onCopyUrn: () => void
   copiedUrn: boolean
   onFocusNode?: (nodeId: string) => void | Promise<void>
+  onLocateMany?: (nodeIds: string[]) => void | Promise<void>
 }
 
 function ViewModeContent({
@@ -711,6 +717,7 @@ function ViewModeContent({
   onCopyUrn,
   copiedUrn,
   onFocusNode,
+  onLocateMany,
 }: ViewModeContentProps) {
   const hasAdditional = Object.keys(propertiesBag).length > 0
   return (
@@ -768,7 +775,11 @@ function ViewModeContent({
       )}
 
       {/* Lineage — real 1-hop neighbors with direction/entity/edge filters. */}
-      <LineageNeighbors nodeId={nodeId} onFocusNode={onFocusNode} />
+      <LineageNeighbors
+        nodeId={nodeId}
+        onFocusNode={onFocusNode}
+        onLocateMany={onLocateMany}
+      />
 
       {/* Recent Activity */}
       <Section title="Recent Activity" icon={LucideIcons.History} action={<ComingSoonChip />}>

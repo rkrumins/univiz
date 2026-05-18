@@ -610,6 +610,34 @@ export function GraphCanvas({ className }: { className?: string }) {
     },
   })
 
+  // Multi-locate: reveal a batch of targets in parallel, then fit the
+  // viewport so all of them are on screen. Each reveal runs the same
+  // expand-ancestors cascade as the single-click path; using
+  // Promise.allSettled lets a partial failure (e.g. one URN that
+  // backend lookup rejects) still surface the successful subset rather
+  // than abandoning the whole batch.
+  const locateManyOnCanvas = useCallback(
+    async (ids: string[]) => {
+      // skipFocus: true on each reveal so the canvas doesn't run N
+      // competing setCenter animations during the cascade. The trailing
+      // fitView below produces a single coherent pan/zoom.
+      await Promise.allSettled(
+        ids.map((id) => revealAndFocus(id, { skipFocus: true })),
+      )
+      if (!rfInstance) return
+      const targets = ids
+        .map((id) => layoutedNodesRef.current.find((n) => n.id === id))
+        .filter((n): n is LineageNode => !!n)
+      if (targets.length === 0) return
+      rfInstance.fitView({
+        nodes: targets.map((n) => ({ id: n.id })),
+        padding: 0.25,
+        duration: 500,
+      })
+    },
+    [rfInstance, revealAndFocus],
+  )
+
   const scheduleFitViewRef = useRef(scheduleFitView)
   scheduleFitViewRef.current = scheduleFitView
 
@@ -1462,6 +1490,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
         onFocusNode={revealAndFocus}
+        onLocateMany={locateManyOnCanvas}
       />
 
       {/* UX Components */}

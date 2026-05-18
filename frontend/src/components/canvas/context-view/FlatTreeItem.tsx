@@ -6,6 +6,7 @@ import { DynamicIcon } from '@/components/ui/DynamicIcon'
 import type { HierarchyNode } from './types'
 import type { ViewLayerConfig } from '@/types/schema'
 import { useSchemaStore } from '@/store/schema'
+import { useCanvasStore } from '@/store/canvas'
 import { generateIconFallback } from '@/lib/type-visuals'
 import { useStagedChangesStore, stagedChangeColor } from '@/store/stagedChangesStore'
 
@@ -88,6 +89,10 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
     node.children.forEach(collect)
     return s.changes.some(c => descendantIds.has(c.targetId) || (c.targetUrn ? descendantIds.has(c.targetUrn) : false))
   })
+
+  // Pulse-on-arrival from a jump-to-node reveal. Auto-clears via the
+  // store's setTimeout (~700ms).
+  const isPulsing = useCanvasStore((s) => s.pulseNodeId === node.id)
 
   const stagedColor = directChange ? stagedChangeColor(directChange.type) : (hasDescendantChange ? 'cascade' : null)
   const stagedSummary = directChange?.summary
@@ -221,7 +226,9 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
         // Staged-change row treatment — full-row color tint per change type
         stagedRowClass,
         // Dimmed when not in trace path or not connected to highlighted node
-        isDimmed && "opacity-40"
+        isDimmed && "opacity-40",
+        // Jump-to-node arrival pulse — one-shot ring animation
+        isPulsing && "lineage-pulse"
       )}
       style={{
         paddingLeft: 12 + indentWidth,
