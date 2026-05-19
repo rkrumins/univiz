@@ -1,0 +1,66 @@
+# Nginx + React SPA. nginx.conf reverse-proxies /api/* -> viz-service:8000
+# and /graph/* -> graph-service:8001 by Service DNS name, so the Ingress only
+# needs to route to this Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: dataviz
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      containers:
+        - name: frontend
+          # Build frontend/Dockerfile and push to Docker Hub.
+          image: docker.io/synodic/frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: dataviz
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

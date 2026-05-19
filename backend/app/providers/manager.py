@@ -32,6 +32,7 @@ from backend.common.adapters import (
     BreakerOpenError,
     BreakerState,
     CircuitBreakerProxy,
+    ProviderBusy,
     ProviderUnavailable,
 )
 from backend.common.interfaces.provider import GraphDataProvider
@@ -550,7 +551,11 @@ class ProviderManager:
                 sem.acquire(), timeout=_SEMAPHORE_ACQUIRE_BUDGET_S,
             )
         except asyncio.TimeoutError:
-            raise ProviderUnavailable(
+            # Semaphore saturated — this is a healthy provider under load,
+            # not a broken one. ProviderBusy maps to HTTP 429 with
+            # Retry-After so the client backs off and retries, instead of
+            # 503 which clients (rightly) treat as "provider is down".
+            raise ProviderBusy(
                 provider_name=f"{cache_key[0]}:{cache_key[1]}",
                 reason="provider concurrency saturated; shed load",
                 retry_after_seconds=1,

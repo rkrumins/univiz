@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, memo } from 'react'
 import { aggregationService, type AggregationJobResponse } from '@/services/aggregationService'
 import { Loader2, CheckCircle2, AlertCircle, Clock, PlayCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { POLLING_INTERVALS } from '@/config/polling'
+import { usePolling } from '@/hooks/usePolling'
 
 interface AggregationHistoryProps {
     dataSourceId: string;
@@ -24,16 +26,16 @@ export function AggregationHistory({ dataSourceId }: AggregationHistoryProps) {
 
     useEffect(() => { fetchJobs() }, [fetchJobs])
 
-    // Poll every 3s only while a job is active. Splitting the interval out of
-    // the fetch effect avoids the previous bug where ``jobs.length`` /
-    // ``jobs.some(...)`` in the dep array re-fired ``fetchJobs`` immediately
-    // after the first response and on every status transition.
+    // Active-only polling: only fires while a job is pending or running.
+    // ``usePolling`` adds jitter + Page Visibility pause for free, so 1000
+    // simultaneous viewers no longer fire in lockstep and backgrounded
+    // tabs stop paying any cost. ``fireOnMount: false`` because the
+    // initial fetch above already loaded the first snapshot.
     const isPolling = jobs.some(j => j.status === 'pending' || j.status === 'running')
-    useEffect(() => {
-        if (!isPolling) return
-        const id = setInterval(fetchJobs, 3000)
-        return () => clearInterval(id)
-    }, [isPolling, fetchJobs])
+    usePolling(fetchJobs, POLLING_INTERVALS.aggregationHistoryActive, {
+        enabled: isPolling,
+        fireOnMount: false,
+    })
 
     if (isLoading && jobs.length === 0) {
         return (

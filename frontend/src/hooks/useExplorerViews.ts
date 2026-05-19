@@ -17,7 +17,7 @@
  */
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import {
-  listViews, listPopularViews, favouriteView, unfavouriteView,
+  listViews, favouriteView, unfavouriteView,
   type View, type ViewListParams,
 } from '@/services/viewApiService'
 
@@ -233,38 +233,44 @@ export function useExplorerViews(filters: ExplorerFilters): UseExplorerViewsResu
   // ─── Initial fetch + filter-change reload ───────────────────────────
 
   useEffect(() => {
-    let cancelled = false
+    // Native AbortController: the cleanup aborts the in-flight HTTP
+    // request itself (rapid filter changes / unmount no longer waste
+    // bandwidth on responses we'll discard). Replaces the previous
+    // ``cancelled`` flag idiom which only suppressed setState.
+    const controller = new AbortController()
 
     const fetchInitial = async () => {
       setIsLoading(true)
       setError(null)
 
       try {
-        const [envelope, popular] = await Promise.all([
-          listViews(buildParams(0)),
-          listPopularViews(10),
-        ])
+        // Single request: ``?include=popular`` makes the server fold the
+        // trending strip into the same response, killing the second
+        // round-trip the page used to make.
+        const envelope = await listViews(
+          { ...buildParams(0), include: ['popular'], popularLimit: 10 },
+          controller.signal,
+        )
 
-        if (!cancelled) {
-          setAllViews(envelope.items)
-          setPopularViews(popular)
-          setTotal(envelope.total)
-          setNextOffset(envelope.hasMore ? envelope.nextOffset : null)
-        }
+        setAllViews(envelope.items)
+        setPopularViews(envelope.popular ?? [])
+        setTotal(envelope.total)
+        setNextOffset(envelope.hasMore ? envelope.nextOffset : null)
       } catch (err) {
-        if (!cancelled) {
-          console.error('[useExplorerViews] Failed to load views:', err)
-          setError(err instanceof Error ? err.message : 'Failed to load views')
-        }
+        // AbortError fires when the controller is aborted — that's the
+        // happy-path cleanup, not a real failure, so don't surface it.
+        if ((err as DOMException)?.name === 'AbortError') return
+        console.error('[useExplorerViews] Failed to load views:', err)
+        setError(err instanceof Error ? err.message : 'Failed to load views')
       } finally {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setIsLoading(false)
         }
       }
     }
 
     fetchInitial()
-    return () => { cancelled = true }
+    return () => { controller.abort() }
   }, [buildParams, refetchKey])
 
   // ─── Load next page (append) ───────────────────────────────────────

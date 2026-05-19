@@ -66,7 +66,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
   const schema = useSchemaStore((s) => s.schema)
   const containmentEdgeTypes = useViewContainmentEdgeTypes()
   const lineageEdgeTypes = useViewLineageEdgeTypes()
-  const { loadChildren, loadingNodes, isLoading: isLoadingChildren } = useGraphHydration()
+  const { loadChildren, cancelChildLoad, loadingNodes, isLoading: isLoadingChildren } = useGraphHydration()
   useLoadingToast('hier-children', isLoadingChildren, 'Expanding hierarchy')
   const relationshipTypes = useViewRelationshipTypes()
   // Search state
@@ -74,6 +74,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
   const [searchResults, setSearchResults] = useState<string[]>([])
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const pendingLoadRef = useRef<Set<string>>(new Set())
 
   // Edit Mode State (shared across canvases)
   const [isPaletteOpen, setPaletteOpen] = useState(false)
@@ -115,10 +116,27 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     return set
   }, [trace.isTracing, trace.visibleTraceNodes, parentMap])
 
+  // ESC-driven trace exit. Mirrors ContextViewCanvas: purges trace-merged
+  // edges from the canvas store, clears trace state, and reverts ancestor-
+  // chain auto-expansion. Without this, ESC fell through to selection-clear
+  // and the trace dock stayed open.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) {
+      useCanvasStore.getState().removeEdges(idsToRemove)
+    }
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace])
+
   // UX-first Canvas Interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => trace.startTrace(nodeId),
     onNodeCreated: (nodeId) => selectNode(nodeId),
+    onExitTrace: exitTrace,
   })
 
   // Keyboard shortcuts
@@ -224,15 +242,23 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     // Select and scroll to node
     selectNode(nodeId)
 
-    // Scroll to node after expansion
+    // Scroll to node after expansion, then pulse so the user sees where
+    // they landed (matches the jump-to-node feedback in other canvases).
     setTimeout(() => {
       const element = document.getElementById(`hierarchy-node-${nodeId}`)
       element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      useCanvasStore.getState().pulseNode(nodeId)
     }, 100)
   }, [flatNodes, selectNode])
 
   // Toggle node expansion with lazy loading
   const toggleNode = useCallback(async (nodeId: string) => {
+    // A child load for this node is already in flight. Ignore repeat clicks
+    // until it settles: otherwise an impatient second click reads the node
+    // as expanded, collapses it, and cancels the in-flight fetch — forcing a
+    // third click to actually load. Collapse works once the load completes.
+    if (pendingLoadRef.current.has(nodeId)) return
+
     // 1. Determine local expansion state
     const isCurrentlyExpanded = expandedNodes.has(nodeId)
 
@@ -248,12 +274,21 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
     })
 
 
-    // If we are collapsing, stop here
-    if (isCurrentlyExpanded) return
+    // If we are collapsing, abort any pending/in-flight load for this node
+    // so a slow response doesn't repopulate a collapsed subtree.
+    if (isCurrentlyExpanded) {
+      cancelChildLoad(nodeId)
+      return
+    }
 
     // 2. Load Children using Generic Hook
-    await loadChildren(nodeId)
-  }, [loadChildren, expandedNodes])
+    pendingLoadRef.current.add(nodeId)
+    try {
+      await loadChildren(nodeId)
+    } finally {
+      pendingLoadRef.current.delete(nodeId)
+    }
+  }, [loadChildren, cancelChildLoad, expandedNodes])
 
   // Expand/collapse all
   const expandAll = useCallback(() => {
@@ -464,6 +499,7 @@ export function HierarchyCanvas({ className }: HierarchyCanvasProps) {
         onTraceUp={(nodeId) => trace.traceUpstream(nodeId)}
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
+        onFocusNode={expandToNode}
       />
 
       {/* === UX-FIRST INTERACTION COMPONENTS (Unified with LineageCanvas) === */}

@@ -1,0 +1,27 @@
+# Raw manifests for GKE + ingress-nginx.
+#
+#   kubectl apply -k deploy/k8s
+#
+# Prereqs (NOT managed here):
+#   1. ingress-nginx controller installed in the cluster.
+#   2. External Postgres (Cloud SQL), Redis (Memorystore), FalkorDB reachable.
+#   3. Secret created (see secret.example.yaml) — intentionally excluded here
+#      so real credentials never get committed/applied by mistake.
+#   4. Images built from the Dockerfiles and pushed to Docker Hub.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: dataviz
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - db-init-sql-configmap.yaml
+  - db-init-job.yaml
+  - aggregation-controlplane.yaml
+  - viz-service.yaml
+  - graph-service.yaml
+  - aggregation-worker.yaml
+  - stats-service.yaml
+  - frontend.yaml
+  - ingress.yaml

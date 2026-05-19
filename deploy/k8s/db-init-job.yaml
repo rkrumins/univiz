@@ -1,0 +1,54 @@
+# One-shot DB bootstrap: applies roles + schemas to the external Postgres.
+# Idempotent — safe to re-run. The 'aggregation' schema MUST exist before
+# aggregation-controlplane runs Alembic.
+#
+# Needs an ADMIN libpq DSN (NOT the asyncpg app URL). 01-roles.sql requires a
+# privileged role to CREATE ROLE/DATABASE; on Cloud SQL this is typically the
+# 'postgres' user (cloudsqlsuperuser). Provide it in the dataviz-secrets
+# Secret under key DB_INIT_DSN, e.g.:
+#   kubectl -n dataviz patch secret dataviz-secrets --type merge -p \
+#     '{"stringData":{"DB_INIT_DSN":"postgresql://postgres:ADMINPASS@PG_HOST:5432/postgres"}}'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dataviz-db-init
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/part-of: dataviz
+    app.kubernetes.io/component: db-init
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: dataviz
+        app.kubernetes.io/component: db-init
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: db-init
+          image: postgres:16.4-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              echo "Applying 01-roles.sql ..."
+              psql -v ON_ERROR_STOP=1 -d "$DB_INIT_DSN" -f /sql/01-roles.sql
+              echo "Applying 02-schemas.sql ..."
+              psql -v ON_ERROR_STOP=1 -d "$DB_INIT_DSN" -f /sql/02-schemas.sql
+              echo "DB init complete."
+          env:
+            - name: DB_INIT_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: dataviz-secrets
+                  key: DB_INIT_DSN
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+      volumes:
+        - name: sql
+          configMap:
+            name: dataviz-db-init-sql

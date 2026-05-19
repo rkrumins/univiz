@@ -23,6 +23,13 @@ from backend.app.models.graph import (
 )
 from backend.common.interfaces.provider import ProviderConfigurationError
 from backend.app.services.context_engine import ContextEngine
+from backend.app.services.fair_share import get_fair_share
+from backend.app.services.graph_cache import (
+    CacheScope,
+    ENDPOINT_AGGREGATED,
+    ENDPOINT_CHILDREN,
+    get_graph_cache,
+)
 from backend.app.services.stats_cache import (
     CacheMiss, SYNTHETIC_SCHEMA_MISSING_FIELDS,
     build_computing_envelope, build_envelope, build_error_envelope, build_meta,
@@ -86,6 +93,49 @@ async def get_context_engine(
 # ------------------------------------------------------------------ #
 # Helper: resolve data source ID from workspace (DB-only, no provider)#
 # ------------------------------------------------------------------ #
+
+def _cache_scope(engine: ContextEngine) -> Optional[CacheScope]:
+    """Derive the (workspace, data source) scope for cache keys.
+
+    Returns None when the engine has no workspace context (legacy
+    connection-scoped path). Connection-scoped reads bypass the cache —
+    they're vanishingly rare in production and not worth the extra key
+    plumbing.
+    """
+    ws = getattr(engine, "_workspace_id", None)
+    if not ws:
+        return None
+    ds = getattr(engine, "_data_source_id", None) or ""
+    return CacheScope(workspace_id=ws, data_source_id=ds)
+
+
+async def _invalidate_cache(engine: ContextEngine) -> None:
+    """Bump the generation counter for the engine's scope, invalidating
+    every cached entry under (workspace, data_source).
+
+    Safe to call after any write: missing scope is a no-op, Redis errors
+    are swallowed by the cache layer. Never raises — invalidation
+    failures must never fail the user's write."""
+    scope = _cache_scope(engine)
+    if scope is None:
+        return
+    await get_graph_cache().bump_generation(scope)
+
+
+async def _enforce_fair_share(engine: ContextEngine, endpoint: str) -> None:
+    """Charge one token against the workspace's per-endpoint bucket.
+
+    Raises :class:`ProviderBusy` (mapped to 429+Retry-After in main.py)
+    when the bucket is empty. No-op when the fair-share feature flag is
+    off OR the engine has no workspace context."""
+    bucket = get_fair_share()
+    if not bucket.is_enabled():
+        return
+    ws = getattr(engine, "_workspace_id", None)
+    if not ws:
+        return
+    await bucket.enforce(endpoint, ws)
+
 
 async def _resolve_data_source_id(
     session: AsyncSession,
@@ -436,11 +486,36 @@ async def get_children_with_edges(
     engine: ContextEngine = Depends(get_context_engine),
 ):
     """Get children with containment and lineage edges in a single round-trip."""
-    return await engine.get_children_with_edges(
-        urn, edge_types=edge_types, lineage_edge_types=lineage_edge_types,
-        search_query=search_query, limit=limit, offset=offset,
-        include_lineage_edges=include_lineage_edges,
-        sort_property=sort_property, cursor=cursor,
+    await _enforce_fair_share(engine, ENDPOINT_CHILDREN)
+
+    async def compute() -> ChildrenWithEdgesResult:
+        return await engine.get_children_with_edges(
+            urn, edge_types=edge_types, lineage_edge_types=lineage_edge_types,
+            search_query=search_query, limit=limit, offset=offset,
+            include_lineage_edges=include_lineage_edges,
+            sort_property=sort_property, cursor=cursor,
+        )
+
+    scope = _cache_scope(engine)
+    if scope is None:
+        return await compute()
+
+    return await get_graph_cache().get_or_compute(
+        scope=scope,
+        endpoint=ENDPOINT_CHILDREN,
+        params={
+            "urn": urn,
+            "edgeTypes": sorted(edge_types) if edge_types else None,
+            "lineageEdgeTypes": sorted(lineage_edge_types) if lineage_edge_types else None,
+            "searchQuery": search_query,
+            "sortProperty": sort_property,
+            "limit": limit,
+            "offset": offset,
+            "cursor": cursor,
+            "includeLineageEdges": include_lineage_edges,
+        },
+        compute=compute,
+        model_cls=ChildrenWithEdgesResult,
     )
 
 
@@ -686,6 +761,7 @@ async def save_graph(
     success = await engine.save_custom_graph(request.nodes, request.edges)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to save graph")
+    await _invalidate_cache(engine)
     return {"status": "success", "message": "Graph saved successfully"}
 
 
@@ -1020,7 +1096,32 @@ async def get_aggregated_edges(
     Returns summarized edge information showing lineage connections
     at a higher granularity level (e.g., between datasets instead of columns).
     """
-    return await engine.get_aggregated_edges(request)
+    await _enforce_fair_share(engine, ENDPOINT_AGGREGATED)
+
+    async def compute() -> AggregatedEdgeResult:
+        return await engine.get_aggregated_edges(request)
+
+    scope = _cache_scope(engine)
+    if scope is None:
+        return await compute()
+
+    # Sort URN lists so two semantically identical requests with differing
+    # input order map to the same cache key — the frontend's chunked
+    # fan-out frequently produces equivalent batches in different orders.
+    return await get_graph_cache().get_or_compute(
+        scope=scope,
+        endpoint=ENDPOINT_AGGREGATED,
+        params={
+            "sourceUrns": sorted(request.source_urns or []),
+            "targetUrns": sorted(request.target_urns or []) if request.target_urns else None,
+            "granularity": request.granularity,
+            "includeEdgeTypes": sorted(request.include_edge_types or []) if request.include_edge_types else None,
+            "lineageEdgeTypes": sorted(request.lineage_edge_types or []) if request.lineage_edge_types else None,
+            "containmentEdgeTypes": sorted(request.containment_edge_types or []) if request.containment_edge_types else None,
+        },
+        compute=compute,
+        model_cls=AggregatedEdgeResult,
+    )
 
 
 @router.post("/edges/aggregated/materialize")
@@ -1059,7 +1160,9 @@ async def create_node(
     If parentUrn is provided, automatically creates a CONTAINS edge
     based on ontology rules.
     """
-    return await engine.create_node(request)
+    result = await engine.create_node(request)
+    await _invalidate_cache(engine)
+    return result
 
 
 # ─── Edge CRUD ────────────────────────────────────────────────────────────────
@@ -1076,7 +1179,9 @@ async def create_edge(
     Validates source/target entity types against the active ontology.
     If idempotencyKey is supplied and a matching edge already exists it is returned unchanged.
     """
-    return await engine.create_edge(request)
+    result = await engine.create_edge(request)
+    await _invalidate_cache(engine)
+    return result
 
 
 @router.patch("/edges/{edge_id}", response_model=EdgeMutationResult, response_model_by_alias=True)
@@ -1087,7 +1192,9 @@ async def update_edge(
     _: object = Depends(require_ws_manage),
 ):
     """Update mutable properties of an existing edge. Edge type is immutable."""
-    return await engine.update_edge(edge_id, request)
+    result = await engine.update_edge(edge_id, request)
+    await _invalidate_cache(engine)
+    return result
 
 
 @router.delete("/edges/{edge_id}", status_code=204)
@@ -1100,6 +1207,7 @@ async def delete_edge(
     success = await engine.delete_edge(edge_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"Edge '{edge_id}' not found")
+    await _invalidate_cache(engine)
 
 
 # ─── Preflight / guided-create APIs ─────────────────────────────────────────

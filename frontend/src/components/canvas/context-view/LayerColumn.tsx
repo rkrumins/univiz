@@ -20,6 +20,7 @@ import type { ViewLayerConfig } from '@/types/schema'
 import type { HierarchyNode, FlatTreeNode } from './types'
 import { FlatTreeItem } from './FlatTreeItem'
 import { SearchBoxItem } from './SearchBoxItem'
+import { GhostFlatTreeItem, GHOST_COUNT_PER_LAYER } from './GhostFlatTreeItem'
 
 interface LayerColumnProps {
   layer: ViewLayerConfig
@@ -49,6 +50,10 @@ interface LayerColumnProps {
   failedNodes?: Set<string>
   onScroll?: () => void
   onAssignToLayer?: (entityId: string) => void
+  /** True during initial canvas hydration when this layer has no nodes yet.
+   * Shows the ghost-card stack instead of the "No entities yet" empty state.
+   * See ContextViewCanvas where this is computed from useCanvasStore.hydrationPhase. */
+  isHydratingInitial?: boolean
 }
 
 // Stable key for each flat tree item (used by virtualizer for measurement cache stability)
@@ -88,7 +93,24 @@ export const LayerColumn = React.memo(function LayerColumn({
   failedNodes,
   onScroll,
   onAssignToLayer,
+  isHydratingInitial = false,
 }: LayerColumnProps) {
+  // A layer that has zero entity types, rules, instance assignments, AND
+  // logical nodes is configured to receive nothing — showing ghost cards
+  // there reads as "still loading" when the truth is "nothing was ever
+  // going to land here". Detect this upfront so the empty state appears
+  // immediately rather than after hydration completes.
+  const layerHasConfiguredSources = useMemo(() => {
+    const hasEntityTypes = (layer.entityTypes?.length ?? 0) > 0
+    const hasRules = (layer.rules?.length ?? 0) > 0
+    const hasAssignments = (layer.entityAssignments?.length ?? 0) > 0
+    const hasLogicalNodes = (layer.logicalNodes?.length ?? 0) > 0
+    const acceptsUnassigned = layer.showUnassigned === true
+    return hasEntityTypes || hasRules || hasAssignments || hasLogicalNodes || acceptsUnassigned
+  }, [layer])
+
+  const shouldShowGhosts = isHydratingInitial && layerHasConfiguredSources
+
   const [localFocusId, setLocalFocusId] = useState<string | null>(null)
   const [breadcrumb, setBreadcrumb] = useState<HierarchyNode[]>([])
   const [isCollapsed, setIsCollapsed] = useState(false)
@@ -494,7 +516,12 @@ export const LayerColumn = React.memo(function LayerColumn({
     <motion.div
       data-layer-id={layer.id}
       className={cn(
-        "flex flex-col relative group/column transition-all duration-300",
+        // pointer-events-auto re-establishes interactivity for all descendants.
+        // The parent columns wrapper is pointer-events-none (so inter-column
+        // gaps fall through to the edge hit-test layer); pointer-events is an
+        // inherited CSS property, so without this explicit `auto` chevrons,
+        // headers, and node cards would inherit `none` and become inert.
+        "flex flex-col relative group/column transition-all duration-300 pointer-events-auto",
         isCollapsed ? "min-w-[60px] max-w-[60px]" : "flex-1 min-w-[320px] max-w-[480px]"
       )}
       layout
@@ -624,14 +651,34 @@ export const LayerColumn = React.memo(function LayerColumn({
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {/* Entity count pill */}
-                <div className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/[0.06] dark:bg-white/[0.04] backdrop-blur-sm border border-white/[0.08]">
-                  <span className="text-[10px] font-semibold text-ink" style={{ color: layer.color }}>
-                    {visibleCount}
-                  </span>
-                  <span className="text-[9px] text-ink-muted/60">/</span>
-                  <span className="text-[10px] text-ink-muted/60">{totalCount}</span>
-                </div>
+                {/* Loading pill — replaces the entity-count pill while this
+                    layer is hydrating with no entities yet. Premium spinner +
+                    layer-tinted background makes the loading state legible at
+                    a glance from anywhere on the canvas. */}
+                {shouldShowGhosts && flatTree.length === 0 ? (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.92 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.92 }}
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-full backdrop-blur-sm border"
+                    style={{
+                      backgroundColor: `${layer.color}1a`,
+                      borderColor: `${layer.color}40`,
+                      color: layer.color,
+                    }}
+                  >
+                    <LucideIcons.Loader2 className="w-3 h-3 animate-spin" />
+                    <span className="text-[10px] font-semibold tracking-wide">Loading…</span>
+                  </motion.div>
+                ) : (
+                  <div className="flex items-center gap-1 px-2 py-1 rounded-full bg-white/[0.06] dark:bg-white/[0.04] backdrop-blur-sm border border-white/[0.08]">
+                    <span className="text-[10px] font-semibold text-ink" style={{ color: layer.color }}>
+                      {visibleCount}
+                    </span>
+                    <span className="text-[9px] text-ink-muted/60">/</span>
+                    <span className="text-[10px] text-ink-muted/60">{totalCount}</span>
+                  </div>
+                )}
                 {onAddToLayer && (
                   <button
                     onClick={(e) => {
@@ -756,23 +803,63 @@ export const LayerColumn = React.memo(function LayerColumn({
           <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-b from-canvas/80 to-transparent pointer-events-none z-10" />
 
           {flatTree.length === 0 ? (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col items-center justify-center py-16 px-4"
-            >
-              <div
-                className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4"
-                style={{ backgroundColor: `${layer.color}10` }}
-              >
-                <LucideIcons.FolderOpen
-                  className="w-8 h-8"
-                  style={{ color: `${layer.color}40` }}
-                />
-              </div>
-              <p className="text-sm font-medium text-ink-muted/60">No entities yet</p>
-              <p className="text-xs text-ink-muted/40 mt-1">Click + to add entities</p>
-            </motion.div>
+            <AnimatePresence mode="wait" initial={false}>
+              {shouldShowGhosts ? (
+                <motion.div
+                  key="ghost-stack"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.18, ease: 'easeOut' }}
+                  className="py-2 px-1 flex flex-col"
+                >
+                  {/* Clear caption — removes any ambiguity about whether the
+                      ghost cards mean "loading" or "empty layer". */}
+                  <div
+                    className="flex items-center gap-2 px-3 py-2 mx-1 mb-1 rounded-lg backdrop-blur-sm border"
+                    style={{
+                      backgroundColor: `${layer.color}10`,
+                      borderColor: `${layer.color}25`,
+                    }}
+                  >
+                    <LucideIcons.Loader2
+                      className="w-3.5 h-3.5 animate-spin flex-shrink-0"
+                      style={{ color: layer.color }}
+                    />
+                    <span
+                      className="text-[11px] font-medium tracking-wide"
+                      style={{ color: layer.color }}
+                    >
+                      Loading {layer.name} entities…
+                    </span>
+                  </div>
+                  {Array.from({ length: GHOST_COUNT_PER_LAYER }).map((_, i) => (
+                    <GhostFlatTreeItem key={`ghost-${i}`} index={i} layer={layer} depth={0} />
+                  ))}
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="empty-state"
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.18, ease: 'easeOut' }}
+                  className="flex flex-col items-center justify-center py-16 px-4"
+                >
+                  <div
+                    className="w-16 h-16 rounded-2xl flex items-center justify-center mb-4"
+                    style={{ backgroundColor: `${layer.color}10` }}
+                  >
+                    <LucideIcons.FolderOpen
+                      className="w-8 h-8"
+                      style={{ color: `${layer.color}40` }}
+                    />
+                  </div>
+                  <p className="text-sm font-medium text-ink-muted/60">No entities yet</p>
+                  <p className="text-xs text-ink-muted/40 mt-1">Click + to add entities</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
           ) : (
             <div
               className="py-2 px-1 w-full"
@@ -835,9 +922,10 @@ export const LayerColumn = React.memo(function LayerColumn({
                   )
                 }
 
-                // Skeleton loading placeholder
+                // Skeleton loading placeholder — uses the shared GhostFlatTreeItem
+                // so initial-hydration ghosts and child-expansion skeletons share
+                // one visual language.
                 if (item.isSkeleton) {
-                  const indentWidth = item.depth * 16
                   const skeletonAnimStyle: React.CSSProperties | undefined = isNew ? {
                     animation: `flatTreeSkeletonGrow 0.22s cubic-bezier(0.25, 0.46, 0.45, 0.94) backwards`,
                     animationDelay: `${(item.skeletonIndex ?? 0) * 0.06}s`,
@@ -851,27 +939,12 @@ export const LayerColumn = React.memo(function LayerColumn({
                       ref={virtualizer.measureElement}
                       style={virtualStyle}
                     >
-                      <div style={skeletonAnimStyle} className="mx-1 rounded-xl overflow-hidden">
-                        <div style={{ paddingLeft: 12 + indentWidth }} className="flex items-center gap-2 w-full py-2">
-                          {/* Skeleton chevron area */}
-                          <div className="w-6 h-6 flex-shrink-0" />
-                          {/* Skeleton icon */}
-                          <div
-                            className="w-7 h-7 rounded-xl flex-shrink-0 animate-pulse"
-                            style={{ backgroundColor: `${layer.color}15` }}
-                          />
-                          {/* Skeleton text lines */}
-                          <div className="flex-1 min-w-0 flex flex-col gap-1.5">
-                            <div
-                              className="h-3.5 rounded-lg animate-pulse"
-                              style={{ backgroundColor: `${layer.color}12`, width: `${55 + ((item.skeletonIndex ?? 0) * 13) % 35}%` }}
-                            />
-                            <div
-                              className="h-2.5 rounded-md animate-pulse w-16"
-                              style={{ backgroundColor: `${layer.color}08` }}
-                            />
-                          </div>
-                        </div>
+                      <div style={skeletonAnimStyle}>
+                        <GhostFlatTreeItem
+                          index={item.skeletonIndex ?? 0}
+                          layer={layer}
+                          depth={Math.max(1, item.depth)}
+                        />
                       </div>
                     </div>
                   )

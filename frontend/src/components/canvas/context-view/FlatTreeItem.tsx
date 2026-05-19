@@ -6,6 +6,7 @@ import { DynamicIcon } from '@/components/ui/DynamicIcon'
 import type { HierarchyNode } from './types'
 import type { ViewLayerConfig } from '@/types/schema'
 import { useSchemaStore } from '@/store/schema'
+import { useCanvasStore } from '@/store/canvas'
 import { generateIconFallback } from '@/lib/type-visuals'
 import { useStagedChangesStore, stagedChangeColor } from '@/store/stagedChangesStore'
 
@@ -88,6 +89,11 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
     node.children.forEach(collect)
     return s.changes.some(c => descendantIds.has(c.targetId) || (c.targetUrn ? descendantIds.has(c.targetUrn) : false))
   })
+
+  // Pulse-on-arrival from a jump-to-node reveal. Backed by a Set so
+  // multi-locate flows can pulse many nodes concurrently. Auto-clears
+  // per-id via the store's setTimeout (~900ms).
+  const isPulsing = useCanvasStore((s) => s.pulseNodeIds.has(node.id))
 
   const stagedColor = directChange ? stagedChangeColor(directChange.type) : (hasDescendantChange ? 'cascade' : null)
   const stagedSummary = directChange?.summary
@@ -191,9 +197,17 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
       data-canvas-interactive
       data-trace-focus={isFocusNode ? 'true' : 'false'}
       className={cn(
-        "flex items-center gap-2 mx-1 rounded-xl cursor-pointer transition-all duration-200 group/item relative",
+        "flex items-center gap-2 mx-1 rounded-xl cursor-pointer transition-all duration-200 group/item relative z-[2]",
         heightClass,
         paddingClass,
+        // Subtle backdrop-blur on the card body — visually invisible
+        // (matches the glassy translucent design) but blurs anything
+        // painted behind so cross-column edges don't read as solid lines
+        // bleeding through the node. Same technique the layer header uses
+        // (`backdrop-blur-xl` at LayerColumn.tsx:508). The bg tint is kept
+        // near-zero so the airy feel of the original cards is preserved;
+        // hover / selected gradients below paint over this without conflict.
+        "bg-canvas-elevated/10 backdrop-blur-sm",
         // Base hover state with gradient
         "hover:bg-gradient-to-r hover:from-white/[0.06] hover:to-transparent",
         // Selected state with accent glow
@@ -213,7 +227,9 @@ export const FlatTreeItem = React.memo(function FlatTreeItem({
         // Staged-change row treatment — full-row color tint per change type
         stagedRowClass,
         // Dimmed when not in trace path or not connected to highlighted node
-        isDimmed && "opacity-40"
+        isDimmed && "opacity-40",
+        // Jump-to-node arrival pulse — one-shot ring animation
+        isPulsing && "lineage-pulse"
       )}
       style={{
         paddingLeft: 12 + indentWidth,

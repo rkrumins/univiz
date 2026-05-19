@@ -29,6 +29,7 @@ from backend.app.auth.dependencies import (
     rbac_flag,
     requires,
 )
+from backend.app.common.single_flight import normalised_principal, read_views_sf
 from backend.app.db.engine import get_db_session
 from backend.app.db.models import ViewORM
 from backend.app.db.repositories import view_repo
@@ -153,9 +154,22 @@ async def list_popular_views(
     user=Depends(get_optional_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """List the most-favourited enterprise-visible views."""
-    return await view_repo.list_popular_views(
-        session, limit=limit, user_id=_user_id(user),
+    """List the most-favourited enterprise-visible views.
+
+    Single-flight wrapped: when N concurrent callers hit this with the
+    same (principal, limit) pair the leader runs the query and the
+    others receive the same result. Most-favourited views are a
+    homepage-style render that frequently sees burst traffic from
+    every Explorer tab opening at once; this kills the thundering
+    herd against the views + favourites tables.
+    """
+    principal = normalised_principal(_user_id(user))
+    key = ("popular", principal, limit)
+    return await read_views_sf.run(
+        key,
+        lambda: view_repo.list_popular_views(
+            session, limit=limit, user_id=_user_id(user),
+        ),
     )
 
 
@@ -169,8 +183,15 @@ async def get_view_facets(
     dropdowns from the authoritative DB-wide set of values rather than
     deriving them from the currently-loaded page (which would miss
     tags/creators beyond the first page at scale).
+
+    Single-flight wrapped: facets is a global aggregation read with a
+    fixed key. Under any concurrency, exactly one worker runs the
+    aggregate and the rest piggy-back on its result.
     """
-    return await view_repo.get_view_facets(session)
+    return await read_views_sf.run(
+        ("facets",),
+        lambda: view_repo.get_view_facets(session),
+    )
 
 
 @router.get("/stats", response_model=ViewCatalogStats)
@@ -244,6 +265,21 @@ async def list_views(
     include_deleted: bool = Query(False, alias="includeDeleted"),
     deleted_only: bool = Query(False, alias="deletedOnly"),
     attention_only: bool = Query(False, alias="attentionOnly"),
+    include: List[str] = Query(
+        default_factory=list,
+        description=(
+            "Optional embedded resources. ``include=popular`` folds the "
+            "Explorer's trending strip into this response (under "
+            "``popular``) so the page only makes one request instead of "
+            "two."
+        ),
+    ),
+    popular_limit: int = Query(
+        10,
+        le=100,
+        alias="popularLimit",
+        description="Cap on the embedded popular list when include=popular.",
+    ),
     user=Depends(get_optional_user),
     claims: PermissionClaims = Depends(get_permission_claims),
     session: AsyncSession = Depends(get_db_session),
@@ -290,6 +326,16 @@ async def list_views(
         deleted_only=deleted_only,
         attention_only=attention_only,
     )
+
+    # Optional ?include=popular: fold the trending strip into the same
+    # response so the Explorer only makes one round-trip instead of two.
+    # ``list_popular_views`` enforces its own visibility scoping (private
+    # views only surface to their creator), so it does not need to pass
+    # through the RBAC post-filter below — popular IS the visible set.
+    if "popular" in include:
+        response.popular = await view_repo.list_popular_views(
+            session, limit=popular_limit, user_id=_user_id(user),
+        )
 
     if not rbac_flag("RBAC_ENFORCE_VIEWS"):
         return response

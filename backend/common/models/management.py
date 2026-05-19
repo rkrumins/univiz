@@ -730,11 +730,16 @@ class ViewListResponse(BaseModel):
     guessing from ``len(items) >= limit``. ``next_offset`` is the
     offset to pass for the next page, or None when ``has_more`` is
     False.
+
+    ``popular`` is populated only when the caller passes
+    ``?include=popular`` so the Explorer can grab its list + trending
+    strip in one round-trip. Absent (None) otherwise.
     """
     items: List[ViewResponse]
     total: int
     has_more: bool = Field(alias="hasMore")
     next_offset: Optional[int] = Field(None, alias="nextOffset")
+    popular: Optional[List[ViewResponse]] = None
 
     class Config:
         populate_by_name = True

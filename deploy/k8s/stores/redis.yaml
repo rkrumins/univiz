@@ -1,0 +1,82 @@
+# In-cluster Redis (message broker) as a StatefulSet.
+# OPT-IN alternative to managed Memorystore. When used, set
+# REDIS_URL=redis://redis:6379/0 in the Secret.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: dataviz
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: dataviz
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # AOF for stream durability; noeviction prevents silent msg loss.
+          args:
+            - "--appendonly"
+            - "yes"
+            - "--maxmemory"
+            - "256mb"
+            - "--maxmemory-policy"
+            - "noeviction"
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

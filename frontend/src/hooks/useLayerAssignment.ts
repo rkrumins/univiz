@@ -39,6 +39,9 @@ export interface UseLayerAssignmentResult {
   displayFlat: HierarchyNode[]
   displayMap: Map<string, HierarchyNode>
   urnToIdMap: Map<string, string>
+  /** Final effective layer per node id — exposed for layer-ordinal lookups
+   *  by the canvas (e.g. left/right neighbor sort for trace pinning). */
+  nodeLayerMap: Map<string, string>
 }
 
 // ============================================
@@ -188,6 +191,12 @@ export function useLayerAssignment({
 
         // 5. inheritance (for non-containment relationships, if any)
         if (!myLayerId && inheritedLayerId) myLayerId = inheritedLayerId
+
+        // No fallback beyond inheritance. Nodes that match nothing in the
+        // chain stay unassigned and drop out of `nodesByLayer` — this is
+        // what keeps trace results from pulling in entities (e.g. layer
+        // nodes with no view-level assignment) into a focus column where
+        // they don't actually belong.
       }
 
       if (myLayerId === '__UNASSIGNED__') myLayerId = undefined
@@ -404,5 +413,21 @@ export function useLayerAssignment({
     return map
   }, [displayFlat])
 
-  return { layerRules, nodesByLayer, displayFlat, displayMap, urnToIdMap }
+  // Re-derive nodeLayerMap from the rendered hierarchy: every HierarchyNode
+  // we ended up emitting under a layer must have had a layer assignment, so
+  // we recover the map without changing the algorithm's return shape.
+  const nodeLayerMap = useMemo(() => {
+    const map = new Map<string, string>()
+    nodesByLayer.forEach((layerNodes, layerId) => {
+      const stack = [...layerNodes]
+      while (stack.length > 0) {
+        const node = stack.pop()!
+        map.set(node.id, layerId)
+        for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i])
+      }
+    })
+    return map
+  }, [nodesByLayer])
+
+  return { layerRules, nodesByLayer, displayFlat, displayMap, urnToIdMap, nodeLayerMap }
 }

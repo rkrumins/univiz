@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps, NodeToolbar } from '@xyflow/react'
 import * as LucideIcons from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useSchemaStore } from '@/store/schema'
+import { useCanvasStore } from '@/store/canvas'
 import { cn } from '@/lib/utils'
 import { generateColorFromType, generateIconFallback } from '@/lib/type-visuals'
 import type { EntityInstance, EntityVisualConfig } from '@/types/schema'
@@ -51,6 +52,10 @@ export const GenericNode = memo(function GenericNode({
   dragging,
   isConnectable,
 }: GenericNodeProps) {
+  // Pulse-on-arrival ring. Driven by the canvas store's Set so multiple
+  // simultaneous reveals (multi-locate) can all pulse at once. Auto-clears
+  // per-id after the animation duration (~900ms).
+  const isPulsing = useCanvasStore((s) => s.pulseNodeIds.has(id))
   // Handle both nested (data.data) and flat (data) structures
   const rawData = (data as Record<string, unknown>)
   const entityData: GenericNodeData = rawData.data
@@ -188,7 +193,9 @@ export const GenericNode = memo(function GenericNode({
           // Downstream nodes: Green tint
           isDownstream && !isFocus && !isUpstream && "ring-2 ring-green-400 ring-offset-1 shadow-[0_0_15px_rgba(74,222,128,0.4)] bg-green-50 dark:bg-green-950/30 z-50",
           // Generic traced node (neither up nor down but in path)
-          isTraced && !isFocus && !isUpstream && !isDownstream && "ring-2 ring-purple-400 ring-offset-1 shadow-[0_0_15px_rgba(192,132,252,0.4)] z-50"
+          isTraced && !isFocus && !isUpstream && !isDownstream && "ring-2 ring-purple-400 ring-offset-1 shadow-[0_0_15px_rgba(192,132,252,0.4)] z-50",
+          // Jump-to-node arrival pulse — one-shot ring animation
+          isPulsing && "lineage-pulse"
         )}
         style={{
           borderColor: isFocus ? '#fbbf24' : isUpstream ? '#60a5fa' : isDownstream ? '#4ade80' : isTraced ? '#c084fc' : visual.color,

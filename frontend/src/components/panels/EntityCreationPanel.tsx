@@ -133,7 +133,7 @@ export function EntityCreationPanel({
         }).map(n => ({
             id: n.id,
             urn: (n.data?.urn as string) || n.id,
-            name: (n.data?.label as string) || (n.data?.displayName as string) || n.id,
+            name: (n.data?.label as string) || n.id,
             type: (n.data?.type as string) || 'unknown',
         }))
     }, [nodes, entityTypes])
@@ -227,7 +227,7 @@ export function EntityCreationPanel({
                     urn: tempUrn,
                     classifications: tags,
                     isPending: 'create',
-                    metadata: properties,
+                    properties,
                 },
             }])
 
@@ -281,7 +281,7 @@ export function EntityCreationPanel({
                             type: result.node.entityType,
                             urn: result.node.urn,
                             classifications: result.node.tags,
-                            metadata: result.node.properties,
+                            properties: result.node.properties,
                         },
                     }])
                     if (result.containmentEdge) {

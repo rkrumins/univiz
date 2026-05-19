@@ -59,12 +59,14 @@ import { NodePalette } from './NodePalette'
 
 // Hooks
 import { useGraphHydration } from '@/hooks/useGraphHydration'
+import { useRevealNode } from '@/hooks/useRevealNode'
+import { useGraphProvider } from '@/providers/GraphProviderContext'
 import { useElkLayout } from '@/hooks/useElkLayout'
 import { useContainmentHierarchy } from '@/hooks/useContainmentHierarchy'
 import { useCanvasTrace } from '@/hooks/useCanvasTrace'
 import { useAggregatedLineage } from '@/hooks/useAggregatedLineage'
 import { useHighlightState, useHoverHighlight, useHoveredNodeId } from '@/hooks/useHighlightState'
-import { useEdgeDetailPanel, useEdgeTypeFilters } from '@/hooks/useEdgeFilters'
+import { useEdgeDetailPanel, useEdgeTypeFilters, useEdgeFiltersStore } from '@/hooks/useEdgeFilters'
 import { useSemanticZoom } from '@/hooks/useSemanticZoom'
 import { useCanvasInteractions } from '@/hooks/useCanvasInteractions'
 import { useCanvasKeyboard } from '@/hooks/useCanvasKeyboard'
@@ -109,10 +111,12 @@ export function GraphCanvas({ className }: { className?: string }) {
 
   // 2. Canvas store
   const { setNodes, setEdges, selectNode, selectEdge, clearSelection, addEdges, addNodes } = useCanvasStore()
+  const setVisibleEdges = useCanvasStore((s) => s.setVisibleEdges)
   const rawNodes = useCanvasStore((s) => s.nodes)
   const rawEdges = useCanvasStore((s) => s.edges)
   const selectedNodeIds = useCanvasStore((s) => s.selectedNodeIds)
   const selectedNodeId = selectedNodeIds[0] ?? null
+  const drawerNodeId = useCanvasStore((s) => s.drawerNodeId)
   // 3. Schema / ontology
   const schema = useSchemaStore((s) => s.schema)
   const containmentEdgeTypes = useViewContainmentEdgeTypes()
@@ -246,7 +250,7 @@ export function GraphCanvas({ className }: { className?: string }) {
   // handles visibility by projecting to visible ancestors, not filtering.
 
   // 7. Progressive loading
-  const { loadChildren, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
+  const { loadChildren, cancelChildLoad, isLoading: isLoadingChildren, loadingNodes } = useGraphHydration()
   useLoadingToast('graph-children', isLoadingChildren, 'Expanding hierarchy')
 
   // 8. Trace system (shared hook)
@@ -444,6 +448,25 @@ export function GraphCanvas({ className }: { className?: string }) {
     [allVisibleEdges]
   )
 
+  // Publish the projected lineage edge set so EntityDrawer's Lineage section
+  // can mirror what the user sees on canvas (see canvas.ts:visibleEdges).
+  // Dedup by id-fingerprint so unstable upstream memos (allVisibleEdges
+  // re-derives on every aggregatedEdges Map churn) don't cause repeated
+  // store writes that feed back into a render loop.
+  const lineageEdgesFingerprint = useMemo(
+    () => lineageEdges.map((e) => e.id).join('|'),
+    [lineageEdges],
+  )
+  const lineageEdgesRef = useRef(lineageEdges)
+  lineageEdgesRef.current = lineageEdges
+  useEffect(() => {
+    setVisibleEdges(lineageEdgesRef.current as LineageEdgeType[])
+    // No cleanup-reset: avoids a second store write per cycle that triggers
+    // a re-render in any subscriber (LineageNeighbors) and feeds the loop.
+    // Stale data on unmount is overwritten by the next canvas mount; if no
+    // canvas is mounted, LineageNeighbors falls back to raw `edges`.
+  }, [lineageEdgesFingerprint, setVisibleEdges])
+
   // 12. Highlight state — uses lineageEdges for click/hover highlighting
   const hoveredNodeId = useHoveredNodeId()
   const { highlightState, isHighlightActive: isClickHighlightActive } = useHighlightState({
@@ -484,9 +507,65 @@ export function GraphCanvas({ className }: { className?: string }) {
     )
   }, [rawEdges, relationshipTypes, containmentEdgeTypes, ontologyMetadata, edgeFilters])
 
+  // 13a. Wire EdgeDetailPanel's filter state into actual canvas rendering.
+  // The store has been driving the panel UI for a while — this is what makes
+  // the toggles affect the graph the user sees.
+  const directionFilter = useEdgeFiltersStore((s) => s.directionFilter)
+  const focusedFilterNodeId = useEdgeFiltersStore((s) => s.focusedNodeId)
+  const highlightedEdgeIds = useEdgeFiltersStore((s) => s.highlightedEdgeIds)
+  const isolateMode = useEdgeFiltersStore((s) => s.isolateMode)
+
+  // Set of normalized edge types the user has left enabled. `null` means "no
+  // filters configured yet" (schema not loaded / no edges discovered) and we
+  // pass everything through rather than nuking the graph.
+  const enabledEdgeTypes = useMemo<Set<string> | null>(() => {
+    if (!dynamicEdgeFilters || dynamicEdgeFilters.length === 0) return null
+    return new Set(dynamicEdgeFilters.filter((f) => f.enabled).map((f) => f.type))
+  }, [dynamicEdgeFilters])
+
+  // Direction filter — when a node is focused via the panel, restrict the
+  // displayed lineage edges to that node's incoming / outgoing / upstream /
+  // downstream set. Transitive sets are computed via iterative DFS to avoid
+  // recursion limits on large graphs.
+  const directionEdgeIds = useMemo<Set<string> | null>(() => {
+    if (!focusedFilterNodeId || directionFilter === 'all') return null
+    if (directionFilter === 'incoming') {
+      return new Set(
+        allVisibleEdges.filter((e) => e.target === focusedFilterNodeId).map((e) => e.id),
+      )
+    }
+    if (directionFilter === 'outgoing') {
+      return new Set(
+        allVisibleEdges.filter((e) => e.source === focusedFilterNodeId).map((e) => e.id),
+      )
+    }
+    const ids = new Set<string>()
+    const visited = new Set<string>()
+    const stack = [focusedFilterNodeId]
+    while (stack.length > 0) {
+      const node = stack.pop()!
+      if (visited.has(node)) continue
+      visited.add(node)
+      for (const e of allVisibleEdges) {
+        if (directionFilter === 'upstream' && e.target === node) {
+          ids.add(e.id)
+          stack.push(e.source)
+        } else if (directionFilter === 'downstream' && e.source === node) {
+          ids.add(e.id)
+          stack.push(e.target)
+        }
+      }
+    }
+    return ids
+  }, [allVisibleEdges, focusedFilterNodeId, directionFilter])
+
   // 14. ELK Layout
   const { applyLayout, isLayouting, direction, toggleDirection } = useElkLayout()
   const [layoutedNodes, setLayoutedNodes] = useState<LineageNode[]>([])
+  // Ref mirror so the reveal-focus adapter can read post-layout positions
+  // without re-binding every render. Synced below on every render.
+  const layoutedNodesRef = useRef<LineageNode[]>([])
+  layoutedNodesRef.current = layoutedNodes
   const prevLayoutSig = useRef('')
   const hasAppliedInitialLayout = useRef(false)
   const fitViewTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -501,6 +580,63 @@ export function GraphCanvas({ className }: { className?: string }) {
       fitViewTimer.current = null
     }, 250)
   }, [rfInstance])
+
+  // Reveal + center the viewport on a node by id. Used by EntityDrawer's
+  // LineageNeighbors so clicking a neighbor pans the canvas to it — and,
+  // when the neighbor is hidden inside collapsed parents, expands the
+  // ancestor chain (lazy-loading from the backend if needed) before
+  // panning. See [useRevealNode](../../hooks/useRevealNode.ts).
+  //
+  // The pan adapter reads from `layoutedNodes` (post-elk positions) via a
+  // ref because canvas-store positions are pre-layout. Trace mode is
+  // transparent here — visibility is governed by parentMap + expandedNodes,
+  // not by trace state, so the cascade works under both browse and trace.
+  const provider = useGraphProvider()
+  const revealAndFocus = useRevealNode({
+    parentMap,
+    setExpandedNodes,
+    loadChildren,
+    provider,
+    focus: (id: string) => {
+      if (!rfInstance) return
+      const node =
+        layoutedNodesRef.current.find((n) => n.id === id) ??
+        useCanvasStore.getState().nodes.find((n) => n.id === id)
+      if (!node) return
+      rfInstance.setCenter(node.position.x, node.position.y, {
+        zoom: rfInstance.getZoom(),
+        duration: 400,
+      })
+    },
+  })
+
+  // Multi-locate: reveal a batch of targets in parallel, then fit the
+  // viewport so all of them are on screen. Each reveal runs the same
+  // expand-ancestors cascade as the single-click path; using
+  // Promise.allSettled lets a partial failure (e.g. one URN that
+  // backend lookup rejects) still surface the successful subset rather
+  // than abandoning the whole batch.
+  const locateManyOnCanvas = useCallback(
+    async (ids: string[]) => {
+      // skipFocus: true on each reveal so the canvas doesn't run N
+      // competing setCenter animations during the cascade. The trailing
+      // fitView below produces a single coherent pan/zoom.
+      await Promise.allSettled(
+        ids.map((id) => revealAndFocus(id, { skipFocus: true })),
+      )
+      if (!rfInstance) return
+      const targets = ids
+        .map((id) => layoutedNodesRef.current.find((n) => n.id === id))
+        .filter((n): n is LineageNode => !!n)
+      if (targets.length === 0) return
+      rfInstance.fitView({
+        nodes: targets.map((n) => ({ id: n.id })),
+        padding: 0.25,
+        duration: 500,
+      })
+    },
+    [rfInstance, revealAndFocus],
+  )
 
   const scheduleFitViewRef = useRef(scheduleFitView)
   scheduleFitViewRef.current = scheduleFitView
@@ -592,6 +728,13 @@ export function GraphCanvas({ className }: { className?: string }) {
       // Register manual override so semantic zoom doesn't undo this action
       semanticZoom.registerManualOverride(nodeId)
 
+      // A child load for this node is already in flight. Ignore repeat
+      // clicks until it settles: otherwise an impatient second click reads
+      // committed state as expanded, collapses the node, and cancels the
+      // in-flight fetch — forcing a third click to actually load. Collapse
+      // works normally once the load completes (finally clears pendingLoadRef).
+      if (pendingLoadRef.current.has(nodeId)) return
+
       let wasExpanded = false
       setExpandedNodes((prev) => {
         wasExpanded = prev.has(nodeId)
@@ -607,9 +750,13 @@ export function GraphCanvas({ className }: { className?: string }) {
         } finally {
           pendingLoadRef.current.delete(nodeId)
         }
+      } else if (wasExpanded) {
+        // User collapsed mid-load — drop the result so a slow response
+        // doesn't repopulate a now-collapsed subtree.
+        cancelChildLoad(nodeId)
       }
     },
-    [loadChildren, semanticZoom],
+    [loadChildren, cancelChildLoad, semanticZoom],
   )
 
   const toggleNodeRef = useRef(toggleNode)
@@ -630,12 +777,28 @@ export function GraphCanvas({ className }: { className?: string }) {
   // Flow is the master switch — Trace mode respects it so the canvas can be
   // dialed back to "trace highlights on nodes only" when desired.
   const displayEdges = useMemo(() => {
+    const matchesTypeFilter = (edge: typeof allVisibleEdges[number]): boolean => {
+      if (!enabledEdgeTypes) return true
+      const normalized = normalizeEdgeType(edge).toLowerCase()
+      const original = (edge.data?.edgeType || edge.data?.relationship || 'unknown').toLowerCase()
+      return enabledEdgeTypes.has(normalized) || enabledEdgeTypes.has(original)
+    }
     return allVisibleEdges
       .filter(edge => {
-        // Always show containment edges when parent is expanded
-        if (edge._isContainment) return true
+        // Containment edges are subject to the type filter (so users can hide
+        // structural edges) but ignore the lineage Flow toggle.
+        if (edge._isContainment) {
+          return matchesTypeFilter(edge)
+        }
         // Lineage edges follow the Flow toggle, regardless of trace state
-        return showLineageFlow
+        if (!showLineageFlow) return false
+        if (!matchesTypeFilter(edge)) return false
+        // Direction filter (only active when a focus node is set)
+        if (directionEdgeIds && !directionEdgeIds.has(edge.id)) return false
+        // Isolate mode — only render highlighted edges. Requires at least one
+        // highlight to avoid the surprise of "isolate mode hides everything".
+        if (isolateMode && highlightedEdgeIds.size > 0 && !highlightedEdgeIds.has(edge.id)) return false
+        return true
       })
       .map(edge => {
         if (edge._isContainment) {
@@ -683,7 +846,7 @@ export function GraphCanvas({ className }: { className?: string }) {
           },
         }
       })
-  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges])
+  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges, enabledEdgeTypes, directionEdgeIds, isolateMode, highlightedEdgeIds])
   // (trace.isTracing/trace.result kept in deps because the map step inside reads them for isTraced flagging)
 
   // 16. Display nodes with visual state — only VISIBLE nodes (expand/collapse aware)
@@ -1018,6 +1181,22 @@ export function GraphCanvas({ className }: { className?: string }) {
     }
   }, [rawNodes, rawEdges])
 
+  // ESC-driven trace exit. Mirrors ContextViewCanvas: purges the edges the
+  // trace merged into the canvas store, clears trace state, and reverts
+  // ancestor-chain auto-expansion. Without this, ESC fell through to plain
+  // selection-clear and the trace dock stayed open.
+  const exitTrace = useCallback(() => {
+    if (!trace.isTracing) return false
+    const idsToRemove = Array.from(trace.addedEdgeIds)
+    trace.clearTrace()
+    if (idsToRemove.length > 0) {
+      useCanvasStore.getState().removeEdges(idsToRemove)
+    }
+    trace.resetAddedEdgeIds()
+    setExpandedNodes(new Set())
+    return true
+  }, [trace])
+
   // 19. Canvas interactions (context menu, inline edit, quick create, command palette)
   const interactions = useCanvasInteractions({
     onTraceNode: (nodeId) => trace.startTrace(nodeId),
@@ -1036,6 +1215,7 @@ export function GraphCanvas({ className }: { className?: string }) {
       }
       return false
     },
+    onExitTrace: exitTrace,
   })
 
   useCanvasKeyboard({ enabled: true, handlers: interactions.keyboardHandlers })
@@ -1296,7 +1476,7 @@ export function GraphCanvas({ className }: { className?: string }) {
 
       {/* Panels */}
       <AnimatePresence>
-        {isEdgePanelOpen && (
+        {!drawerNodeId && isEdgePanelOpen && (
           <EdgeDetailPanel
             isOpen={isEdgePanelOpen}
             onClose={closeEdgePanel}
@@ -1309,6 +1489,8 @@ export function GraphCanvas({ className }: { className?: string }) {
         onTraceUp={(nodeId) => trace.traceUpstream(nodeId)}
         onTraceDown={(nodeId) => trace.traceDownstream(nodeId)}
         onFullTrace={(nodeId) => trace.traceFullLineage(nodeId)}
+        onFocusNode={revealAndFocus}
+        onLocateMany={locateManyOnCanvas}
       />
 
       {/* UX Components */}

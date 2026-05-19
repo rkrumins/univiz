@@ -22,7 +22,8 @@ import {
 // Section labels — slight tone shift from the change type for human readability.
 const TYPE_LABELS: Record<StagedChangeType, string> = {
   create_entity: 'New entities',
-  rename_entity: 'Edits',
+  rename_entity: 'Renames',
+  update_entity: 'Property edits',
   delete_entity: 'Deletions',
   assign_layer: 'Layer assignments',
   move_to_layer: 'Layer rules',
@@ -35,6 +36,7 @@ const TYPE_LABELS: Record<StagedChangeType, string> = {
 const TYPE_ICONS: Record<StagedChangeType, keyof typeof LucideIcons> = {
   create_entity: 'PlusCircle',
   rename_entity: 'Pencil',
+  update_entity: 'Settings2',
   delete_entity: 'Trash2',
   assign_layer: 'Move',
   move_to_layer: 'ArrowRightLeft',

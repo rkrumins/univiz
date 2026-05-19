@@ -1,0 +1,86 @@
+# In-cluster FalkorDB (graph database) as a StatefulSet.
+# OPT-IN alternative to an external/managed FalkorDB. When used, set
+# FALKORDB_HOST=falkordb in the ConfigMap (Helm: config.falkordb.host).
+#
+# NOTE: this uses the stock falkordb image with an EMPTY graph. The repo's
+# quickstart image (data/quickstart/Dockerfile.falkordb) bakes in sample
+# data — build & push that and swap the image below if you want seed data.
+apiVersion: v1
+kind: Service
+metadata:
+  name: falkordb
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: falkordb
+    app.kubernetes.io/part-of: dataviz
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: falkordb
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: ui
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: falkordb
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: falkordb
+    app.kubernetes.io/part-of: dataviz
+spec:
+  serviceName: falkordb
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: falkordb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: falkordb
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      containers:
+        - name: falkordb
+          image: falkordb/falkordb:v4.16.0
+          env:
+            - name: FALKORDB_ARGS
+              value: "THREAD_COUNT 4"
+          ports:
+            - name: redis
+              containerPort: 6379
+            - name: ui
+              containerPort: 3000
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/falkordb/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

@@ -6,9 +6,26 @@ import { useStagedChangesStore } from '@/store/stagedChangesStore'
 // Global visibility tracker — which layer-node-* elements are currently in the viewport
 const globalVisibleNodes = new Set<string>()
 
+// Same-column edges route through a left lane. Lane `index`'s leftmost
+// control point sits at node.left - SAME_COLUMN_LANE_START - (BASE +
+// index * STEP) from the container left edge. These are exported so the
+// canvas can reserve a matching scroll-content gutter (see
+// EXTREMITY_EDGE_GUTTER_PX) and the two stay in sync.
+export const SAME_COLUMN_LANE_START = 6
+export const SAME_COLUMN_LANE_BASE = 24
+export const SAME_COLUMN_LANE_STEP = 8
+// Horizontal gutter reserved on each side of the layer columns so the
+// outermost same-column lanes (and the rightmost columns' outgoing-edge
+// starts) aren't clipped by the overflow-auto scroll container. Sized to
+// keep the first 4 lanes unclipped (≈ 62px).
+export const EXTREMITY_EDGE_GUTTER_PX =
+  SAME_COLUMN_LANE_START + SAME_COLUMN_LANE_BASE + SAME_COLUMN_LANE_STEP * 4
+
 export function LineageFlowOverlay({
   nodes,
   edges,
+  nodeStubCounts,
+  showStubs = false,
   expandedNodes,
   selectEdge,
   isEdgePanelOpen,
@@ -21,9 +38,21 @@ export function LineageFlowOverlay({
   resolveEdgeColor,
   onEdgeDoubleClick,
   showDirection = true,
+  expandingEdgeIds,
 }: {
   nodes: any[],
   edges: any[],
+  /**
+   * Per-node lineage counts for the stub indicators. Drives a short
+   * partial-edge marker on each entity card: a quiet inbound arrow on
+   * the left if `in > 0`, a quiet outbound arrow on the right if
+   * `out > 0`. The stubs are entity-anchored decorations — they never
+   * attempt to span across to a partner node. Hover/select on an entity
+   * materializes the real edges over these markers.
+   */
+  nodeStubCounts?: Map<string, { in: number; out: number }>,
+  /** When true, render the per-node stub indicators. */
+  showStubs?: boolean,
   expandedNodes: Set<string>,
   selectEdge: (id: string) => void,
   isEdgePanelOpen: boolean,
@@ -38,6 +67,8 @@ export function LineageFlowOverlay({
   onEdgeDoubleClick?: (edgeId: string) => void,
   /** When true, render arrowheads + animated mid-edge chevron flow. */
   showDirection?: boolean,
+  /** Edge ids whose drill-down is in flight — pulses them via `.nx-edge-expanding`. */
+  expandingEdgeIds?: Set<string>,
 }) {
   // Store computed abstract edges instead of direct React nodes for virtualization
   const [computedEdges, setComputedEdges] = useState<ComputedEdge[]>([])
@@ -45,6 +76,19 @@ export function LineageFlowOverlay({
   const [overflowBadges, setOverflowBadges] = useState<OverflowBadge[]>([])
   // Trailing edge stubs — partial curves from visible nodes toward container boundary
   const [overflowEdges, setOverflowEdges] = useState<OverflowEdge[]>([])
+  // Per-node lineage indicators — tight indigo ribbons that "peek out"
+  // from behind each entity card on the side(s) with lineage. The
+  // ribbon is rendered in the overlay's lower z-index so the card
+  // chrome hides the inboard portion — visually it reads as a soft
+  // glow tab integrated into the card design rather than a separate
+  // decoration. Stroke width / opacity scale with the lineage count.
+  const [computedStubs, setComputedStubs] = useState<Array<{
+    nodeId: string
+    side: 'in' | 'out'
+    count: number
+    cx: number; cy: number  // ribbon center
+    width: number; height: number
+  }>>([])
 
   // Viewport tracking for virtualization
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: typeof window !== 'undefined' ? window.innerHeight : 1000 })
@@ -96,6 +140,7 @@ export function LineageFlowOverlay({
     }
     return { bySource, byTarget }
   }, [edges])
+
 
   // Debounced update function using requestAnimationFrame
   const scheduleUpdate = useCallback(() => {
@@ -212,9 +257,9 @@ export function LineageFlowOverlay({
           // lineage tools must show every connection by default; rolling
           // up intra-column edges into a chip hides what the user came to see.
           if (isSameColumn && !isSelf) {
-            sx = sRect.left - containerRect.left - 6
-            tx = tRect.left - containerRect.left - 6
-            const curveDist = -(24 + index * 8)  // negative = leftward
+            sx = sRect.left - containerRect.left - SAME_COLUMN_LANE_START
+            tx = tRect.left - containerRect.left - SAME_COLUMN_LANE_START
+            const curveDist = -(SAME_COLUMN_LANE_BASE + index * SAME_COLUMN_LANE_STEP)  // negative = leftward
             pathD = `M ${sx} ${sy} C ${sx + curveDist} ${sy}, ${tx + curveDist} ${ty}, ${tx} ${ty}`
           } else if (isSibling) {
             // Direction: left-to-right (downstream) → route ABOVE the row band.
@@ -315,6 +360,23 @@ export function LineageFlowOverlay({
             dynamicStrokeWidth = Math.max(1, baseStrokeWidth * 0.7)
           }
 
+          // Reverse-flow geometric reroute only — no visual styling change.
+          // The edge points back upstream (target layer < source layer);
+          // routing it through a deeper sub-row arc keeps the forward
+          // flow uncluttered (no zigzag through other rows). Visually it
+          // reads identically to forward edges: same type color, same
+          // gradient fade, same chevron animation, same arrowhead. Only
+          // the path geometry differs.
+          let isRev = false
+          if ((edge as any).isReverseFlow) {
+            isRev = true
+            const dist = Math.abs(tx - sx)
+            const arcDepth = Math.max(60, dist * 0.35)
+            const cx1 = sx + Math.max(40, dist * 0.25)
+            const cx2 = tx - Math.max(40, dist * 0.25)
+            pathD = `M ${sx} ${sy} C ${cx1} ${sy + arcDepth}, ${cx2} ${ty + arcDepth}, ${tx} ${ty}`
+          }
+
           newComputedEdges.push({
             id: edge.id,
             source: edge.source,
@@ -330,6 +392,9 @@ export function LineageFlowOverlay({
             confidence: edge.confidence || 0,
             isTraceEdge,
             isFocusIncident,
+            isReverseFlow: isRev,
+            isBrowseBundle: !!(edge as any).isBrowseBundle,
+            isBidirectional: !!(edge as any).isBidirectional,
           })
         }
         return
@@ -398,6 +463,67 @@ export function LineageFlowOverlay({
 
     setComputedEdges(newComputedEdges)
 
+    // ── Per-node lineage ribbons ────────────────────────────────────────
+    //
+    // For every visible entity that has lineage on either side, emit a
+    // tight indigo ribbon that PEEKS OUT from behind the card's edge.
+    // The overlay sits at z-[5] and the card chrome at z-[10]+, so the
+    // inboard portion of the ribbon is hidden naturally by the card —
+    // the visible result is a soft glow tab attached to the card edge.
+    // No external spacing, no floating decorations, no arrows trying to
+    // bridge gaps. Just a quiet "this side has lineage" indicator that
+    // reads as part of the card design.
+    //
+    // The ribbon vertical extent is sized to the card's own height
+    // (45%) so it always feels proportional, whether the entity is a
+    // tall layer card or a tight leaf row.
+    if (showStubs && nodeStubCounts && nodeStubCounts.size > 0) {
+      // Sized to be confidently visible without dominating the card.
+      // 7px core + 4px halo around it gives a soft glow tab that reads
+      // at a glance. ~5.5px peeks out beyond the card edge (1.5px overlap
+      // hides any hard inboard edge behind the card chrome).
+      const RIBBON_W = 7
+      const RIBBON_HEIGHT_RATIO = 0.55
+      const RIBBON_INSET = 1.5
+      const newStubs: typeof computedStubs = []
+      globalVisibleNodes.forEach(domId => {
+        const nodeId = domId.startsWith('layer-node-') ? domId.slice('layer-node-'.length) : domId
+        const counts = nodeStubCounts.get(nodeId)
+        if (!counts) return
+        const el = getEl(domId)
+        if (!el) return
+        const rect = el.getBoundingClientRect()
+        const midY = rect.top + rect.height / 2 - containerRect.top
+        const height = Math.max(18, rect.height * RIBBON_HEIGHT_RATIO)
+        if (counts.in > 0) {
+          // Inbound ribbon center sits `(RIBBON_W/2 - RIBBON_INSET)` to
+          // the left of the card-left edge — so part of the pill peeks
+          // out, the rest is hidden by the card chrome.
+          const cardLeft = rect.left - containerRect.left
+          newStubs.push({
+            nodeId, side: 'in', count: counts.in,
+            cx: cardLeft - (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+        if (counts.out > 0) {
+          const cardRight = rect.right - containerRect.left
+          newStubs.push({
+            nodeId, side: 'out', count: counts.out,
+            cx: cardRight + (RIBBON_W / 2 - RIBBON_INSET),
+            cy: midY,
+            width: RIBBON_W,
+            height,
+          })
+        }
+      })
+      setComputedStubs(newStubs)
+    } else if (computedStubs.length > 0) {
+      setComputedStubs([])
+    }
+
     const badges: OverflowBadge[] = []
     buckets.forEach((bucket) => {
       const avgX = bucket.gutterXs.reduce((a, b) => a + b, 0) / bucket.gutterXs.length
@@ -410,7 +536,8 @@ export function LineageFlowOverlay({
     })
     setOverflowBadges(badges)
     setOverflowEdges(trailingEdges)
-  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edgeIndex, selectEdge, isEdgePanelOpen, toggleEdgePanel, isTracing, traceResult, highlightedEdges, isHighlightActive, resolveEdgeColor, hoveredEdgeId, showStubs, nodeStubCounts])
 
   // Store updateFlow in ref for ResizeObserver access and expose to parent
   useEffect(() => {
@@ -419,6 +546,15 @@ export function LineageFlowOverlay({
       triggerRedrawRef.current = scheduleUpdate
     }
   }, [updateFlow, scheduleUpdate, triggerRedrawRef])
+
+  // Stubs mode toggles + stub-count changes need a redraw because
+  // updateFlow's identity changes but the observers above don't refire —
+  // without this, switching to stubs (or swapping the per-node counts)
+  // leaves the canvas showing the previous geometry until the next
+  // scroll / resize / hover.
+  useEffect(() => {
+    scheduleUpdate()
+  }, [showStubs, nodeStubCounts, scheduleUpdate])
 
   // ResizeObserver + IntersectionObserver for node elements.
   // Uses MutationObserver to dynamically track layer-node-* elements as they're
@@ -635,6 +771,26 @@ export function LineageFlowOverlay({
     return true
   })
 
+  // ── Density-adaptive render tier ───────────────────────────────────────
+  //
+  // Premium  (≤ 200 visible)    — full treatment: per-edge gradient,
+  //                                animated chevron flow, particles, glow.
+  // Standard (201 – 800)        — drop animated chevron + particles unless
+  //                                edge is hovered or focus-incident; pool
+  //                                gradient defs by color (~10 vs N).
+  // Coalesced (> 800)           — strip everything except the core stroke +
+  //                                shared color gradient + arrowhead. Hover
+  //                                still reads through the hit layer (now
+  //                                gated to ≤1200 edges in Part 3).
+  //
+  // Premium feel concentrates on the user's focus. The hovered / focus-
+  // incident subset always gets the Premium treatment regardless of tier
+  // (`focus + context` fisheye, Part 5).
+  const renderTier: 'premium' | 'standard' | 'coalesced' =
+    visibleEdges.length <= 200 ? 'premium'
+    : visibleEdges.length <= 800 ? 'standard'
+    : 'coalesced'
+
   // ── Shared SVG defs — one marker per unique color, one gradient per color+direction ──
   // Avoids creating 500+ <marker> and 200+ <linearGradient> elements per render.
   const sharedDefs = useMemo(() => {
@@ -675,8 +831,17 @@ export function LineageFlowOverlay({
               .edge-direction-flow {
                 animation: edgeFlow 1.4s linear infinite;
               }
+              @keyframes lineageStubFlow {
+                to { stroke-dashoffset: -14; }
+              }
+              .lineage-stub-flow {
+                animation: lineageStubFlow 1.6s linear infinite;
+              }
+              .lineage-stub-group {
+                transition: opacity 220ms ease;
+              }
               @media (prefers-reduced-motion: reduce) {
-                .flow-particles, .flow-particles-ghost, .edge-direction-flow {
+                .flow-particles, .flow-particles-ghost, .edge-direction-flow, .lineage-stub-flow {
                   animation: none;
                 }
               }
@@ -703,7 +868,11 @@ export function LineageFlowOverlay({
                 markerHeight="10"
                 refX="11"
                 refY="5"
-                orient="auto"
+                // auto-start-reverse lets the same marker serve markerEnd
+                // (forward arrowhead) AND markerStart (reversed at the
+                // source end) for bidirectional edges — one marker def per
+                // color instead of two.
+                orient="auto-start-reverse"
                 markerUnits="userSpaceOnUse"
               >
                 <polygon points="0 0, 12 5, 0 10, 2 5" fill={c} stroke={c} strokeWidth="0.5" />
@@ -754,36 +923,52 @@ export function LineageFlowOverlay({
           // Per-edge gradient id — direction is encoded in the stroke itself.
           // Fades from a soft tint of the type color at the source to full
           // saturation at the target. The arrowhead is the confirming cue.
+          //
+          // Tier policy: only Premium tier (and the focus-incident /
+          // hovered subset in any tier) gets the per-edge gradient. Other
+          // edges fall back to the solid color stroke — direction is still
+          // unmistakable via the arrowhead. Eliminates N <linearGradient>
+          // defs per render at high density.
+          const isPremiumLook =
+            renderTier === 'premium' || isHighlighted || edge.isFocusIncident
           const gradId = `edge-grad-${edge.id.replace(/[^a-zA-Z0-9]/g, '')}`
           const coreOpacity = isHighlighted ? Math.min(0.95, edgeOpacity * 1.2) : edgeOpacity
 
+          const isExpanding = expandingEdgeIds?.has(edge.id) ?? false
+          const edgeClasses = [
+            edge.isTraceEdge ? 'nx-edge-trace' : null,
+            isExpanding ? 'nx-edge-expanding' : null,
+          ].filter(Boolean).join(' ') || undefined
           return (
             <g
               key={edge.id}
               data-edge-id={edge.id}
               data-edge-src={edge.source}
               data-edge-tgt={edge.target}
-              className={edge.isTraceEdge ? 'nx-edge-trace' : undefined}
+              className={edgeClasses}
               style={{ opacity: groupOpacity, transition: 'opacity 0.12s ease' }}
             >
               {/* Per-edge directional gradient. `userSpaceOnUse` with start/
                   end at the path's source/target endpoints aligns the gradient
                   vector to the actual edge direction — approximate for curves
                   but visually correct. Source stop at 35% of edge opacity gives
-                  the soft-tint start; target stop at full edge opacity. */}
-              <defs>
-                <linearGradient
-                  id={gradId}
-                  gradientUnits="userSpaceOnUse"
-                  x1={sx}
-                  y1={sy}
-                  x2={tx}
-                  y2={ty}
-                >
-                  <stop offset="0%" stopColor={color} stopOpacity={coreOpacity * 0.35} />
-                  <stop offset="100%" stopColor={color} stopOpacity={coreOpacity} />
-                </linearGradient>
-              </defs>
+                  the soft-tint start; target stop at full edge opacity.
+                  Skipped for non-premium-look edges to keep DOM count down. */}
+              {isPremiumLook && (
+                <defs>
+                  <linearGradient
+                    id={gradId}
+                    gradientUnits="userSpaceOnUse"
+                    x1={sx}
+                    y1={sy}
+                    x2={tx}
+                    y2={ty}
+                  >
+                    <stop offset="0%" stopColor={color} stopOpacity={coreOpacity * 0.35} />
+                    <stop offset="100%" stopColor={color} stopOpacity={coreOpacity} />
+                  </linearGradient>
+                </defs>
+              )}
 
               {/* SUBTLE GLOW — only on highlight, thin halo */}
               {isHighlighted && (
@@ -819,29 +1004,33 @@ export function LineageFlowOverlay({
 
               {/* CORE LINE — stroke uses the per-edge gradient so direction
                   is encoded in the line itself (faded at source, full at
-                  target). strokeOpacity is intentionally 1: the gradient's
-                  stops already carry the effective opacity per endpoint. */}
+                  target). strokeOpacity is intentionally 1 when the gradient
+                  carries opacity in its stops; a fixed opacity is used when
+                  the solid-color fallback runs. Reverse-flow edges use the
+                  same styling as forward — only their path geometry differs. */}
               <path
                 d={pathD}
                 style={{
-                  stroke: `url(#${gradId})`,
+                  stroke: isPremiumLook ? `url(#${gradId})` : color,
                   strokeWidth: dynamicStrokeWidth,
                   fill: 'none',
-                  strokeOpacity: 1,
+                  strokeOpacity: isPremiumLook ? 1 : coreOpacity,
                   strokeDasharray: isGhost ? '6 4' : 'none',
                   strokeLinecap: 'round',
                   transition: 'stroke-width 0.2s ease',
                 }}
                 markerEnd={showDirection ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
+                markerStart={showDirection && edge.isBidirectional ? `url(#arrow-${color.replace(/[^a-zA-Z0-9]/g, '')})` : undefined}
                 className="pointer-events-none"
               />
 
               {/* DIRECTION FLOW — animated chevron flowing source → target.
-                  Renders for ALL edges (including ghost edges that represent
-                  fine-grained lineage delegated up to a visible ancestor —
-                  TRANSFORMS at column level rolled up to Dataset, etc.) so
-                  flow direction is unmistakable regardless of edge type. */}
-              {showDirection && (
+                  Renders for ALL edges in Premium tier; in Standard /
+                  Coalesced tiers we limit it to the focus + context subset
+                  (hovered, focus-incident) so density doesn't melt the
+                  paint pipeline. Reverse-flow edges follow the same rules
+                  as forward — chevron animates along their downward arc. */}
+              {showDirection && isPremiumLook && (
                 <>
                   {/* White underlay — gives the colored dashes contrast against any background */}
                   <path
@@ -933,6 +1122,110 @@ export function LineageFlowOverlay({
             </g>
           )
         })}
+
+        {/* ── Per-node lineage ribbons ────────────────────────────────────
+            Indigo accents that peek out from behind each entity card on
+            the side(s) with lineage. Three layers compose the premium
+            look without external decoration:
+
+              1. Halo  — wider, blurry-tinted pill behind the core, gives
+                         the ribbon a soft glow against the card edge.
+              2. Core  — narrower pill with a vertical fade gradient.
+              3. Sheen — thin highlight stripe inside the core, lifts the
+                         ribbon off the canvas (faux specular).
+
+            The overlay sits at z-[5] beneath the card chrome (z-[10+])
+            so the inboard half of every layer is hidden by the card.
+            Native SVG <title> on each group provides the hover tooltip
+            ("8 incoming connections" / etc.) so the user can confirm
+            meaning. Hover/select the entity materializes the real edges
+            and these indicators recede behind them. ─────────────────── */}
+        {computedStubs.length > 0 && (
+          <>
+            <defs>
+              {/* Halo: wider gradient, lighter tones, generous fade.
+                  Sits behind the core to create a soft glow without
+                  needing an expensive SVG filter. */}
+              <linearGradient id="lineage-ribbon-halo" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
+                <stop offset="50%" stopColor="rgb(129, 140, 248)" stopOpacity="0.55" />
+                <stop offset="100%" stopColor="rgb(129, 140, 248)" stopOpacity="0" />
+              </linearGradient>
+              {/* Core: vertical fade with full saturation in the middle.
+                  rgb(79, 70, 229) is indigo-600 — slightly deeper than the
+                  accent-lineage indigo-500 so the ribbon reads as a
+                  punctuated accent against the card. */}
+              <linearGradient id="lineage-ribbon-core" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+                <stop offset="18%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="50%" stopColor="rgb(79, 70, 229)" stopOpacity="1" />
+                <stop offset="82%" stopColor="rgb(99, 102, 241)" stopOpacity="0.65" />
+                <stop offset="100%" stopColor="rgb(99, 102, 241)" stopOpacity="0" />
+              </linearGradient>
+              {/* Sheen: a thin highlight stripe running down one side of
+                  the core. Adds a subtle "glass" depth so the ribbon
+                  doesn't read as flat fill. */}
+              <linearGradient id="lineage-ribbon-sheen" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="rgba(255, 255, 255, 0)" />
+                <stop offset="45%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="55%" stopColor="rgba(255, 255, 255, 0.35)" />
+                <stop offset="100%" stopColor="rgba(255, 255, 255, 0)" />
+              </linearGradient>
+            </defs>
+            {computedStubs.map(stub => {
+              const key = `ribbon-${stub.nodeId}-${stub.side}`
+              // Opacity scales subtly with lineage volume — light pairs
+              // get a quieter ribbon, heavy fan-in nodes get a stronger
+              // accent. log2 cap keeps the difference perceptible
+              // without making heavy-traffic nodes shout.
+              const intensity = Math.min(0.75 + Math.log2(Math.max(1, stub.count)) * 0.06, 1)
+              const haloW = stub.width + 6
+              const haloH = stub.height + 4
+              const sheenW = Math.max(1.4, stub.width * 0.38)
+              const sheenInset = stub.side === 'in'
+                ? stub.width * 0.18   // sheen toward the card-facing side
+                : -stub.width * 0.18
+              const label = stub.count > 1
+                ? `${stub.count.toLocaleString()} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connections`
+                : `${stub.count} ${stub.side === 'in' ? 'incoming' : 'outgoing'} connection`
+              return (
+                <g key={key} className="pointer-events-none" opacity={intensity}>
+                  {/* Halo */}
+                  <rect
+                    x={stub.cx - haloW / 2}
+                    y={stub.cy - haloH / 2}
+                    width={haloW}
+                    height={haloH}
+                    rx={haloW / 2}
+                    ry={haloW / 2}
+                    fill="url(#lineage-ribbon-halo)"
+                  />
+                  {/* Core */}
+                  <rect
+                    x={stub.cx - stub.width / 2}
+                    y={stub.cy - stub.height / 2}
+                    width={stub.width}
+                    height={stub.height}
+                    rx={stub.width / 2}
+                    ry={stub.width / 2}
+                    fill="url(#lineage-ribbon-core)"
+                  />
+                  {/* Sheen */}
+                  <rect
+                    x={stub.cx - sheenW / 2 + sheenInset}
+                    y={stub.cy - stub.height / 2 + 2}
+                    width={sheenW}
+                    height={stub.height - 4}
+                    rx={sheenW / 2}
+                    ry={sheenW / 2}
+                    fill="url(#lineage-ribbon-sheen)"
+                  />
+                  <title>{label}</title>
+                </g>
+              )
+            })}
+          </>
+        )}
 
         {/* ── Trailing overflow edges — partial S-curves fading toward container edge ── */}
         {overflowEdges.map(oe => (
@@ -1055,6 +1348,15 @@ export function LineageFlowOverlay({
                   ×{edge.edgeCount.toLocaleString()} bundled
                 </span>
               )}
+              {edge.isBidirectional && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+                  style={{ background: `${edge.color}1a`, color: edge.color, border: `1px solid ${edge.color}33` }}
+                  title="Flow exists in both directions between these endpoints"
+                >
+                  Two-way
+                </span>
+              )}
             </div>
 
             {/* Source → Target with arrow */}
@@ -1094,9 +1396,23 @@ export function LineageFlowOverlay({
       )
     })()}
 
-    {/* ── HIT LAYER ─── z-20: above columns, transparent, only click/hover paths ── *
-     *  Positioned identically to the visual layer but invisible. Sits above the    *
-     *  z-10 column container so pointer events reach these paths correctly.        */}
+    {/* ── HIT LAYER ─── z-20: above columns, transparent, only click/hover paths ──
+     *  Positioned identically to the visual layer but invisible. Sits above the
+     *  z-10 column container.
+     *
+     *  Pointer-events policy: each <path> uses `pointer-events: stroke` (set via
+     *  inline style — Tailwind has no utility) so events fire only when the
+     *  pointer is on the actual stroked geometry, not the path's bounding box.
+     *  Combined with a tighter strokeWidth (6 vs the prior 14), this keeps the
+     *  whole canvas clickable at high edge density — clicks anywhere off an
+     *  edge fall through to the node layer below.
+     *
+     *  Density gate: above HIT_DENSITY_LIMIT visible edges, the per-edge hit
+     *  path overlay would still form a coverage mesh that occludes nodes. In
+     *  that regime we skip the hit layer entirely; users interact with edges
+     *  via the trace dock / EdgeLegend instead. Nodes always remain clickable.
+     */}
+    {visibleEdges.length <= 1200 && (
     <div className="absolute inset-0 pointer-events-none z-20">
       <svg className="w-full h-full overflow-visible pointer-events-none">
         {visibleEdges.map(edge => {
@@ -1107,8 +1423,8 @@ export function LineageFlowOverlay({
               d={pathD}
               fill="none"
               stroke="transparent"
-              strokeWidth={14}
-              className="pointer-events-auto cursor-pointer"
+              strokeWidth={6}
+              style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
               data-canvas-interactive
               onMouseEnter={(e) => {
                 setHoveredEdgeId(edge.id)
@@ -1136,6 +1452,7 @@ export function LineageFlowOverlay({
         })}
       </svg>
     </div>
+    )}
     </>
   )
 }

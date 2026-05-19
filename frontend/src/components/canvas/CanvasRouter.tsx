@@ -10,7 +10,7 @@
  * All data loading is handled by useGraphHydration (called here and in canvas components).
  */
 
-import { Suspense, useMemo } from 'react'
+import { Suspense, useMemo, useEffect } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AlertTriangle, Loader2, RefreshCw, WifiOff } from 'lucide-react'
@@ -19,6 +19,8 @@ import { useGraphProviderContext } from '@/providers/GraphProviderContext'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { useGraphHydration } from '@/hooks/useGraphHydration'
 import { useLoadingToast } from '@/components/ui/toast'
+import { useCanvasStore } from '@/store/canvas'
+import { useTraceStore } from '@/hooks/useUnifiedTrace'
 import { GraphCanvas } from './GraphCanvas'
 import { HierarchyCanvas } from './HierarchyCanvas'
 import { ReferenceModelCanvas } from './ReferenceModelCanvas'
@@ -50,7 +52,34 @@ export function CanvasRouter({ className, layoutType: layoutTypeProp }: CanvasRo
   // without hydration (loadChildren/searchChildren only).
   const { hydrationError, hydrationPhase, isLoading: isHydrating } = useGraphHydration({ hydrate: true })
   const isInitialLoad = isHydrating && hydrationPhase !== 'complete'
-  useLoadingToast('hydration', isInitialLoad && !hydrationError, hydrationPhase === 'roots' ? 'Loading graph data' : hydrationPhase === 'edges' ? 'Loading relationships' : 'Preparing view')
+  useLoadingToast(
+    'hydration',
+    isInitialLoad && !hydrationError,
+    hydrationPhase === 'roots' ? 'Loading entities' : hydrationPhase === 'edges' ? 'Loading edges' : 'Preparing view',
+    'Canvas ready',
+  )
+
+  // Mirror hydration phase into the canvas store so downstream components
+  // (ContextViewCanvas → LayerColumn ghost cards, GhostLineageOverlay) can
+  // drive their ghost-loading UI without each calling useGraphHydration with
+  // their own state.
+  const setHydrationPhase = useCanvasStore((s) => s.setHydrationPhase)
+  useEffect(() => {
+    setHydrationPhase(hydrationPhase)
+  }, [hydrationPhase, setHydrationPhase])
+
+  // Clear trace state when the active view changes. The trace store is an
+  // app-singleton; without this, a trace started in view A leaks into view
+  // B (different data, different URNs) and the dock stays open against an
+  // unrelated canvas. Stale trace-added edges in the canvas store are
+  // wiped naturally by view B's hydration cycle, so only the trace state
+  // needs explicit cleanup here.
+  const activeViewId = activeView?.id
+  useEffect(() => {
+    const { clearTrace, resetAddedEdgeIds } = useTraceStore.getState()
+    clearTrace()
+    resetAddedEdgeIds()
+  }, [activeViewId])
 
   // Memoize canvas selection based on view layout type
   const CanvasComponent = useMemo(() => {

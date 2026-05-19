@@ -83,14 +83,44 @@ export class RemoteGraphProvider implements GraphDataProvider {
     private _inflight = new Map<string, Promise<unknown>>()
 
     /** Short-lived response cache for GET requests (prevents rapid re-fetches during re-renders) */
-    private _responseCache = new Map<string, { data: unknown; ts: number }>()
-    private static RESPONSE_CACHE_TTL = 2000 // 2 seconds
+    private _responseCache = new Map<string, { data: unknown; ts: number; ttl: number }>()
+    /** Fallback TTL for endpoints not matched in {@link responseCacheTtlMs}. */
+    private static DEFAULT_RESPONSE_CACHE_TTL_MS = 2000
 
     constructor(options?: RemoteGraphProviderOptions) {
         this.workspaceId = options?.workspaceId
         this.dataSourceId = options?.dataSourceId
         this.connectionId = options?.connectionId
         this.circuitBreaker = getCircuitBreaker(this.workspaceId, this.dataSourceId)
+    }
+
+    /**
+     * Per-endpoint response cache TTL. Hot read paths (children, edges,
+     * top-level) sit at 30s so a "expand all" or zoom-out doesn't re-fire
+     * the same query against FalkorDB on every render — backend cache
+     * (Phase 1) will extend the same window server-side. Metadata reads
+     * (schema/ontology) sit at 60s because they change rarely. Anything
+     * else falls through to the legacy 2s window via DEFAULT.
+     *
+     * Match is by the first url path segment after `/graph/` (or the
+     * literal path when not workspace-scoped).
+     */
+    private static responseCacheTtlMs(path: string): number {
+        // Strip query params and workspace/api prefix
+        const pathOnly = path.split('?')[0]
+        const seg = pathOnly.replace(/^\/api\/v\d+(\/[^/]+)?\/graph/, '')
+        // Hot read paths — 30 s
+        if (seg.includes('/children')) return 30_000
+        if (seg.startsWith('/edges/between') || seg.startsWith('/edges/query')) return 30_000
+        if (seg.startsWith('/nodes/top-level')) return 30_000
+        if (seg.startsWith('/nodes/query') || seg === '/search') return 30_000
+        if (seg.match(/^\/nodes\/[^/]+\/(ancestors|descendants|parent)/)) return 30_000
+        // Metadata/schema endpoints — 60 s (change rarely; cached server-side too)
+        if (seg.startsWith('/metadata') || seg === '/introspection' || seg === '/stats') {
+            return 60_000
+        }
+        // Default — preserve the legacy short window
+        return RemoteGraphProvider.DEFAULT_RESPONSE_CACHE_TTL_MS
     }
 
     // ==========================================
@@ -137,7 +167,7 @@ export class RemoteGraphProvider implements GraphDataProvider {
         // Check short-lived response cache for GET requests
         if (method === 'GET') {
             const cached = this._responseCache.get(cacheKey)
-            if (cached && Date.now() - cached.ts < RemoteGraphProvider.RESPONSE_CACHE_TTL) {
+            if (cached && Date.now() - cached.ts < cached.ttl) {
                 return cached.data as T
             }
         }
@@ -191,9 +221,12 @@ export class RemoteGraphProvider implements GraphDataProvider {
 
             const data = await response.json() as T
 
-            // Cache GET responses briefly to handle rapid re-renders
+            // Cache GET responses; TTL is per-endpoint (hot read paths 30s,
+            // metadata 60s, default 2s) so a "expand all" doesn't re-fire
+            // the same children query on every render.
             if (method === 'GET') {
-                this._responseCache.set(cacheKey, { data, ts: Date.now() })
+                const ttl = RemoteGraphProvider.responseCacheTtlMs(url)
+                this._responseCache.set(cacheKey, { data, ts: Date.now(), ttl })
             }
 
             this.circuitBreaker.recordSuccess()

@@ -1,0 +1,159 @@
+# ── Images ────────────────────────────────────────────────────────────
+# Final image = "{registry}/{org}/{name}:{tag}". Build the 6 images from the
+# repo Dockerfiles and push to Docker Hub before deploying — no CI exists.
+image:
+  registry: docker.io
+  org: synodic
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ── Ingress (ingress-nginx, plain HTTP) ───────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  host: dataviz.example.com
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+
+# ── Non-secret config (rendered into a ConfigMap) ─────────────────────
+config:
+  logLevel: INFO
+  # Keep in sync with ingress.host.
+  corsAllowedOrigins: "http://dataviz.example.com"
+  graphProvider: falkordb
+  # EXTERNAL FalkorDB endpoint (managed / VM / other cluster).
+  falkordb:
+    host: REPLACE_ME_FALKORDB_HOST
+    port: "6379"
+    graphName: nexus_lineage
+  jwt:
+    algorithm: HS256
+    expiryMinutes: "60"
+  adminEmail: admin@synodic.local
+  aggregation:
+    jobTimeoutSecs: "7200"
+    workerConcurrency: "4"
+    maxConcurrentPerGraph: "2"
+  stats:
+    schedulerTickSecs: "30"
+    workerConcurrency: "2"
+    maxConcurrentPerGraph: "1"
+    defaultIntervalSecs: "300"
+    minIntervalSecs: "60"
+    maxDeliveryAttempts: "3"
+    drainTimeoutSecs: "60"
+    pollTimeoutSecs: "30"
+    pollTimeoutLargeSecs: "600"
+    pollLargeThreshold: "100000"
+
+# ── Secrets ───────────────────────────────────────────────────────────
+# create=true renders a Secret from the values below. For production prefer
+# create=false + an existingSecret you created out-of-band (kubectl/SealedSecret).
+# Required keys: MANAGEMENT_DB_URL, REDIS_URL, JWT_SECRET_KEY, ADMIN_PASSWORD,
+# CREDENTIAL_ENCRYPTION_KEY, and (if dbInit.enabled) DB_INIT_DSN.
+secrets:
+  create: true
+  existingSecret: ""
+  managementDbUrl: "postgresql+asyncpg://synodic:REPLACE_ME@REPLACE_ME_PG_HOST:5432/synodic"
+  redisUrl: "redis://REPLACE_ME_REDIS_HOST:6379/0"
+  jwtSecretKey: "REPLACE_ME"
+  adminPassword: "REPLACE_ME"
+  credentialEncryptionKey: ""
+  # Admin libpq DSN for the db-init Job (CREATE ROLE/DATABASE needs privileges).
+  dbInitDsn: "postgresql://postgres:REPLACE_ME@REPLACE_ME_PG_HOST:5432/postgres"
+  # Only used when stores.postgres.enabled (in-cluster Postgres). Keep in
+  # sync with the password inside managementDbUrl.
+  postgresPassword: "REPLACE_ME"
+
+# ── In-cluster stateful backing stores (OPT-IN) ───────────────────────
+# Alternative to external/managed Cloud SQL + Memorystore + FalkorDB.
+# When enabled, point the app at the in-cluster Service DNS names:
+#   config.falkordb.host: falkordb
+#   secrets.redisUrl: redis://redis:6379/0
+#   secrets.managementDbUrl: postgresql+asyncpg://synodic:<pw>@postgres:5432/synodic
+# Enabling postgres makes it self-bootstrap the schema, so set
+# dbInit.enabled: false in that case.
+stores:
+  falkordb:
+    enabled: false
+    image: falkordb/falkordb:v4.16.0
+    storage: 10Gi
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 2Gi }
+  redis:
+    enabled: false
+    image: redis:7-alpine
+    storage: 5Gi
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  postgres:
+    enabled: false
+    image: postgres:16.4-alpine
+    storage: 20Gi
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 2Gi }
+
+# ── DB bootstrap Job (applies roles + schemas to external Postgres) ───
+# Idempotent. The 'aggregation' schema MUST exist before the control plane
+# runs Alembic. Runs as a Helm pre-install/pre-upgrade hook.
+dbInit:
+  enabled: true
+  image: postgres:16.4-alpine
+
+# ── Boot ordering ─────────────────────────────────────────────────────
+# Adds a wait-for-controlplane initContainer to viz/worker/stats so the
+# singleton control plane finishes Alembic + creates the aggregation schema
+# before they start. Disable only for single-shot dev.
+ordering:
+  enabled: true
+  image: curlimages/curl:8.10.1
+
+# ── Demo-data seed Job (OPT-IN) ───────────────────────────────────────
+# Post-install/upgrade hook that loads demo scenarios into FalkorDB.
+# Idempotent (skips if the graph already has data).
+seed:
+  enabled: false
+  scenarios: "finance,ecommerce"
+  scale: "1"
+  breadth: "1"
+  depth: "1"
+
+# ── Per-workload settings ─────────────────────────────────────────────
+services:
+  viz:
+    replicas: 2
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  graph:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  controlplane:
+    replicas: 1
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  worker:
+    replicas: 2
+    terminationGracePeriodSeconds: 120
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  stats:
+    replicas: 1
+    terminationGracePeriodSeconds: 120
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+  frontend:
+    replicas: 2
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 128Mi }

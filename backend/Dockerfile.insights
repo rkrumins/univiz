@@ -1,9 +1,10 @@
-# ── Synodic Stats Service (Background Poller) ─────────────────────────
-# Headless refresh loop for per-data-source graph stats (node/edge counts,
-# schema, ontology). Fully decoupled from viz-service and Control Plane —
-# own connection pools, own circuit breakers, own timeouts.
+# ── Synodic Insights Service (Background Poller) ─────────────────────
+# Headless entrypoint for `python -m backend.insights_service`. Owns the
+# per-data-source stats refresh loop (node/edge counts, schema, ontology),
+# discovery jobs, and purge. Fully decoupled from viz-service and Control
+# Plane — own connection pools, own circuit breakers, own timeouts.
 #
-# Architecture:
+# Process layout (all in one asyncio runtime):
 #   - Scheduler task: every STATS_SCHEDULER_TICK_SECS, enqueues due
 #     data sources to the 'stats.jobs' Redis Stream (with SET NX dedup).
 #   - Worker task: XREADGROUP on 'stats.jobs' (group: stats-workers).

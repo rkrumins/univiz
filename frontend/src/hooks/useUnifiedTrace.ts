@@ -192,6 +192,14 @@ export interface TraceState {
      * to leak into the ambient edge mesh.
      */
     addedEdgeIds: Set<string>
+    /**
+     * In-flight drill targets — `${sourceUrn}->${targetUrn}` for each
+     * aggregated edge currently being expanded. Set on drill start, cleared
+     * on response (success or failure). Lets the renderer pulse the
+     * drilling edge instead of leaving the canvas visually frozen during
+     * the network round-trip.
+     */
+    expandingPairs: Set<string>
 
     // Actions
     setFocus: (nodeId: string | null) => void
@@ -234,13 +242,24 @@ const TRACE_HISTORY_LIMIT = 5
 // Default Configuration
 // ============================================
 
+/**
+ * Default depth applied when the dock direction arrows re-enable a side
+ * that was previously zeroed out. Also the initial config depth, so a
+ * fresh trace covers the full pipeline by default.
+ */
+export const DEFAULT_TRACE_DEPTH = 25
+
+/** Hard upper bound for any depth input — matches the trace depth control's slider max. */
+export const MAX_TRACE_DEPTH = 100
+
 const DEFAULT_CONFIG: TraceConfig = {
-    // Skeleton-first defaults. At level=0 (top-level Domain rollup), the
-    // ontology bounds the result set to ~10s of nodes — depth=99 is "as
-    // deep as the rollup extends", not "walk 99 hops of raw lineage".
-    // Backend hard caps via TRACE_MAX_NODES + TRACE_TIMEOUT_MS.
-    upstreamDepth: 99,
-    downstreamDepth: 99,
+    // 25/25 covers a deep end-to-end pipeline by default. Users can raise
+    // this to 100 via the Trace Depth header chip (visible only in trace
+    // mode), or drop to 0 on one side via the dock direction arrows.
+    // Materialized AGGREGATED edges at the focus level keep hub-node
+    // traces tractable even at the upper bound.
+    upstreamDepth: DEFAULT_TRACE_DEPTH,
+    downstreamDepth: DEFAULT_TRACE_DEPTH,
     includeColumnLineage: true,
     excludeContainmentEdges: true,
     includeInheritedLineage: true,
@@ -276,6 +295,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
     drilldowns: new Map(),
     traceHistory: [],
     addedEdgeIds: new Set(),
+    expandingPairs: new Set(),
 
     setFocus: (nodeId) => {
         if (nodeId === null) {
@@ -380,6 +400,11 @@ export const useTraceStore = create<TraceState>((set, get) => ({
         const key = drilldownKey(sourceUrn, targetUrn, nextLevel)
         if (drilldowns.has(key)) return drilldowns.get(key) ?? null
 
+        const pairKey = `${sourceUrn}->${targetUrn}`
+        const expandingNext = new Set(get().expandingPairs)
+        expandingNext.add(pairKey)
+        set({ expandingPairs: expandingNext })
+
         try {
             const v2 = await provider.expandAggregated({
                 sourceUrn,
@@ -389,7 +414,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
                 includeContainmentEdges: config.includeContainmentEdges,
             })
             // Merge into the drilldowns map (immutable replacement so React selectors notice).
-            const next = new Map(drilldowns)
+            const next = new Map(get().drilldowns)
             next.set(key, v2)
             set({ drilldowns: next })
             return v2
@@ -397,6 +422,10 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             // Drill-down failure is non-fatal — keep the trace state, surface error.
             set({ error: err instanceof Error ? err.message : 'Failed to expand aggregated edge' })
             return null
+        } finally {
+            const after = new Set(get().expandingPairs)
+            after.delete(pairKey)
+            set({ expandingPairs: after })
         }
     },
 
@@ -421,6 +450,18 @@ export const useTraceStore = create<TraceState>((set, get) => ({
                 .filter((r): r is TraceV2Result => r !== undefined))
         }
 
+        // Mark every uncached pair as in-flight so the renderer can pulse
+        // them. Cleared in the final `then` below regardless of outcome.
+        const pairKeys = uncached.map(p => `${p.sourceUrn}->${p.targetUrn}`)
+        const expandingStart = new Set(get().expandingPairs)
+        for (const k of pairKeys) expandingStart.add(k)
+        set({ expandingPairs: expandingStart })
+        const clearExpanding = () => {
+            const after = new Set(get().expandingPairs)
+            for (const k of pairKeys) after.delete(k)
+            set({ expandingPairs: after })
+        }
+
         // Try the batch endpoint first. On ANY failure (4xx, 5xx, network),
         // fall back to N concurrent per-edge expandAggregated calls so the
         // drill flow keeps working. Without this fallback, a single
@@ -442,40 +483,44 @@ export const useTraceStore = create<TraceState>((set, get) => ({
         }
 
         let merged: TraceV2Result | null = null
-        if (typeof provider.expandAggregatedBatch === 'function') {
-            try {
-                merged = await provider.expandAggregatedBatch({
-                    pairs: uncached,
-                    lineageEdgeTypes: config.lineageEdgeTypes.length > 0 ? config.lineageEdgeTypes : null,
-                    includeContainmentEdges: config.includeContainmentEdges,
-                })
-            } catch (err) {
-                // Log the batch failure but don't abort — drill back via per-edge.
-                console.warn('[trace] expand-batch failed, falling back to per-edge expand:', err)
-                merged = await callPerEdge()
-                if (!merged) {
-                    set({ error: err instanceof Error ? err.message : 'Failed to expand aggregated edges (batch)' })
-                    return null
+        try {
+            if (typeof provider.expandAggregatedBatch === 'function') {
+                try {
+                    merged = await provider.expandAggregatedBatch({
+                        pairs: uncached,
+                        lineageEdgeTypes: config.lineageEdgeTypes.length > 0 ? config.lineageEdgeTypes : null,
+                        includeContainmentEdges: config.includeContainmentEdges,
+                    })
+                } catch (err) {
+                    // Log the batch failure but don't abort — drill back via per-edge.
+                    console.warn('[trace] expand-batch failed, falling back to per-edge expand:', err)
+                    merged = await callPerEdge()
+                    if (!merged) {
+                        set({ error: err instanceof Error ? err.message : 'Failed to expand aggregated edges (batch)' })
+                        return null
+                    }
                 }
+            } else {
+                merged = await callPerEdge()
+                if (!merged) return null
             }
-        } else {
-            merged = await callPerEdge()
-            if (!merged) return null
-        }
 
-        // Cache the merged response under each (s, t, nextLevel) key so
-        // future calls for the same pair are no-ops. The cached entry per
-        // key is the full merged result — not ideal for memory but keeps
-        // the lookup contract identical to single-edge expand.
-        const next = new Map(drilldowns)
-        if (merged) {
-            for (const p of uncached) {
-                const key = drilldownKey(p.sourceUrn, p.targetUrn, p.nextLevel)
-                next.set(key, merged)
+            // Cache the merged response under each (s, t, nextLevel) key so
+            // future calls for the same pair are no-ops. The cached entry per
+            // key is the full merged result — not ideal for memory but keeps
+            // the lookup contract identical to single-edge expand.
+            const next = new Map(get().drilldowns)
+            if (merged) {
+                for (const p of uncached) {
+                    const key = drilldownKey(p.sourceUrn, p.targetUrn, p.nextLevel)
+                    next.set(key, merged)
+                }
+                set({ drilldowns: next })
             }
-            set({ drilldowns: next })
+            return merged
+        } finally {
+            clearExpanding()
         }
-        return merged
     },
 
     collapseDrilldown: (key) => {
@@ -500,6 +545,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             showUpstream: true,
             showDownstream: true,
             drilldowns: new Map(),
+            expandingPairs: new Set(),
         })
     },
 
@@ -529,6 +575,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
             drilldowns: new Map(),
             addedEdgeIds: new Set(),
             traceHistory: [],
+            expandingPairs: new Set(),
         })
     },
 }))
@@ -728,6 +775,13 @@ export interface UseUnifiedTraceResult {
     recordAddedEdgeIds: (ids: Iterable<string>) => void
     /** Drop the tracked added-edge ids (without affecting the canvas store). */
     resetAddedEdgeIds: () => void
+
+    /**
+     * `${sourceUrn}->${targetUrn}` for each aggregated edge whose drill-down
+     * is in-flight. Renderers can use this to pulse the edge while the
+     * network call completes so the canvas never appears frozen.
+     */
+    expandingPairs: Set<string>
 }
 
 export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTraceResult {
@@ -744,6 +798,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
     const drilldowns = useTraceStore(s => s.drilldowns)
     const traceHistory = useTraceStore(s => s.traceHistory)
     const addedEdgeIds = useTraceStore(s => s.addedEdgeIds)
+    const expandingPairs = useTraceStore(s => s.expandingPairs)
 
     // Actions
     const setConfig = useTraceStore(s => s.setConfig)
@@ -1003,6 +1058,7 @@ export function useUnifiedTrace(options: UseUnifiedTraceOptions): UseUnifiedTrac
         addedEdgeIds,
         recordAddedEdgeIds,
         resetAddedEdgeIds,
+        expandingPairs,
     }
 }
 

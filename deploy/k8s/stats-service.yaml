@@ -1,0 +1,74 @@
+# Background poller — keeps graph stats fresh in Postgres. No Service
+# (port 8092 is health-only). Scale horizontally via replicas; per-source
+# Redis SET NX dedup guarantees at-most-one pending poll per data source.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stats-service
+  namespace: dataviz
+  labels:
+    app.kubernetes.io/name: stats-service
+    app.kubernetes.io/part-of: dataviz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stats-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stats-service
+        app.kubernetes.io/part-of: dataviz
+    spec:
+      # Drain in-flight polls on rollout/scale-down instead of SIGKILL at 30s.
+      terminationGracePeriodSeconds: 120
+      initContainers:
+        # Controlplane runs Alembic — ensures polling_config / stats tables
+        # exist before this starts. Replaces compose depends_on.
+        - name: wait-for-controlplane
+          image: curlimages/curl:8.10.1
+          command:
+            - /bin/sh
+            - -c
+            - "until curl -sf http://aggregation-controlplane:8091/health; do echo waiting for controlplane; sleep 3; done"
+      containers:
+        - name: stats-service
+          # Build backend/Dockerfile.insights and push to Docker Hub.
+          image: docker.io/synodic/stats-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 8092
+          envFrom:
+            - configMapRef:
+                name: dataviz-config
+            - secretRef:
+                name: dataviz-secrets
+          env:
+            - name: SYNODIC_ROLE
+              value: "stats"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 15
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

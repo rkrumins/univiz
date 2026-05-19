@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Node, Edge, Viewport } from '@xyflow/react'
+import type { HydrationPhase } from '@/hooks/useGraphHydration'
 
 export interface LineageNode extends Node {
   data: {
@@ -55,12 +56,42 @@ interface CanvasState {
   /** Atomic add of both nodes and edges with dedup (1 re-render) */
   addGraph: (nodes: LineageNode[], edges: LineageEdge[]) => void
 
+  // Visible edges — the projected + aggregated lineage edge set currently
+  // rendered on the canvas. Published by whichever canvas component owns
+  // edge projection (ContextViewCanvas via useEdgeProjection; GraphCanvas via
+  // its allVisibleEdges memo). Read by panels that need to mirror what the
+  // user actually sees on canvas (e.g. EntityDrawer's Lineage section),
+  // which raw `edges` alone cannot represent because raw edges live at
+  // leaf level while the canvas shows them rolled up to visible ancestors
+  // and merged with backend-aggregated edges. Empty when no canvas is
+  // mounted — readers must fall back to `edges`.
+  visibleEdges: LineageEdge[]
+  setVisibleEdges: (edges: LineageEdge[]) => void
+
+  // One-shot pulse highlight — populated after a "jump to node" reveal so
+  // the user sees a visible confirmation of where they landed. A Set
+  // because multi-locate flows fire multiple pulses concurrently; using
+  // a single id would let the latest call overwrite earlier ones and
+  // only the last node would visibly pulse. Each entry auto-clears
+  // after the animation duration (~900ms). Read by node components
+  // (GenericNode, FlatTreeItem) via `pulseNodeIds.has(id)` to apply the
+  // `lineage-pulse` class.
+  pulseNodeIds: Set<string>
+  pulseNode: (id: string) => void
+
   // Selection
   selectedNodeIds: string[]
   selectedEdgeIds: string[]
   selectNode: (id: string, multi?: boolean) => void
   selectEdge: (id: string, multi?: boolean) => void
   clearSelection: () => void
+
+  // Sticky entity drawer — which entity the drawer currently shows.
+  // Decoupled from selection so background clicks / selection changes
+  // don't close it; only an explicit close (X) does.
+  drawerNodeId: string | null
+  openNodeDrawer: (id: string) => void
+  closeNodeDrawer: () => void
 
   // Viewport
   viewport: Viewport
@@ -72,6 +103,12 @@ interface CanvasState {
   setLoading: (loading: boolean) => void
   addLoadingRegion: (region: string) => void
   removeLoadingRegion: (region: string) => void
+
+  // Hydration phase — mirrored from useGraphHydration({hydrate:true}) in
+  // CanvasRouter so downstream canvas components can drive ghost-loading UI
+  // without each owning their own hydration hook.
+  hydrationPhase: HydrationPhase
+  setHydrationPhase: (phase: HydrationPhase) => void
 
   // Active Lens
   activeLensId: string | null
@@ -155,6 +192,28 @@ export const useCanvasStore = create<CanvasState>()(
       _version: 0,
       setNodes: (nodes) => set({ nodes, _nodeIndex: new Set(nodes.map((n) => n.id)) }),
       setEdges: (edges) => set({ edges, _edgeIndex: new Set(edges.map((e) => e.id)) }),
+      visibleEdges: [],
+      setVisibleEdges: (visibleEdges) => set({ visibleEdges }),
+      pulseNodeIds: new Set(),
+      pulseNode: (id) => {
+        // Add to the pulsing set; each id auto-clears after the
+        // animation duration. Using a Set lets multi-locate fire many
+        // pulses in parallel without overwriting each other.
+        set((state) => {
+          if (state.pulseNodeIds.has(id)) return state // already pulsing
+          const next = new Set(state.pulseNodeIds)
+          next.add(id)
+          return { pulseNodeIds: next }
+        })
+        setTimeout(() => {
+          set((state) => {
+            if (!state.pulseNodeIds.has(id)) return state
+            const next = new Set(state.pulseNodeIds)
+            next.delete(id)
+            return { pulseNodeIds: next }
+          })
+        }, 900)
+      },
       addNodes: (newNodes) => set((state) => {
         const existingIds = state._nodeIndex
         const uniqueNodes = newNodes.filter((n) => !existingIds.has(n.id))
@@ -225,6 +284,10 @@ export const useCanvasStore = create<CanvasState>()(
             ? [] // Toggle off: clicking the already-selected node deselects it
             : [id],
         selectedEdgeIds: multi ? state.selectedEdgeIds : [],
+        // Single-select of a real entity opens (or swaps) the sticky drawer.
+        // Toggle-off keeps it open — only the X button closes it. Logical
+        // groupings and multi-select never touch the drawer.
+        ...(!multi && !id.startsWith('logical:') ? { drawerNodeId: id } : {}),
       })),
       selectEdge: (id, multi = false) => set((state) => ({
         selectedEdgeIds: multi
@@ -233,8 +296,16 @@ export const useCanvasStore = create<CanvasState>()(
             : [...state.selectedEdgeIds, id]
           : [id],
         selectedNodeIds: multi ? state.selectedNodeIds : [],
+        // Mutual exclusion: selecting an edge swaps the right rail to the
+        // edge drawer.
+        drawerNodeId: null,
       })),
       clearSelection: () => set({ selectedNodeIds: [], selectedEdgeIds: [] }),
+
+      // Sticky entity drawer
+      drawerNodeId: null,
+      openNodeDrawer: (id) => set({ drawerNodeId: id }),
+      closeNodeDrawer: () => set({ drawerNodeId: null }),
 
       // Viewport
       viewport: { x: 0, y: 0, zoom: 1 },
@@ -243,6 +314,8 @@ export const useCanvasStore = create<CanvasState>()(
       // Loading
       isLoading: false,
       loadingRegions: new Set(),
+      hydrationPhase: 'idle',
+      setHydrationPhase: (hydrationPhase) => set({ hydrationPhase }),
       setLoading: (isLoading) => set({ isLoading }),
       addLoadingRegion: (region) => set((state) => {
         const newRegions = new Set(state.loadingRegions)

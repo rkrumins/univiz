@@ -62,4 +62,23 @@ export type ComputedEdge = {
   isTraceEdge?: boolean
   /** True when an endpoint is the trace focus — emphasised more strongly. */
   isFocusIncident?: boolean
+  /**
+   * True when this edge points back upstream (target's layer index <
+   * source's). Renderer routes these in a dedicated dimmed lane so the
+   * canonical left→right flow stays clean. Computed in useEdgeProjection
+   * via `nodeLayerIndexMap`.
+   */
+  isReverseFlow?: boolean
+  /**
+   * True when the projection meta-bundled this edge from many fine-grained
+   * leaf-pair edges up to a containment-parent pair (browse-mode rollup).
+   * Drives the badge label "+N pairs" instead of "+N edges".
+   */
+  isBrowseBundle?: boolean
+  /**
+   * True when the projection collapsed an A→B and a B→A bundle into a
+   * single record. Renderer should draw a dual-arrowhead path
+   * (markerStart + markerEnd) to communicate two-way flow.
+   */
+  isBidirectional?: boolean
 }

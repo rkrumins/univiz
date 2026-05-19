@@ -9,7 +9,7 @@
  * - Node-centric edge exploration
  */
 
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
+import { useState, useMemo, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
     X,
@@ -34,6 +34,9 @@ import {
     Sparkles,
     Zap,
     Check,
+    Pencil,
+    Trash2,
+    Save,
 } from 'lucide-react'
 import { useCanvasStore, type LineageEdge, type LineageNode } from '@/store/canvas'
 import {
@@ -45,6 +48,9 @@ import {
 import { useSchemaStore, useContainmentEdgeTypes, useEdgeTypeMetadataMap, useRelationshipTypes } from '@/store/schema'
 import { getAllEdgeTypeDefinitions, normalizeEdgeType } from '@/utils/edgeTypeUtils'
 import { useEdgeVisual } from '@/hooks/useEntityVisual'
+import { useStagedChangesStore } from '@/store/stagedChangesStore'
+import { PropertyEditor } from '@/components/panels/PropertyEditor'
+import { patchEdge, deleteEdge as apiDeleteEdge } from '@/services/edgeApi'
 import { cn } from '@/lib/utils'
 
 // ============================================
@@ -113,17 +119,9 @@ export function EdgeDetailPanel({
     const ontologyMetadata = useMemo(() => ({ edgeTypeMetadata }), [edgeTypeMetadata])
     const panelRef = useRef<HTMLDivElement>(null)
 
-    // Click-outside to close panel
-    useEffect(() => {
-        if (!isOpen) return
-        const handleMouseDown = (e: MouseEvent) => {
-            if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
-                onClose()
-            }
-        }
-        document.addEventListener('mousedown', handleMouseDown)
-        return () => document.removeEventListener('mousedown', handleMouseDown)
-    }, [isOpen, onClose])
+    // Sticky: the X button is the only close path. Clicking other edges or
+    // the canvas background never closes the panel, it only swaps the data
+    // shown inside.
 
     // Generate filters dynamically if not provided
     const edgeFilters = useMemo(() => {
@@ -682,6 +680,69 @@ function EdgeCard({
     const color = edgeVisual.strokeColor
     const EdgeIcon = GitBranch  // Generic fallback; icon resolution TBD in Phase 4d
 
+    // Inline edit state — toggles between read-only properties view and
+    // PropertyEditor. Changes optimistically update the canvas and stage an
+    // `edit_edge` change; the apply hook PATCHes the backend at Save Blueprint.
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    const [isEditing, setIsEditing] = useState(false)
+
+    // Server-rejected immutable keys — we hide them in the editor and never
+    // include them in the PATCH payload. The backend ignores edge type changes,
+    // and `isAggregated` / `sourceEdgeCount` / `sourceEdges` are client-only.
+    const IMMUTABLE_EDGE_KEYS = ['edgeType', 'relationship', 'isAggregated', 'sourceEdgeCount', 'sourceEdges', 'animated']
+
+    const stageEdgeEdit = (newData: Record<string, any>) => {
+        const previousData: Record<string, any> = { ...(edge.data ?? {}) }
+        // Optimistic visual update.
+        useCanvasStore.getState().updateEdge(edge.id, newData as any)
+        const stagedChanges = useStagedChangesStore.getState()
+        const sourceLabel = (sourceNode?.data.label as string) || edge.source
+        const targetLabel = (targetNode?.data.label as string) || edge.target
+        stagedChanges.stageOrReplace(
+            (c) => c.type === 'edit_edge' && c.targetId === edge.id,
+            {
+                type: 'edit_edge',
+                targetId: edge.id,
+                before: previousData,
+                after: { ...newData },
+                summary: `Edit edge '${sourceLabel}' → '${targetLabel}'`,
+                discard: () => {
+                    useCanvasStore.getState().updateEdge(edge.id, previousData as any)
+                },
+                apply: async (ctx) => {
+                    const propsToSend: Record<string, unknown> = {}
+                    for (const [k, v] of Object.entries(newData)) {
+                        if (IMMUTABLE_EDGE_KEYS.includes(k)) continue
+                        propsToSend[k] = v
+                    }
+                    await patchEdge(ctx.wsId, edge.id, propsToSend)
+                },
+            },
+        )
+    }
+
+    const stageEdgeDelete = () => {
+        // Capture the full edge for restore-on-discard, then drop it locally.
+        const snapshot = { ...edge }
+        useCanvasStore.getState().removeEdge(edge.id)
+        const stagedChanges = useStagedChangesStore.getState()
+        const sourceLabel = (sourceNode?.data.label as string) || edge.source
+        const targetLabel = (targetNode?.data.label as string) || edge.target
+        stagedChanges.stage({
+            type: 'delete_edge',
+            targetId: edge.id,
+            before: snapshot,
+            after: null,
+            summary: `Delete edge '${sourceLabel}' → '${targetLabel}'`,
+            discard: () => {
+                useCanvasStore.getState().addEdges([snapshot])
+            },
+            apply: async (ctx) => {
+                await apiDeleteEdge(ctx.wsId, edge.id)
+            },
+        })
+    }
+
     return (
         <motion.div
             layout
@@ -750,6 +811,36 @@ function EdgeCard({
                     title={isHighlighted ? "Remove highlight" : "Highlight edge"}
                 >
                     <Highlighter className="w-3 h-3" />
+                </button>
+
+                {/* Edit button — expands the card and switches to PropertyEditor */}
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation()
+                        if (!isExpanded) onToggleExpand()
+                        setIsEditing((v) => !v)
+                    }}
+                    className={cn(
+                        "w-6 h-6 flex items-center justify-center rounded transition-colors",
+                        isEditing
+                            ? "bg-accent-lineage/15 text-accent-lineage"
+                            : "text-ink-muted hover:text-accent-lineage hover:bg-accent-lineage/5"
+                    )}
+                    title={isEditing ? "Done editing" : "Edit properties"}
+                >
+                    <Pencil className="w-3 h-3" />
+                </button>
+
+                {/* Delete button — stages delete_edge; restored on discard */}
+                <button
+                    onClick={(e) => {
+                        e.stopPropagation()
+                        stageEdgeDelete()
+                    }}
+                    className="w-6 h-6 flex items-center justify-center rounded text-ink-muted hover:text-red-500 hover:bg-red-500/10 transition-colors"
+                    title="Delete edge"
+                >
+                    <Trash2 className="w-3 h-3" />
                 </button>
 
                 {onDeselect && (
@@ -834,22 +925,48 @@ function EdgeCard({
                                 </div>
                             )}
 
-                            {/* Additional Metadata */}
-                            {edge.data && Object.keys(edge.data).filter(k =>
-                                !['confidence', 'edgeType', 'relationship', 'animated', 'isAggregated', 'sourceEdgeCount', 'sourceEdges', 'label'].includes(k)
-                            ).length > 0 && (
+                            {/* Properties — read-only by default; PropertyEditor swap on Edit.
+                                Immutable keys (edgeType, isAggregated, …) are filtered
+                                out of the editor so the user can't try to PATCH them. */}
+                            {(() => {
+                                const editableData: Record<string, any> = {}
+                                if (edge.data) {
+                                    for (const [k, v] of Object.entries(edge.data)) {
+                                        if (IMMUTABLE_EDGE_KEYS.includes(k)) continue
+                                        editableData[k] = v
+                                    }
+                                }
+                                const hasEditable = Object.keys(editableData).length > 0
+                                if (!hasEditable && !isEditing) return null
+                                return (
                                     <div className="text-2xs">
-                                        <span className="text-ink-muted">Properties: </span>
-                                        <div className="mt-1 font-mono bg-black/5 dark:bg-white/5 p-2 rounded text-ink-secondary overflow-x-auto text-2xs">
-                                            {Object.entries(edge.data)
-                                                .filter(([k]) => !['confidence', 'edgeType', 'relationship', 'animated', 'isAggregated', 'sourceEdgeCount', 'sourceEdges', 'label'].includes(k))
-                                                .map(([k, v]) => (
-                                                    <div key={k}>{k}: {JSON.stringify(v)}</div>
-                                                ))
-                                            }
+                                        <div className="flex items-center justify-between mb-1">
+                                            <span className="text-ink-muted">Properties</span>
+                                            {isEditing && (
+                                                <span className="text-accent-lineage flex items-center gap-1">
+                                                    <Save className="w-3 h-3" />
+                                                    Staged on edit
+                                                </span>
+                                            )}
                                         </div>
+                                        {isEditing ? (
+                                            <div onClick={(e) => e.stopPropagation()}>
+                                                <PropertyEditor
+                                                    value={editableData}
+                                                    onChange={(next) => stageEdgeEdit(next as Record<string, any>)}
+                                                    bare
+                                                />
+                                            </div>
+                                        ) : hasEditable ? (
+                                            <div className="font-mono bg-black/5 dark:bg-white/5 p-2 rounded text-ink-secondary overflow-x-auto text-2xs">
+                                                {Object.entries(editableData).map(([k, v]) => (
+                                                    <div key={k}>{k}: {JSON.stringify(v)}</div>
+                                                ))}
+                                            </div>
+                                        ) : null}
                                     </div>
-                                )}
+                                )
+                            })()}
                         </div>
                     </motion.div>
                 )}

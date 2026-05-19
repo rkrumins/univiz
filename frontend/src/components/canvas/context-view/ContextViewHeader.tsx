@@ -14,7 +14,11 @@ import { useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useToast } from '@/components/ui/toast'
 import type { HierarchyNode } from './types'
+import type { LineageRenderMode } from '@/store/preferences'
+import { LineageDisplayPopover } from './LineageDisplayPopover'
+import { TraceDepthControl } from './TraceDepthControl'
 
 export interface ContextViewHeaderProps {
   // Search
@@ -31,12 +35,32 @@ export interface ContextViewHeaderProps {
   showEdgeDirection: boolean
   onToggleEdgeDirection: () => void
 
+  // Edge rendering mode — Stubs (chip-only) / Auto (size-adaptive) / Raw
+  // (render all). Bound to usePreferencesStore.lineageRenderMode; the
+  // canvas reads the same store separately. Header drives the user-
+  // facing toggle; persistence + side effects live in the store.
+  lineageRenderMode: LineageRenderMode
+  onSetLineageRenderMode: (mode: LineageRenderMode) => void
+
   // Trace — global toggle that mirrors the keyboard shortcut. Drawer's
   // per-node trace buttons remain for granular up/down/full control.
   traceActive: boolean
   canTrace: boolean
   onStartTrace: () => void
   onExitTrace: () => void
+  /** True once the canvas finishes hydrating (entities + edges). When
+   *  false, Trace is unsafe to fire — the backend hasn't fully loaded the
+   *  lineage graph yet and the trace would return nothing. The header
+   *  surfaces this as a distinct "loading" button state with a toast on
+   *  attempted click. */
+  lineageReady: boolean
+
+  // Trace depth — visible affordance under the Lineage controls so users
+  // can see and adjust the current upstream/downstream hop count. Edits
+  // re-run the active trace (handled by the parent's onSetTraceDepth).
+  traceUpstreamDepth: number
+  traceDownstreamDepth: number
+  onSetTraceDepth: (dir: 'upstream' | 'downstream', value: number) => void
 
   // Add entity
   onAddEntity: () => void
@@ -72,10 +96,16 @@ export function ContextViewHeader({
   onToggleLineageFlow,
   showEdgeDirection,
   onToggleEdgeDirection,
+  lineageRenderMode,
+  onSetLineageRenderMode,
   traceActive,
   canTrace,
   onStartTrace,
   onExitTrace,
+  lineageReady,
+  traceUpstreamDepth,
+  traceDownstreamDepth,
+  onSetTraceDepth,
   onAddEntity,
   viewName,
   entityTypeCount,
@@ -91,6 +121,17 @@ export function ContextViewHeader({
   onRedo,
 }: ContextViewHeaderProps) {
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const { showToast } = useToast()
+
+  // Warn the user when they try to trace before the lineage data has
+  // finished hydrating. Keyed so rapid repeat clicks coalesce instead of
+  // stacking dozens of identical toasts.
+  const warnLineageNotReady = () => {
+    showToast(
+      'warning',
+      'Trace is unavailable until lineage finishes loading. Please wait a moment.',
+    )
+  }
 
   return (
     <div className="flex-shrink-0 bg-gradient-to-r from-canvas-elevated/90 via-canvas-elevated/95 to-canvas-elevated/90 backdrop-blur-xl border-b border-black/[0.08] dark:border-white/[0.06] px-6 py-3 relative">
@@ -141,9 +182,12 @@ export function ContextViewHeader({
 
         {/* Zone 3 — Actions */}
         <div className="flex items-center gap-3">
-          {/* Lineage Flow Toggle */}
+          {/* Lineage Flow Toggle — single stable label. State is conveyed
+              through the colored dot + active gradient. Trace state lives
+              on its own button below; this label no longer encodes it. */}
           <button
             onClick={onToggleLineageFlow}
+            title={showLineageFlow ? 'Hide the lineage mesh on the canvas' : 'Show the lineage mesh on the canvas'}
             className={cn(
               "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all duration-300",
               showLineageFlow
@@ -154,35 +198,35 @@ export function ContextViewHeader({
             <motion.div animate={{ rotate: showLineageFlow ? 0 : -180 }} transition={{ duration: 0.3 }}>
               <LucideIcons.GitBranch className="w-4 h-4" />
             </motion.div>
-            <span>
-              {showLineageFlow
-                ? (traceActive ? 'Flow + Trace' : 'Flow Active')
-                : 'Show Flow'}
-            </span>
+            <span>Lineage</span>
             <div className={cn(
               "w-2 h-2 rounded-full transition-colors duration-300",
               showLineageFlow ? "bg-green-500 dark:bg-green-400 dark:shadow-lg dark:shadow-green-400/50" : "bg-ink-muted/30"
             )} />
           </button>
 
-          {/* Show Direction toggle */}
-          <button
-            onClick={onToggleEdgeDirection}
-            title={showEdgeDirection ? 'Hide edge direction' : 'Show edge direction'}
-            className={cn(
-              "flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium transition-all duration-300",
-              showEdgeDirection
-                ? "bg-gradient-to-r from-cyan-500/15 to-cyan-500/[0.08] text-cyan-700 border border-cyan-400/40 shadow-sm shadow-cyan-500/10 dark:from-cyan-500/20 dark:to-cyan-500/10 dark:text-cyan-300 dark:border-cyan-400/30 dark:shadow-lg dark:shadow-cyan-400/10"
-                : "bg-black/[0.04] border border-black/[0.10] text-ink-muted hover:bg-black/[0.08] hover:text-ink dark:bg-white/[0.04] dark:border-white/[0.08] dark:hover:bg-white/[0.08]"
-            )}
-          >
-            <LucideIcons.MoveRight className="w-3.5 h-3.5" />
-            <span>{showEdgeDirection ? 'Direction On' : 'Direction Off'}</span>
-          </button>
+          {/* Display popover — consolidates Edge Density (Stubs/Auto/Raw)
+              and Direction arrows behind a single trigger. Hidden when
+              Lineage is off: with no mesh rendering, these settings have
+              no effect, so the toolbar stays uncluttered. */}
+          {showLineageFlow && (
+            <LineageDisplayPopover
+              lineageRenderMode={lineageRenderMode}
+              onSetLineageRenderMode={onSetLineageRenderMode}
+              showEdgeDirection={showEdgeDirection}
+              onToggleEdgeDirection={onToggleEdgeDirection}
+            />
+          )}
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
 
-          {/* Trace toggle */}
+          {/* Trace toggle — three visual states:
+              1. `traceActive` → Exit Trace (rose, pulsing dot)
+              2. `!lineageReady` → "Loading lineage…" (indigo pulse + spinner).
+                 Stays clickable to fire a warning toast, so the affordance
+                 reads as "not yet" rather than "broken".
+              3. ready → Trace Lineage (existing indigo gradient). Hard-
+                 disabled when no entity selected. */}
           {traceActive ? (
             <button
               onClick={onExitTrace}
@@ -192,6 +236,25 @@ export function ContextViewHeader({
               <LucideIcons.X className="w-4 h-4" strokeWidth={2.4} />
               <span>Exit Trace</span>
               <span className="w-2 h-2 rounded-full bg-rose-500 dark:bg-rose-300 dark:shadow-lg dark:shadow-rose-300/60 animate-pulse" />
+            </button>
+          ) : !lineageReady ? (
+            <button
+              onClick={warnLineageNotReady}
+              aria-busy="true"
+              title="Lineage data is still loading — Trace will become available once it finishes"
+              className={cn(
+                "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all duration-300 cursor-wait",
+                "bg-gradient-to-r from-accent-lineage/12 to-purple-500/[0.06] text-accent-lineage/85 border border-accent-lineage/30",
+                "dark:from-accent-lineage/18 dark:to-purple-500/10 dark:text-accent-lineage dark:border-accent-lineage/25",
+                "shadow-sm shadow-accent-lineage/10",
+              )}
+            >
+              <LucideIcons.Loader2 className="w-4 h-4 animate-spin" strokeWidth={2.4} />
+              <span>Loading lineage…</span>
+              <span
+                className="w-2 h-2 rounded-full bg-accent-lineage dark:shadow-lg dark:shadow-accent-lineage/60 animate-pulse"
+                aria-hidden
+              />
             </button>
           ) : (
             <button
@@ -208,6 +271,18 @@ export function ContextViewHeader({
               <LucideIcons.Workflow className="w-4 h-4" strokeWidth={2.2} />
               <span>Trace Lineage</span>
             </button>
+          )}
+
+          {/* Trace Depth — visible only during an active trace. Sits right
+              next to the Trace toggle so the active scope (↑N upstream,
+              ↓N downstream) is one glance away. Blue / green colors
+              mirror EntityDrawer's Root Cause / Impact treatment. */}
+          {traceActive && (
+            <TraceDepthControl
+              upstreamDepth={traceUpstreamDepth}
+              downstreamDepth={traceDownstreamDepth}
+              onChange={onSetTraceDepth}
+            />
           )}
 
           <div className="w-px h-6 bg-gradient-to-b from-transparent via-black/15 dark:via-white/10 to-transparent" />
