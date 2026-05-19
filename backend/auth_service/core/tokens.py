@@ -27,6 +27,7 @@ from .config import (
 
 _REFRESH_AUDIENCE = f"{JWT_AUDIENCE}:refresh"
 _INVITE_AUDIENCE = f"{JWT_AUDIENCE}:invite"
+_OIDC_STATE_AUDIENCE = f"{JWT_AUDIENCE}:oidc_state"
 
 
 # ── Access tokens ────────────────────────────────────────────────────
@@ -172,4 +173,53 @@ def decode_invite_token(token: str) -> dict:
     )
     if payload.get("purpose") != "invite":
         raise jwt.InvalidTokenError("Not an invite token")
+    return payload
+
+
+# ── OIDC flow-state tokens ───────────────────────────────────────────
+#
+# The Authorization-Code + PKCE dance needs ``state``, ``nonce`` and the
+# PKCE ``code_verifier`` to survive the round-trip to the IdP. Rather
+# than a server-side session store we sign them into a short-lived,
+# HttpOnly cookie. The signature makes the cookie tamper-proof; the
+# short expiry bounds the window for a stolen-cookie replay.
+
+def create_oidc_state_token(
+    *,
+    state: str,
+    nonce: str,
+    code_verifier: str,
+    next_path: str,
+    expires_in_minutes: int = 10,
+) -> str:
+    """Sign the in-flight OIDC handshake parameters into a JWT."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "purpose": "oidc_state",
+        "state": state,
+        "nonce": nonce,
+        "cv": code_verifier,
+        "next": next_path,
+        "iss": JWT_ISSUER,
+        "aud": _OIDC_STATE_AUDIENCE,
+        "iat": now,
+        "exp": now + timedelta(minutes=expires_in_minutes),
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def decode_oidc_state_token(token: str) -> dict:
+    """Decode an OIDC flow-state JWT. Returns the payload dict.
+
+    Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure.
+    """
+    payload = jwt.decode(
+        token,
+        JWT_SECRET_KEY,
+        algorithms=[JWT_ALGORITHM],
+        issuer=JWT_ISSUER,
+        audience=_OIDC_STATE_AUDIENCE,
+    )
+    if payload.get("purpose") != "oidc_state":
+        raise jwt.InvalidTokenError("Not an OIDC state token")
     return payload

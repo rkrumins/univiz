@@ -13,6 +13,7 @@ do not change.
 from __future__ import annotations
 
 import logging
+import secrets
 from typing import Awaitable, Callable, Optional
 
 import jwt as pyjwt
@@ -21,6 +22,7 @@ from .core.config import (
     JWT_EXPIRY_MINUTES,
     JWT_REFRESH_EXPIRY_DAYS,
 )
+from .core.password import hash_password
 from .core.tokens import (
     create_access_token,
     create_refresh_token,
@@ -32,6 +34,7 @@ from .interface import (
     InvalidCredentials,
     InvalidRefreshToken,
     SessionTokens,
+    SSOAuthError,
     User,
 )
 from .providers import ProviderCredentials, get_provider
@@ -198,6 +201,111 @@ class LocalIdentityService:
             roles = await self._user_repo.get_user_roles(session, orm.id)
         return _orm_to_user(orm, role=_primary_role(roles))
 
+    async def complete_sso_login(self, identity) -> tuple[User, SessionTokens]:
+        """Find-or-provision from a verified SSO identity, then issue a
+        session. ``identity`` is a ``ProviderIdentity`` (provider,
+        external_id, email, names, raw_claims).
+
+        Identity key is ``(auth_provider, external_id)`` — never email.
+        Linking guardrails (account-takeover defence):
+
+          * known subject → reuse the account (must be active);
+          * new subject, email free → JIT-provision (active, no roles);
+          * new subject, email collides with an existing account →
+            auto-link **only** when the IdP asserts
+            ``email_verified=true`` AND the existing account is a local,
+            active account; on link, password login is disabled;
+          * otherwise → **deny + audit** (no duplicate-email account).
+        """
+        provider = identity.provider
+        external_id = identity.external_id
+        email = identity.email
+        email_verified = _claims_email_verified(identity.raw_claims)
+
+        claims_extra: dict = {}
+        async with self._session_factory() as session:
+            orm = await self._user_repo.get_user_by_external_identity(
+                session, provider, external_id,
+            )
+
+            if orm is not None:
+                if orm.deleted_at is not None or orm.status != "active":
+                    raise SSOAuthError("sso_account_inactive")
+            else:
+                by_email = await self._user_repo.get_user_by_email(session, email)
+                if by_email is None:
+                    orm = await self._user_repo.create_sso_user(
+                        session,
+                        email=email,
+                        first_name=identity.first_name,
+                        last_name=identity.last_name,
+                        auth_provider=provider,
+                        external_id=external_id,
+                        password_hash=_disabled_password_hash(),
+                    )
+                    if self._outbox_emit is not None:
+                        await self._outbox_emit(
+                            session, "user.sso_provisioned",
+                            {"user_id": orm.id, "email": orm.email,
+                             "provider": provider, "external_id": external_id},
+                        )
+                else:
+                    safe_to_link = (
+                        email_verified
+                        and by_email.status == "active"
+                        and by_email.auth_provider == "local"
+                        and by_email.deleted_at is None
+                    )
+                    if not safe_to_link:
+                        await self._emit_audit(
+                            "user.sso_link_denied",
+                            {"email": email, "provider": provider,
+                             "external_id": external_id,
+                             "reason": "unsafe_auto_link",
+                             "email_verified": email_verified,
+                             "existing_status": by_email.status,
+                             "existing_provider": by_email.auth_provider},
+                        )
+                        raise SSOAuthError("unsafe_auto_link")
+                    orm = await self._user_repo.link_user_to_provider(
+                        session,
+                        user_id=by_email.id,
+                        auth_provider=provider,
+                        external_id=external_id,
+                        disabled_password_hash=_disabled_password_hash(),
+                    )
+                    if self._outbox_emit is not None:
+                        await self._outbox_emit(
+                            session, "user.sso_linked",
+                            {"user_id": orm.id, "email": orm.email,
+                             "provider": provider, "external_id": external_id},
+                        )
+
+            roles = await self._user_repo.get_user_roles(session, orm.id)
+            if self._claims_resolver is not None:
+                claims_extra = await self._claims_resolver(session, orm.id)
+            if self._outbox_emit is not None:
+                await self._outbox_emit(
+                    session, "user.logged_in",
+                    {"user_id": orm.id, "email": orm.email, "provider": provider},
+                )
+
+        user = _orm_to_user(orm, role=_primary_role(roles))
+        tokens = self._issue_tokens(user, family_id=None, claims_extra=claims_extra)
+        return user, tokens
+
+    async def _emit_audit(self, event_type: str, payload: dict) -> None:
+        """Emit an audit event in its own committed transaction.
+
+        Used for the link-denied path: the main session rolls back when
+        we raise ``SSOAuthError``, so the audit record must be written
+        and committed separately or it would be lost with the rollback.
+        """
+        if self._outbox_emit is None:
+            return
+        async with self._session_factory() as session:
+            await self._outbox_emit(session, event_type, payload)
+
     # ── Internals ─────────────────────────────────────────────────────
 
     def _issue_tokens(
@@ -224,6 +332,20 @@ class LocalIdentityService:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+def _claims_email_verified(raw_claims: dict) -> bool:
+    """OIDC ``email_verified`` may arrive as a JSON bool or the string
+    ``"true"`` depending on the IdP. Treat anything else as false."""
+    v = raw_claims.get("email_verified")
+    return v is True or (isinstance(v, str) and v.strip().lower() == "true")
+
+
+def _disabled_password_hash() -> str:
+    """A valid Argon2id hash of a discarded random secret. Stored on
+    SSO-owned / linked accounts so the local password path runs in
+    constant time but can never authenticate them."""
+    return hash_password(secrets.token_urlsafe(64))
+
 
 def _primary_role(roles: list[str]) -> str:
     """Pick the highest-privilege role for downstream gating.

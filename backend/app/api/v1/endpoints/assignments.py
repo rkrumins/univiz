@@ -8,7 +8,7 @@ when the cache was cold and `_get_containment_edge_types()` was called before
 """
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from backend.app.api.v1.endpoints.graph import get_context_engine
+from backend.app.api.v1.endpoints.graph import get_context_engine, require_ws_manage
 from backend.app.models.assignment import LayerAssignmentRequest, LayerAssignmentResult
 from backend.app.services.assignment_engine import assignment_engine
 from backend.app.services.context_engine import ContextEngine
@@ -20,6 +20,7 @@ router = APIRouter()
 async def compute_assignments(
     request: LayerAssignmentRequest = Body(..., embed=False),
     engine: ContextEngine = Depends(get_context_engine),
+    _: object = Depends(require_ws_manage),
 ):
     """Compute layer assignments using the workspace-scoped ContextEngine.
 

@@ -287,6 +287,18 @@ async def lifespan(_app: FastAPI):
     #    client implementing the same protocol.
     register_provider("local", LocalIdentityProvider())
 
+    # Phase 1: OIDC (Authorization Code + PKCE). Always registered so
+    # the /auth/oidc/* routes can answer 404 when unconfigured; the
+    # provider self-reports ``enabled`` from env (OIDC_ENABLED + creds).
+    from backend.auth_service.providers import OidcProvider, load_oidc_settings
+    _oidc_settings = load_oidc_settings()
+    register_provider("oidc", OidcProvider(_oidc_settings))
+    logger.info(
+        "OIDC provider registered (enabled=%s, issuer=%s)",
+        _oidc_settings.enabled,
+        _oidc_settings.issuer or "<unset>",
+    )
+
     async def _emit_user_event(session, event_type: str, payload: dict) -> None:
         await user_repo.create_outbox_event(session, event_type=event_type, payload=payload)
 
@@ -294,9 +306,21 @@ async def lifespan(_app: FastAPI):
     # them in the access JWT. The auth service forwards the dict
     # opaquely; the FastAPI ``requires(...)`` dependency reads it back.
     from backend.app.services import permission_service
+    from backend.app.services.revocation_service import get_revocation_service
 
     async def _resolve_claims(session, user_id: str) -> dict:
         claims = await permission_service.resolve(session, user_id)
+        # Record the freshly-minted sid in the user→sids reverse index
+        # so revoke_all_user_sessions can kill every live session on
+        # suspend / deprovision / role change. Best-effort: a Redis
+        # outage must not block login (requires() applies its own
+        # fail policy on the read side).
+        try:
+            await get_revocation_service().record_session(user_id, claims.sid)
+        except Exception as exc:  # noqa: BLE001 — recording is best-effort
+            logger.warning(
+                "Session-index record failed (user=%s): %s", user_id, exc
+            )
         return claims.to_jwt_dict()
 
     _app.state.identity_service = LocalIdentityService(
@@ -620,6 +644,21 @@ async def lifespan(_app: FastAPI):
         name="event-loop-monitor",
     )
 
+    # Phase 0 — outbox relay → append-only auth_audit_log. Runs only on
+    # the documented owner role (CONTROLPLANE / DEV via runs_scheduler)
+    # so multiple WEB replicas don't all drain the same outbox.
+    _app.state._outbox_relay_shutdown = asyncio.Event()
+    _app.state._outbox_relay_task = None
+    if runs_scheduler():
+        from .services.outbox_relay import run_relay as _run_outbox_relay
+        _app.state._outbox_relay_task = asyncio.create_task(
+            _run_outbox_relay(
+                get_jobs_session,
+                _app.state._outbox_relay_shutdown,
+            ),
+            name="outbox-relay",
+        )
+
     # P1.10 — flip the readiness gate. From this point on, the
     # TimeoutMiddleware accepts non-liveness requests; before this, it
     # returns 503 + Retry-After: 5. Setting this AFTER all sync init
@@ -667,6 +706,21 @@ async def lifespan(_app: FastAPI):
             await asyncio.wait_for(_event_loop_task, timeout=1.0)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
+
+    # Phase 0 — stop the outbox relay before DB pool teardown.
+    _outbox_relay_shutdown = getattr(_app.state, "_outbox_relay_shutdown", None)
+    _outbox_relay_task = getattr(_app.state, "_outbox_relay_task", None)
+    if _outbox_relay_shutdown is not None:
+        _outbox_relay_shutdown.set()
+    if _outbox_relay_task is not None and not _outbox_relay_task.done():
+        try:
+            await asyncio.wait_for(_outbox_relay_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _outbox_relay_task.cancel()
+            try:
+                await _outbox_relay_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # Stop the stuck-job reconciler so it doesn't try to commit during
     # DB pool teardown. Setting the shutdown event lets it exit at the

@@ -17,6 +17,7 @@ alembic>=1.13.0          # Schema migrations
 cryptography>=41.0.0
 argon2-cffi>=23.1.0      # Argon2id password hashing (OWASP recommended)
 PyJWT>=2.8.0             # Stateless JWT token creation / verification
+Authlib>=1.3.0           # OIDC ID-token verification (JWKS) + OAuth client
 zxcvbn-python>=4.4.24    # Server-side password strength validation
 slowapi>=0.1.9           # Rate limiting for auth endpoints
 

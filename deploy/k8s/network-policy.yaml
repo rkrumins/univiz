@@ -1,0 +1,241 @@
+# Network isolation for the dataviz namespace.
+#
+# Model: default-deny ingress + egress, then an explicit allow-list.
+# Pod identity is the existing `app.kubernetes.io/name` label on every
+# workload/store pod; the seed & db-init Jobs only carry
+# `app.kubernetes.io/component`, so their rules key off that.
+#
+# Ingress is strict pod-to-pod (this is the lateral-movement control).
+# Egress is intentionally looser: DNS + intra-namespace + outbound to
+# the store ports on any address, because the default deployment points
+# at EXTERNAL managed Postgres/Redis/FalkorDB (see kustomization.yaml).
+# Tighten `np-egress-common` ipBlock to your provider CIDRs if desired.
+#
+# Assumes the ingress-nginx controller lives in namespace
+# `ingress-nginx` (matched via the auto-applied
+# `kubernetes.io/metadata.name` namespace label, GA since k8s 1.21).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Egress allowed for ALL pods: DNS, anything inside this namespace
+# (covers viz->controlplane, frontend->viz/graph, the
+# wait-for-controlplane initContainer, and in-cluster stores when
+# stores.* are opted in), plus outbound to external store ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-common
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dataviz
+    # External managed Postgres / Redis / FalkorDB. Narrow 0.0.0.0/0 to
+    # your provider's CIDR (e.g. Cloud SQL / Memorystore range) to tighten.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-frontend
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - { protocol: TCP, port: 80 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-viz-service
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: viz-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      ports:
+        - { protocol: TCP, port: 8000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-graph-service
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: graph-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      ports:
+        - { protocol: TCP, port: 8001 }
+---
+# Control plane is reached by viz-service (proxy) and by the
+# wait-for-controlplane initContainer baked into viz/worker/stats.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-aggregation-controlplane
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aggregation-controlplane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: viz-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: stats-service
+      ports:
+        - { protocol: TCP, port: 8091 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-redis
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: viz-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-controlplane
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: stats-service
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-falkordb
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: falkordb
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: viz-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-controlplane
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: stats-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: graph-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seed
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-postgres
+  labels:
+    app.kubernetes.io/part-of: dataviz
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: viz-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aggregation-controlplane
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: db-init
+      ports:
+        - { protocol: TCP, port: 5432 }

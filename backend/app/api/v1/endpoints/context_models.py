@@ -8,6 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.auth.dependencies import requires
 from backend.app.db.engine import get_db_session
 from backend.app.db.repositories import context_model_repo, view_repo
 from backend.common.models.management import (
@@ -23,6 +24,11 @@ from backend.common.models.management import (
 # ------------------------------------------------------------------ #
 
 router = APIRouter()
+
+# The router-level dependency in api.py enforces
+# ``workspace:datasource:read`` for every workspace context-model route;
+# mutating routes additionally require ``workspace:datasource:manage``.
+require_ws_manage = requires("workspace:datasource:manage", workspace="ws_id")
 
 
 @router.get("", response_model=List[ContextModelResponse])
@@ -40,6 +46,7 @@ async def create_context_model(
     req: ContextModelCreateRequest = Body(...),
     data_source_id: Optional[str] = Query(None, alias="dataSourceId"),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Create (Save Blueprint) a context model for this workspace."""
     return await context_model_repo.create_context_model(
@@ -66,6 +73,7 @@ async def update_context_model(
     context_model_id: str = Path(...),
     req: ContextModelUpdateRequest = Body(...),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Update (Save Blueprint) an existing context model."""
     cm = await context_model_repo.update_context_model(session, context_model_id, req)
@@ -79,6 +87,7 @@ async def delete_context_model(
     ws_id: str = Path(...),
     context_model_id: str = Path(...),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Delete a context model."""
     deleted = await context_model_repo.delete_context_model(session, context_model_id)
@@ -92,6 +101,7 @@ async def instantiate_template(
     req: InstantiateTemplateRequest = Body(...),
     data_source_id: Optional[str] = Query(None, alias="dataSourceId"),
     session: AsyncSession = Depends(get_db_session),
+    _: object = Depends(require_ws_manage),
 ):
     """Create a workspace context model from a Quick Start Template."""
     cm = await context_model_repo.instantiate_template(
