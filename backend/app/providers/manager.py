@@ -664,6 +664,19 @@ class ProviderManager:
 
         if ptype == "falkordb":
             from backend.app.providers.falkordb_provider import FalkorDBProvider
+            # Host-dev opt-in: the provider row stores the Docker hostname
+            # (`falkordb`) when seeded in-container, which a process running
+            # on the host cannot resolve. When LOCAL_DEV_FALKORDB_OVERRIDE
+            # is set, FALKORDB_HOST/FALKORDB_PORT win over the stored value.
+            # Not injected into compose service env, so containers keep the
+            # stored host and production multi-host providers are unaffected.
+            if os.getenv("LOCAL_DEV_FALKORDB_OVERRIDE", "").strip().lower() in (
+                "1", "true", "yes",
+            ):
+                host = os.getenv("FALKORDB_HOST") or host
+                _port_override = os.getenv("FALKORDB_PORT")
+                if _port_override:
+                    port = int(_port_override)
             # P1.6 — credentials previously dropped here, causing NOAUTH
             # errors to be mis-classified as network failures and tripping
             # the breaker for what is actually a configuration problem.
