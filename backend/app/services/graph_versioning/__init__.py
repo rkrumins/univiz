@@ -45,6 +45,16 @@ from .snapshot_reader import (  # noqa: F401
     apply_changes,
     WorkingSetError,
 )
+from .merge import (  # noqa: F401
+    MergeConflict,
+    MergeOutcome,
+    IntegrityViolation,
+    UnresolvedConflictsError,
+    MergeIntegrityError,
+    three_way_merge,
+    apply_resolutions,
+    check_referential_integrity,
+)
 
 __all__ = [
     "node_content_hash",
@@ -72,4 +82,12 @@ __all__ = [
     "rebuild_snapshot",
     "apply_changes",
     "WorkingSetError",
+    "MergeConflict",
+    "MergeOutcome",
+    "IntegrityViolation",
+    "UnresolvedConflictsError",
+    "MergeIntegrityError",
+    "three_way_merge",
+    "apply_resolutions",
+    "check_referential_integrity",
 ]
