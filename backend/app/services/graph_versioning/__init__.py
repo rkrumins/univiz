@@ -55,6 +55,13 @@ from .merge import (  # noqa: F401
     apply_resolutions,
     check_referential_integrity,
 )
+from .pr_policy import (  # noqa: F401
+    ReviewRecord,
+    MergeabilityResult,
+    latest_per_reviewer,
+    evaluate_mergeability,
+    is_approval_stale,
+)
 
 __all__ = [
     "node_content_hash",
@@ -90,4 +97,9 @@ __all__ = [
     "three_way_merge",
     "apply_resolutions",
     "check_referential_integrity",
+    "ReviewRecord",
+    "MergeabilityResult",
+    "latest_per_reviewer",
+    "evaluate_mergeability",
+    "is_approval_stale",
 ]
