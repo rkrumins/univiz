@@ -106,6 +106,7 @@ services:
       - /app/node_modules
     environment:
       VITE_PROXY_TARGET: http://viz-service:8000
+      VITE_GRAPH_PROXY_TARGET: http://graph-service:8001
 
 volumes:
   # Override the auto-prefixed names (synodic-dev_postgres_data etc.) with

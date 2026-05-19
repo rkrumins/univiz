@@ -106,13 +106,20 @@ async def lifespan(app: FastAPI):
         ontology_service=ontology_svc,
     )
 
-    # 6. Crash recovery
-    try:
-        recovered = await svc.recover_interrupted_jobs()
-        if recovered:
-            logger.info("Recovered %d interrupted aggregation jobs", recovered)
-    except Exception as e:
-        logger.warning("Crash recovery failed: %s", e)
+    # 6. Crash recovery — OFF the startup critical path. It re-dispatches
+    # interrupted jobs with a per-job exponential backoff sleep, which can
+    # take minutes. Awaiting it here would delay the lifespan `yield`, so
+    # uvicorn would not serve `/health` and the Docker healthcheck would
+    # never pass. Run it as a background task instead.
+    async def _run_crash_recovery() -> None:
+        try:
+            recovered = await svc.recover_interrupted_jobs()
+            if recovered:
+                logger.info("Recovered %d interrupted aggregation jobs", recovered)
+        except Exception as e:
+            logger.warning("Crash recovery failed: %s", e)
+
+    recovery_task = asyncio.create_task(_run_crash_recovery())
 
     # 7. Start scheduler (drift detection)
     scheduler = AggregationScheduler(get_jobs_session, registry)
@@ -131,6 +138,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     await scheduler.stop()
     scheduler_task.cancel()
+    recovery_task.cancel()
     try:
         await asyncio.wait_for(registry.evict_all(), timeout=5)
     except asyncio.TimeoutError:
