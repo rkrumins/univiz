@@ -92,6 +92,11 @@ class UserGraphORM(GraphStoreBase):
     ontology_id = Column(Text, nullable=True)            # soft ref → management.ontologies
     origin = Column(Text, nullable=False, default="authored")
     source_data_source_id = Column(Text, nullable=True)  # soft ref → management.workspace_data_sources (connected only)
+    # Fork provenance (origin='fork' only): the base graph this was
+    # forked from and the base commit it was taken at (= the permanent
+    # three-way merge base for every PR raised from this fork).
+    forked_from_graph_id = Column(Text, nullable=True)   # soft ref → user_graphs.id (same Graph Store DB)
+    fork_point_commit_id = Column(Text, nullable=True)
     name = Column(Text, nullable=False)
     description = Column(Text, nullable=True)
     schema_mode = Column(Text, nullable=False, default="schemaless")
@@ -108,12 +113,13 @@ class UserGraphORM(GraphStoreBase):
         Index("idx_user_graphs_workspace", "workspace_id"),
         Index("idx_user_graphs_deleted", "deleted_at"),
         Index("idx_user_graphs_source_ds", "source_data_source_id"),
+        Index("idx_user_graphs_forked_from", "forked_from_graph_id"),
         CheckConstraint(
             "schema_mode IN ('schemaless', 'strict')",
             name="ck_user_graphs_schema_mode",
         ),
         CheckConstraint(
-            "origin IN ('authored', 'connected')",
+            "origin IN ('authored', 'connected', 'fork')",
             name="ck_user_graphs_origin",
         ),
     )
@@ -477,6 +483,94 @@ class GraphStoreOutboxEventORM(GraphStoreBase):
         return f"<GraphStoreOutboxEvent id={self.id!r} type={self.event_type!r}>"
 
 
+# ------------------------------------------------------------------ #
+# Pull requests — a reviewable merge request from a fork (or branch)   #
+# ------------------------------------------------------------------ #
+
+class GraphPullRequestORM(GraphStoreBase):
+    """A reviewable request to merge ``head_graph_id@head_ref`` into
+    ``base_graph_id@base_branch``. For fork PRs head_graph_id != base
+    (cross-graph, possibly cross-workspace); for in-graph branch PRs
+    they are equal. ``merge_base_commit_id`` is the fixed three-way
+    merge base (the fork point, or the branch LCA). Merge is gated on
+    an ``approved`` review by someone with merge rights on the BASE."""
+
+    __tablename__ = "graph_pull_request"
+
+    id = Column(Text, primary_key=True, default=_id("gpr"))
+    base_graph_id = Column(Text, nullable=False)
+    base_branch = Column(Text, nullable=False)
+    head_graph_id = Column(Text, nullable=False)
+    head_ref = Column(Text, nullable=False)
+    merge_base_commit_id = Column(Text, nullable=True)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(Text, nullable=False, default="open")
+    merged_commit_id = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False, default=_now)
+    updated_at = Column(Text, nullable=False, default=_now)
+
+    __table_args__ = (
+        Index("idx_gpr_base", "base_graph_id", "status"),
+        Index("idx_gpr_head", "head_graph_id"),
+        Index("idx_gpr_created_by", "created_by"),
+        CheckConstraint(
+            "status IN ('open', 'changes_requested', 'approved', "
+            "'merged', 'closed')",
+            name="ck_gpr_status",
+        ),
+    )
+
+
+class GraphPrReviewORM(GraphStoreBase):
+    """One review verdict on a PR. The most recent review per reviewer
+    is authoritative; merge requires at least one ``approved`` with no
+    later ``changes_requested`` (policy enforced in the service)."""
+
+    __tablename__ = "graph_pr_review"
+
+    id = Column(Text, primary_key=True, default=_id("gprv"))
+    pr_id = Column(
+        Text, ForeignKey("graph_pull_request.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reviewer = Column(Text, nullable=True)
+    state = Column(Text, nullable=False)
+    body = Column(Text, nullable=True)
+    # The (base_head, head_head) the verdict was given against — used to
+    # invalidate stale approvals when either side advances.
+    reviewed_base_commit_id = Column(Text, nullable=True)
+    reviewed_head_commit_id = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False, default=_now)
+
+    __table_args__ = (
+        Index("idx_gprv_pr", "pr_id", "created_at"),
+        CheckConstraint(
+            "state IN ('approved', 'changes_requested', 'commented')",
+            name="ck_gprv_state",
+        ),
+    )
+
+
+class GraphPrCommentORM(GraphStoreBase):
+    """A general PR conversation comment (inline per-object review is a
+    later, explicitly-deferred enhancement)."""
+
+    __tablename__ = "graph_pr_comment"
+
+    id = Column(Text, primary_key=True, default=_id("gprc"))
+    pr_id = Column(
+        Text, ForeignKey("graph_pull_request.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    author = Column(Text, nullable=True)
+    body = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False, default=_now)
+
+    __table_args__ = (Index("idx_gprc_pr", "pr_id", "created_at"),)
+
+
 __all__ = [
     "UserGraphORM",
     "GraphRefORM",
@@ -490,4 +584,7 @@ __all__ = [
     "GraphMergeORM",
     "GraphMergeConflictORM",
     "GraphStoreOutboxEventORM",
+    "GraphPullRequestORM",
+    "GraphPrReviewORM",
+    "GraphPrCommentORM",
 ]
