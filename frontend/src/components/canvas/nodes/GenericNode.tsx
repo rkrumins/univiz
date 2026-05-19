@@ -4,6 +4,7 @@ import * as LucideIcons from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useSchemaStore } from '@/store/schema'
 import { useCanvasStore } from '@/store/canvas'
+import { useTraceStore } from '@/hooks/useUnifiedTrace'
 import { cn } from '@/lib/utils'
 import { generateColorFromType, generateIconFallback } from '@/lib/type-visuals'
 import type { EntityInstance, EntityVisualConfig } from '@/types/schema'
@@ -27,6 +28,8 @@ interface GenericNodeData extends EntityInstance {
   isUpstream?: boolean
   isDownstream?: boolean
   isFocus?: boolean
+  // Pin Lineage — this node is a pinned trace-path endpoint
+  isPinned?: boolean
   // Persona (business | technical display mode)
   persona?: 'business' | 'technical'
   // Ghost state (unknown/placeholder node)
@@ -62,7 +65,13 @@ export const GenericNode = memo(function GenericNode({
     ? (rawData.data as GenericNodeData)
     : (rawData as unknown as GenericNodeData)
 
-  const { isTraced, isDimmed, isUpstream, isDownstream, isFocus, persona = 'business' } = entityData
+  const { isTraced, isDimmed, isUpstream, isDownstream, isFocus, isPinned, persona = 'business' } = entityData
+
+  // Pin Lineage is only meaningful while a trace is active. Subscribe to the
+  // same trace store GraphCanvas uses so the Pin toolbar button only appears
+  // during a trace.
+  const isTracingActive = useTraceStore((s) => s.focusId !== null)
+  const togglePinTarget = useCanvasStore((s) => s.togglePinTarget)
 
   // Canvas-agnostic callbacks — injected via data props by the host canvas
   const onLoadMore = entityData.onLoadMore
@@ -155,7 +164,14 @@ export const GenericNode = memo(function GenericNode({
           <ToolbarButton icon="ArrowUpRight" label="Trace Upstream" />
           <ToolbarButton icon="ArrowDownLeft" label="Trace Downstream" />
           <div className="w-px h-4 bg-glass-border mx-0.5" />
-          <ToolbarButton icon="Pin" label="Pin" />
+          {isTracingActive && (
+            <ToolbarButton
+              icon="Pin"
+              label={isPinned ? 'Unpin from trace path' : 'Pin to trace path'}
+              active={isPinned}
+              onClick={() => togglePinTarget(id)}
+            />
+          )}
           <ToolbarButton icon="MoreHorizontal" label="More" />
         </NodeToolbar>
       )}
@@ -194,11 +210,13 @@ export const GenericNode = memo(function GenericNode({
           isDownstream && !isFocus && !isUpstream && "ring-2 ring-green-400 ring-offset-1 shadow-[0_0_15px_rgba(74,222,128,0.4)] bg-green-50 dark:bg-green-950/30 z-50",
           // Generic traced node (neither up nor down but in path)
           isTraced && !isFocus && !isUpstream && !isDownstream && "ring-2 ring-purple-400 ring-offset-1 shadow-[0_0_15px_rgba(192,132,252,0.4)] z-50",
+          // Pinned trace-path endpoint — distinct amber ring, sits on top
+          isPinned && "ring-4 ring-amber-500 ring-offset-2 shadow-[0_0_22px_rgba(245,158,11,0.6)] z-[90]",
           // Jump-to-node arrival pulse — one-shot ring animation
           isPulsing && "lineage-pulse"
         )}
         style={{
-          borderColor: isFocus ? '#fbbf24' : isUpstream ? '#60a5fa' : isDownstream ? '#4ade80' : isTraced ? '#c084fc' : visual.color,
+          borderColor: isPinned ? '#f59e0b' : isFocus ? '#fbbf24' : isUpstream ? '#60a5fa' : isDownstream ? '#4ade80' : isTraced ? '#c084fc' : visual.color,
           borderLeftWidth: visual.borderStyle !== 'none' ? '4px' : undefined,
           boxShadow: isFocus
             ? '0 0 30px rgba(251,191,36,0.5)'
@@ -211,7 +229,7 @@ export const GenericNode = memo(function GenericNode({
                   : selected
                     ? `0 0 20px ${visual.color}40`
                     : '0 4px 12px rgba(0,0,0,0.1)',
-          ['--ring-color' as string]: isFocus ? '#fbbf24' : isUpstream ? '#60a5fa' : isDownstream ? '#4ade80' : isTraced ? '#c084fc' : visual.color,
+          ['--ring-color' as string]: isPinned ? '#f59e0b' : isFocus ? '#fbbf24' : isUpstream ? '#60a5fa' : isDownstream ? '#4ade80' : isTraced ? '#c084fc' : visual.color,
         }}
         // Add data attributes for testing/debugging
         data-traced={isTraced}
@@ -219,6 +237,7 @@ export const GenericNode = memo(function GenericNode({
         data-upstream={isUpstream}
         data-downstream={isDownstream}
         data-focus={isFocus}
+        data-pinned={isPinned}
       >
         {/* Header */}
         <div className="flex items-start gap-2">
@@ -525,14 +544,26 @@ function FieldRenderer({ field, value, color, size }: FieldRendererProps) {
 }
 
 // Toolbar Button Component
-function ToolbarButton({ icon, label }: { icon: string; label: string }) {
+function ToolbarButton({
+  icon,
+  label,
+  onClick,
+  active,
+}: {
+  icon: string
+  label: string
+  onClick?: () => void
+  active?: boolean
+}) {
   return (
     <button
       title={label}
+      onClick={onClick}
       className={cn(
-        "w-7 h-7 rounded-md flex items-center justify-center",
-        "text-ink-secondary hover:text-ink hover:bg-black/5 dark:hover:bg-white/10",
-        "transition-colors"
+        "w-7 h-7 rounded-md flex items-center justify-center transition-colors",
+        active
+          ? "text-amber-600 dark:text-amber-400 bg-amber-400/20"
+          : "text-ink-secondary hover:text-ink hover:bg-black/5 dark:hover:bg-white/10"
       )}
     >
       <DynamicIcon name={icon} className="w-3.5 h-3.5" />
