@@ -29,6 +29,10 @@ FALKORDB_QUERY_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_QUERY_TIMEOUT", "
 # the generic 5s read default because wide containers with many lineage
 # cross-edges legitimately exceed it; aligns with HTTP_TIMEOUT_GRAPH_SECS.
 FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_CHILDREN_QUERY_TIMEOUT", "15"))
+# /edges/between resolves edges among a (potentially large) URN set. The
+# generic 5s read default times out on big graphs; this sits just under
+# the 45s ASGI/client budgets so the DB cancels first with a clean error.
+FALKORDB_EDGES_BETWEEN_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_EDGES_BETWEEN_TIMEOUT", "40"))
 # Aggregated-edge projection reads can scan large URN sets; the generic
 # 5s read timeout kills these on graphs with hundreds of containers.
 FALKORDB_AGGREGATED_READ_TIMEOUT_SECS: float = float(os.getenv("FALKORDB_AGGREGATED_READ_TIMEOUT_SECS", "30"))
