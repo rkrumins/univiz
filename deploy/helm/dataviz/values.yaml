@@ -123,6 +123,17 @@ seed:
   breadth: "1"
   depth: "1"
 
+# ── Network isolation (default-deny + allow-list) ─────────────────────
+# Opt-in. ingressNamespace = where the ingress-nginx controller runs
+# (matched via the auto kubernetes.io/metadata.name namespace label).
+# externalStoreCidrs scopes egress to managed Postgres/Redis/FalkorDB —
+# narrow it from 0.0.0.0/0 to your provider's CIDR to tighten.
+networkPolicy:
+  enabled: false
+  ingressNamespace: ingress-nginx
+  externalStoreCidrs:
+    - 0.0.0.0/0
+
 # ── Per-workload settings ─────────────────────────────────────────────
 services:
   viz:

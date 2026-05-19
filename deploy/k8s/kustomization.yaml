@@ -25,3 +25,4 @@ resources:
   - stats-service.yaml
   - frontend.yaml
   - ingress.yaml
+  - network-policy.yaml
