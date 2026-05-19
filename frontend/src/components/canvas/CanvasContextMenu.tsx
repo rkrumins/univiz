@@ -48,6 +48,12 @@ export interface CanvasContextMenuProps {
     onDeleteNode?: (id: string) => void
     onCreateChild?: (parentId: string) => void
     onTraceNode?: (id: string) => void
+    /** Pin/unpin a node as a trace-path endpoint (Pin Lineage). */
+    onPinTarget?: (id: string) => void
+    /** URNs currently pinned — drives the Pin/Unpin label. */
+    pinnedTargetIds?: string[]
+    /** Whether a trace is active (Pin Lineage only applies during a trace). */
+    traceActive?: boolean
     onCopyUrn?: (id: string) => void
     /** Edge actions */
     onEditEdge?: (id: string) => void
@@ -78,6 +84,9 @@ export function CanvasContextMenu({
     onDeleteNode,
     onCreateChild,
     onTraceNode,
+    onPinTarget,
+    pinnedTargetIds = [],
+    traceActive = false,
     onCopyUrn,
     onEditEdge,
     onDeleteEdge,
@@ -150,6 +159,16 @@ export function CanvasContextMenu({
                     icon: 'GitBranch',
                     shortcut: 'T',
                     onClick: () => { onTraceNode(target.id); onClose() }
+                })
+            }
+
+            if (traceActive && onPinTarget) {
+                const pinned = pinnedTargetIds.includes(target.id)
+                result.push({
+                    id: 'pin-trace-path',
+                    label: pinned ? 'Unpin from Trace Path' : 'Pin to Trace Path',
+                    icon: 'Pin',
+                    onClick: () => { onPinTarget(target.id); onClose() }
                 })
             }
 
@@ -272,6 +291,7 @@ export function CanvasContextMenu({
 
         return result
     }, [target, onEditNode, onDuplicateNode, onDeleteNode, onCreateChild, onTraceNode,
+        onPinTarget, pinnedTargetIds, traceActive,
         onCopyUrn, onEditEdge, onDeleteEdge, onReverseEdge, onCreateNode, onPaste,
         onSelectAll, customActions, layers, onMoveToLayer, onClose])
 

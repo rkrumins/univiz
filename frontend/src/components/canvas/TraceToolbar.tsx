@@ -66,6 +66,14 @@ interface TraceToolbarProps {
     className?: string
     /** Position variant */
     position?: 'top' | 'bottom' | 'floating'
+    /** Pin Lineage — number of pinned trace-path endpoints */
+    pinnedCount?: number
+    /** Pin Lineage — how off-path elements are shown */
+    pinDisplayMode?: 'hide' | 'dim'
+    /** Pin Lineage — switch off-path display mode */
+    onSetPinDisplayMode?: (mode: 'hide' | 'dim') => void
+    /** Pin Lineage — clear all pins */
+    onClearPins?: () => void
 }
 
 // ============================================
@@ -93,6 +101,10 @@ export function TraceToolbar({
     availableLineageEdgeTypes = [],
     className,
     position = 'floating',
+    pinnedCount = 0,
+    pinDisplayMode = 'hide',
+    onSetPinDisplayMode,
+    onClearPins,
 }: TraceToolbarProps) {
     const [isExpanded, setIsExpanded] = useState(false)
     const [showStats, setShowStats] = useState(false)
@@ -316,6 +328,59 @@ export function TraceToolbar({
                         <LucideIcons.RefreshCw className="w-3 h-3" />
                         Re-trace
                     </motion.button>
+                )}
+
+                {/* Pin Lineage — isolate the focus↔pin sub-lineage */}
+                {pinnedCount > 0 && (
+                    <>
+                        <div className="h-4 w-[1px] bg-glass-border" />
+                        <div className="flex items-center gap-1">
+                            <span
+                                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                                title="Pinned trace-path endpoints"
+                            >
+                                <LucideIcons.Pin className="w-3 h-3" />
+                                {pinnedCount} pinned
+                            </span>
+                            {onSetPinDisplayMode && (
+                                <div className="flex items-center bg-black/5 dark:bg-white/5 rounded-lg p-0.5">
+                                    <button
+                                        onClick={() => onSetPinDisplayMode('hide')}
+                                        className={cn(
+                                            "px-2 py-1 rounded-md text-2xs font-medium transition-all",
+                                            pinDisplayMode === 'hide'
+                                                ? "bg-amber-500 text-white shadow-sm"
+                                                : "text-ink-muted hover:bg-black/5 dark:hover:bg-white/10"
+                                        )}
+                                        title="Hide everything off the pinned path"
+                                    >
+                                        Isolate
+                                    </button>
+                                    <button
+                                        onClick={() => onSetPinDisplayMode('dim')}
+                                        className={cn(
+                                            "px-2 py-1 rounded-md text-2xs font-medium transition-all",
+                                            pinDisplayMode === 'dim'
+                                                ? "bg-amber-500 text-white shadow-sm"
+                                                : "text-ink-muted hover:bg-black/5 dark:hover:bg-white/10"
+                                        )}
+                                        title="Keep full graph as dimmed context"
+                                    >
+                                        Dim
+                                    </button>
+                                </div>
+                            )}
+                            {onClearPins && (
+                                <button
+                                    onClick={onClearPins}
+                                    className="p-1.5 rounded-md hover:bg-black/5 dark:hover:bg-white/10 text-ink-muted transition-all"
+                                    title="Clear all pins"
+                                >
+                                    <LucideIcons.PinOff className="w-4 h-4" />
+                                </button>
+                            )}
+                        </div>
+                    </>
                 )}
 
                 {/* Quick Actions */}

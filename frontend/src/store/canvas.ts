@@ -122,6 +122,18 @@ interface CanvasState {
   setTraceDirection: (direction: 'upstream' | 'downstream' | 'both') => void
   setTraceDepth: (depth: number) => void
 
+  // Pin Lineage — URNs the user pinned during an active trace. When
+  // non-empty the canvas isolates only the nodes/edges on directed lineage
+  // paths between the trace focus and these pinned nodes. URN-keyed for
+  // parity with trace data. `pinDisplayMode` decides whether off-path
+  // elements are hidden ('hide', the default true-isolate) or kept as
+  // greyed context ('dim').
+  pinnedTargetUrns: string[]
+  pinDisplayMode: 'hide' | 'dim'
+  togglePinTarget: (urn: string) => void
+  clearPinTargets: () => void
+  setPinDisplayMode: (mode: 'hide' | 'dim') => void
+
   // Cache
   cachedRegions: Map<string, LineageNode[]>
   cacheRegion: (key: string, nodes: LineageNode[]) => void
@@ -343,6 +355,19 @@ export const useCanvasStore = create<CanvasState>()(
       setTraceDirection: (traceDirection) => set({ traceDirection }),
       setTraceDepth: (traceDepth) => set({ traceDepth }),
 
+      // Pin Lineage
+      pinnedTargetUrns: [],
+      pinDisplayMode: 'hide',
+      togglePinTarget: (urn) => set((state) => ({
+        pinnedTargetUrns: state.pinnedTargetUrns.includes(urn)
+          ? state.pinnedTargetUrns.filter((u) => u !== urn)
+          : [...state.pinnedTargetUrns, urn],
+      })),
+      clearPinTargets: () => set((state) =>
+        state.pinnedTargetUrns.length === 0 ? state : { pinnedTargetUrns: [] }
+      ),
+      setPinDisplayMode: (pinDisplayMode) => set({ pinDisplayMode }),
+
       // Cache
       cachedRegions: new Map(),
       cacheRegion: (key, nodes) => set((state) => {
@@ -440,4 +465,6 @@ export const useEdges = () => useCanvasStore((s) => s.edges)
 export const useSelectedNodes = () => useCanvasStore((s) => s.selectedNodeIds)
 export const useIsLoading = () => useCanvasStore((s) => s.isLoading)
 export const useCanvasVersion = () => useCanvasStore((s) => s._version)
+export const usePinnedTargetUrns = () => useCanvasStore((s) => s.pinnedTargetUrns)
+export const usePinDisplayMode = () => useCanvasStore((s) => s.pinDisplayMode)
 

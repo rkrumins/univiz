@@ -64,6 +64,7 @@ import { useGraphProvider } from '@/providers/GraphProviderContext'
 import { useElkLayout } from '@/hooks/useElkLayout'
 import { useContainmentHierarchy } from '@/hooks/useContainmentHierarchy'
 import { useCanvasTrace } from '@/hooks/useCanvasTrace'
+import { usePinnedLineagePath } from '@/hooks/usePinnedLineagePath'
 import { useAggregatedLineage } from '@/hooks/useAggregatedLineage'
 import { useHighlightState, useHoverHighlight, useHoveredNodeId } from '@/hooks/useHighlightState'
 import { useEdgeDetailPanel, useEdgeTypeFilters, useEdgeFiltersStore } from '@/hooks/useEdgeFilters'
@@ -262,6 +263,42 @@ export function GraphCanvas({ className }: { className?: string }) {
     setExpandedNodes,
     setShowLineageFlow,
   })
+
+  // 8b. Pin Lineage — isolate the sub-lineage between the trace focus and
+  // the pinned nodes. Canvas node id === urn, so focusId/pinned urns/edge
+  // endpoints share one key space.
+  const pinnedTargetUrns = useCanvasStore((s) => s.pinnedTargetUrns)
+  const pinDisplayMode = useCanvasStore((s) => s.pinDisplayMode)
+  const togglePinTarget = useCanvasStore((s) => s.togglePinTarget)
+  const clearPinTargets = useCanvasStore((s) => s.clearPinTargets)
+
+  const pinPath = usePinnedLineagePath({
+    edges: rawEdges,
+    isContainmentEdge,
+    focusUrn: trace.focusId,
+    pinnedUrns: pinnedTargetUrns,
+    containmentParent: parentMap,
+  })
+
+  // Pins are scoped to the active trace's focus — drop them whenever the
+  // focus changes (new trace) or the trace is cleared, so they never leak
+  // into an unrelated trace.
+  const lastFocusRef = useRef<string | null>(trace.focusId)
+  useEffect(() => {
+    if (lastFocusRef.current !== trace.focusId) {
+      lastFocusRef.current = trace.focusId
+      clearPinTargets()
+    }
+  }, [trace.focusId, clearPinTargets])
+
+  // Nodes that must stay rendered when isolating: the path itself plus the
+  // containment ancestors needed for layout.
+  const pinKeptUrns = useMemo(() => {
+    if (!pinPath.active) return null
+    const s = new Set(pinPath.pathNodeUrns)
+    pinPath.keepForLayoutUrns.forEach((u) => s.add(u))
+    return s
+  }, [pinPath])
 
   // 9. Build traceContextSet
   const traceContextSet = useMemo(() => {
@@ -783,16 +820,30 @@ export function GraphCanvas({ className }: { className?: string }) {
       const original = (edge.data?.edgeType || edge.data?.relationship || 'unknown').toLowerCase()
       return enabledEdgeTypes.has(normalized) || enabledEdgeTypes.has(original)
     }
+    // Pin Lineage isolate: in 'hide' mode drop everything off the
+    // focus↔pin path. In 'dim' mode keep all edges but flag off-path ones.
+    const pinIsolating = pinPath.active && pinDisplayMode === 'hide'
+    const isOffPinPath = (edge: typeof allVisibleEdges[number]): boolean => {
+      if (!pinPath.active) return false
+      if (edge._isContainment) {
+        return !(pinKeptUrns?.has(edge.source) && pinKeptUrns?.has(edge.target))
+      }
+      return !pinPath.pathEdgeIds.has(edge.id)
+    }
     return allVisibleEdges
       .filter(edge => {
         // Containment edges are subject to the type filter (so users can hide
         // structural edges) but ignore the lineage Flow toggle.
         if (edge._isContainment) {
-          return matchesTypeFilter(edge)
+          if (!matchesTypeFilter(edge)) return false
+          if (pinIsolating && isOffPinPath(edge)) return false
+          return true
         }
         // Lineage edges follow the Flow toggle, regardless of trace state
         if (!showLineageFlow) return false
         if (!matchesTypeFilter(edge)) return false
+        // Pin Lineage isolate — only render edges on the focus↔pin path
+        if (pinIsolating && isOffPinPath(edge)) return false
         // Direction filter (only active when a focus node is set)
         if (directionEdgeIds && !directionEdgeIds.has(edge.id)) return false
         // Isolate mode — only render highlighted edges. Requires at least one
@@ -801,6 +852,7 @@ export function GraphCanvas({ className }: { className?: string }) {
         return true
       })
       .map(edge => {
+        const pinDimmed = pinPath.active && pinDisplayMode === 'dim' && isOffPinPath(edge)
         if (edge._isContainment) {
           // Containment: thin dashed gray — shows hierarchy structure
           return {
@@ -813,7 +865,7 @@ export function GraphCanvas({ className }: { className?: string }) {
               stroke: '#94a3b8',
               strokeDasharray: '6,4',
               strokeWidth: 1.5,
-              opacity: isHighlightActive ? 0.3 : 0.6,
+              opacity: pinDimmed ? 0.08 : isHighlightActive ? 0.3 : 0.6,
             },
             data: {
               edgeType: edge.data?.edgeType ?? 'CONTAINS',
@@ -830,9 +882,9 @@ export function GraphCanvas({ className }: { className?: string }) {
           target: edge.target,
           // Use 'aggregated' edge component for rolled-up edges (shows edge count badge)
           type: isAggregated ? 'aggregated' as const : 'lineage' as const,
-          animated: !isProjected && !isAggregated && (!isHighlightActive || mergedHighlightEdges.has(edge.id)),
+          animated: !pinDimmed && !isProjected && !isAggregated && (!isHighlightActive || mergedHighlightEdges.has(edge.id)),
           style: {
-            opacity: isHighlightActive && !mergedHighlightEdges.has(edge.id) ? 0.15 : (isProjected ? 0.7 : 1),
+            opacity: pinDimmed ? 0.12 : (isHighlightActive && !mergedHighlightEdges.has(edge.id) ? 0.15 : (isProjected ? 0.7 : 1)),
             strokeDasharray: isProjected && !isAggregated ? '8,4' : undefined,
           },
           data: {
@@ -846,12 +898,13 @@ export function GraphCanvas({ className }: { className?: string }) {
           },
         }
       })
-  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges, enabledEdgeTypes, directionEdgeIds, isolateMode, highlightedEdgeIds])
+  }, [allVisibleEdges, showLineageFlow, trace.isTracing, trace.result, isHighlightActive, mergedHighlightEdges, enabledEdgeTypes, directionEdgeIds, isolateMode, highlightedEdgeIds, pinPath, pinDisplayMode, pinKeptUrns])
   // (trace.isTracing/trace.result kept in deps because the map step inside reads them for isTraced flagging)
 
   // 16. Display nodes with visual state — only VISIBLE nodes (expand/collapse aware)
   const displayNodes = useMemo(() => {
     const base = layoutedNodes.length > 0 ? layoutedNodes : visibleNodes
+    const pinDim = pinPath.active && pinDisplayMode === 'dim'
     const allNodes = base.map((node) => ({
       ...node,
       data: {
@@ -860,10 +913,12 @@ export function GraphCanvas({ className }: { className?: string }) {
         isTraced: trace.isInTrace(node.id),
         isDimmed:
           (trace.isTracing && !traceContextSet.has(node.id)) ||
-          (isHighlightActive && !mergedHighlightNodes.has(node.id)),
+          (isHighlightActive && !mergedHighlightNodes.has(node.id)) ||
+          (pinDim && !pinPath.pathNodeUrns.has(node.id)),
         isUpstream: trace.isUpstream(node.id),
         isDownstream: trace.isDownstream(node.id),
         isFocus: trace.isFocus(node.id),
+        isPinned: pinnedTargetUrns.includes(node.id),
         isHighlighted: mergedHighlightNodes.has(node.id),
         isExpanded: expandedNodes.has(node.id),
         // Hidden child count — drives "Load More" badge on the node
@@ -872,6 +927,14 @@ export function GraphCanvas({ className }: { className?: string }) {
         onToggleExpanded: stableOnToggle,
       },
     }))
+
+    // Pin Lineage isolate ('hide'): cull every node not on the focus↔pin
+    // path (containment ancestors kept so layout can position the subset).
+    if (pinPath.active && pinDisplayMode === 'hide' && pinKeptUrns) {
+      allNodes.forEach((node) => {
+        if (!pinKeptUrns.has(node.id)) node.hidden = true
+      })
+    }
 
     // Viewport-aware filtering: only activate when node count exceeds threshold
     if (allNodes.length > MAX_VISIBLE_NODES && viewportBounds) {
@@ -924,6 +987,11 @@ export function GraphCanvas({ className }: { className?: string }) {
     viewportBounds,
     expandedNodes,
     hiddenChildCounts,
+    visibleNodes,
+    pinPath,
+    pinDisplayMode,
+    pinKeptUrns,
+    pinnedTargetUrns,
   ])
 
   // 18. Handlers
@@ -1334,6 +1402,10 @@ export function GraphCanvas({ className }: { className?: string }) {
               isLoading={trace.isLoading}
               availableLineageEdgeTypes={lineageEdgeTypes}
               position="top"
+              pinnedCount={pinnedTargetUrns.length}
+              pinDisplayMode={pinDisplayMode}
+              onSetPinDisplayMode={(m) => useCanvasStore.getState().setPinDisplayMode(m)}
+              onClearPins={clearPinTargets}
             />
           </div>
         )}
@@ -1504,6 +1576,9 @@ export function GraphCanvas({ className }: { className?: string }) {
         onDeleteNode={interactions.deleteNode}
         onCreateChild={interactions.createChild}
         onTraceNode={(id) => trace.startTrace(id)}
+        onPinTarget={(id) => togglePinTarget(id)}
+        pinnedTargetIds={pinnedTargetUrns}
+        traceActive={trace.isTracing}
         onCopyUrn={interactions.copyUrn}
         onEditEdge={interactions.editEdge}
         onDeleteEdge={interactions.deleteEdge}
