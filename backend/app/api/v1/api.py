@@ -6,6 +6,7 @@ from .endpoints import (
     insights, me,
     groups, workspace_members, view_grants, role_bindings,
     permissions_admin, access_requests, rbac_search,
+    graphs as authored_graphs,
 )
 from backend.auth_service.api.router import router as auth_session_router
 
@@ -150,6 +151,11 @@ api_router.include_router(
 # (api_router is already mounted at /api/v1, so prefix is just /{ws_id}/graph)
 api_router.include_router(
     graph.router, prefix="/{ws_id}/graph", tags=["graph:workspace"],
+)
+# User-authored versioned graphs: /api/v1/{ws_id}/graphs/...
+# (routes carry the full /{ws_id}/graphs path, so no prefix here).
+api_router.include_router(
+    authored_graphs.router, tags=["graphs:authored"],
 )
 # Assignment compute (workspace-scoped)
 api_router.include_router(

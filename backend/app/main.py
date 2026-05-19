@@ -205,6 +205,32 @@ async def lifespan(_app: FastAPI):
         logger.info("Synodic Visualization Service stopped (was degraded)")
         return
 
+    # 1b. Graph Store DB (decoupled system-of-record for user-authored
+    #     versioned graphs) + its outbox relay. Best-effort: this is an
+    #     additive feature on a SEPARATE database, so its unavailability
+    #     must NOT take the whole service down — it degrades to "authored
+    #     graphs unavailable" while everything else runs.
+    _app.state._graph_relay_task = None
+    try:
+        from .db.graph_store_engine import init_graph_store_db  # noqa: E402
+        from .services.graph_outbox_relay import (  # noqa: E402
+            run_graph_outbox_relay,
+        )
+
+        await init_graph_store_db()
+        _graph_relay_stop = asyncio.Event()
+        _app.state._graph_relay_stop = _graph_relay_stop
+        _app.state._graph_relay_task = asyncio.create_task(
+            run_graph_outbox_relay(stop_event=_graph_relay_stop)
+        )
+        logger.info("Graph Store ready; outbox relay started")
+    except Exception as exc:  # noqa: BLE001 — feature-isolated, never fatal
+        logger.warning(
+            "Graph Store init/relay unavailable — authored-graph feature "
+            "degraded (service continues): %s",
+            exc,
+        )
+
     # 2. Seed Quick Start Templates (idempotent — skips if already present)
     async with get_async_session() as session:
         await seed_templates(session)
@@ -719,6 +745,27 @@ async def lifespan(_app: FastAPI):
         await asyncio.wait_for(provider_manager.evict_all(), timeout=5)
     except asyncio.TimeoutError:
         logger.warning("Provider shutdown timed out after 5s — forcing exit")
+
+    # Stop the Graph Store outbox relay + release its pools.
+    _relay_task = getattr(_app.state, "_graph_relay_task", None)
+    if _relay_task is not None and not _relay_task.done():
+        stop = getattr(_app.state, "_graph_relay_stop", None)
+        if stop is not None:
+            stop.set()
+        _relay_task.cancel()
+        try:
+            await _relay_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — best effort on shutdown
+            pass
+    try:
+        from .db.graph_store_engine import close_graph_store_db  # noqa: E402
+
+        await close_graph_store_db()
+    except Exception:  # noqa: BLE001
+        pass
+
     await close_db()
     logger.info("Synodic Visualization Service stopped")
 
