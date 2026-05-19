@@ -182,8 +182,19 @@ export function ContextViewCanvas({
         const shouldMergeNode = (urn: string): boolean =>
           (participantUrns.has(urn) || spineUrns.has(urn)) && !knownAssignedUrns.has(urn)
 
+        // Only trace nodes that arrived with real, renderable data may
+        // become canvas nodes. A spine ancestor (e.g. a Container whose
+        // child Table was the only thing assigned) that the backend
+        // returned without node data must NOT get a containment edge —
+        // a dangling edge to it renders as a blank/phantom box.
+        const hydratedTraceUrns = new Set<string>(
+          lr.nodes
+            .filter(gn => gn.urn && (gn.displayName ?? '').trim().length > 0)
+            .map(gn => gn.urn)
+        )
+
         const newCanvasNodes = lr.nodes
-          .filter(gn => shouldMergeNode(gn.urn))
+          .filter(gn => shouldMergeNode(gn.urn) && hydratedTraceUrns.has(gn.urn))
           .map(gn => {
             const metadata: Record<string, unknown> = {
               ...gn.properties,
@@ -211,7 +222,7 @@ export function ContextViewCanvas({
         // already on the canvas. Drops only the rare edge whose endpoint
         // is an ancestor the spine excluded — those dangle.
         const isResolvableEndpoint = (urn: string): boolean =>
-          shouldMergeNode(urn) || knownAssignedUrns.has(urn)
+          (shouldMergeNode(urn) && hydratedTraceUrns.has(urn)) || knownAssignedUrns.has(urn)
         const newCanvasEdges = lr.edges
           .filter(ge => isResolvableEndpoint(ge.sourceUrn) && isResolvableEndpoint(ge.targetUrn))
           .map(ge => ({

@@ -467,6 +467,7 @@ class FalkorDBProvider(GraphDataProvider):
     from ..config import resilience as _resilience
     _READ_TIMEOUT = _resilience.FALKORDB_QUERY_TIMEOUT_SECS
     _WRITE_TIMEOUT = _resilience.FALKORDB_WRITE_TIMEOUT_SECS
+    _EDGES_BETWEEN_TIMEOUT = _resilience.FALKORDB_EDGES_BETWEEN_TIMEOUT_SECS
     del _resilience
 
     # FalkorDB engine cancels the query 500ms before the asyncio deadline so
@@ -1273,7 +1274,16 @@ class FalkorDBProvider(GraphDataProvider):
         params["limit"] = limit
         cypher += " RETURN a.urn AS src, b.urn AS tgt, type(r) AS relType, properties(r) AS rprops SKIP $skip LIMIT $limit"
 
-        result = await self._ro_query(cypher, params=params)
+        # /edges/between issues an AND query (both source_urns and
+        # target_urns set). On large URN sets this legitimately exceeds the
+        # 5s read default, so give that pattern a longer deadline; all other
+        # callers keep the default.
+        is_between = bool(query.source_urns and query.target_urns)
+        result = await self._ro_query(
+            cypher,
+            params=params,
+            timeout=self._EDGES_BETWEEN_TIMEOUT if is_between else None,
+        )
         edges = []
         for row in (result.result_set or []):
             src, tgt, rel_type, rprops = row[0], row[1], row[2], (row[3] or {})
