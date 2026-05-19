@@ -240,6 +240,60 @@ catalogs**, not another catalog. Concretely (grounded in the codebase):
 - **Context per persona** — the same graph is rendered with business labels,
   technical column-level URNs, or served raw via API to an agent.
 
+### 5.1 What Synodic Does vs. What We Leverage from the Catalog
+
+This is the single most important distinction in this document. Synodic does
+**not** reimplement the catalog. It **stands on the powerful capabilities
+the open-source catalogs already do well** and adds the layer they were
+never built to provide. The division of labor is deliberate:
+
+| Capability | Owned by the open-source catalog — **we leverage it, we do not rebuild it** | Added by **Synodic** — what our tool actually does |
+|---|---|---|
+| Source ingestion & connectors | DataHub / OpenMetadata's mature connector ecosystem (warehouses, BI, pipelines, dbt, etc.) | Consume their already-ingested metadata — zero duplicate ingestion effort |
+| Metadata model & storage | The catalog's entity model is the system of record | Project it into a **knowledge graph**; the catalog stays the source of truth |
+| Lineage capture | Catalog/engine-emitted lineage (incl. column-level) | **Activate** it: deep multi-hop trace, granularity roll-up, impact analysis |
+| Graph data | Catalog-resident graph + graph engines (Neo4j/FalkorDB) | Normalize (URNs), overlay **versioned ontology**, make it explorable |
+| Governance/policy | Collibra/Unity/Dataplex governance & policy engines | Respect them; add **semantic** governance (ontology evolution policies) |
+| Access to the data | Catalog APIs (e.g. DataHub GraphQL) | One clean, normalized API + interactive canvas for **every persona & agents** |
+
+**Read this table as the thesis:** every row's left column is power that
+already exists in the open-source ecosystem and that we are *grateful to
+inherit*. Every row's right column is the gap Synodic closes. We win not by
+out-cataloging the catalogs, but by being the only layer that turns their
+combined output into something explorable, investigable, and
+agent-consumable.
+
+### 5.2 The Open-Source Capabilities & Graph Data We Build On
+
+Concretely, Synodic is force-multiplied by — not in competition with — the
+following existing strengths:
+
+- **Best-in-class ingestion (DataHub, OpenMetadata).** Hundreds of mature
+  connectors and an active community keep metadata fresh. Synodic's
+  first-class DataHub provider
+  (`backend/graph/adapters/datahub_provider.py`) consumes this directly —
+  we get breadth of coverage for free and focus our engineering on
+  activation, not crawler maintenance.
+- **Graph engines (Neo4j, FalkorDB).** Proven, scalable property-graph
+  storage and Cypher traversal. Synodic's pluggable
+  `GraphDataProvider` runs *on* these engines rather than reinventing a
+  graph store — inheriting their performance and operational maturity.
+- **Catalog-resident graph data.** Lineage and relationship edges already
+  captured by the catalog/engines become Synodic's raw material; URN
+  normalization (`urn:li:dataset:...`, DataHub-aligned) unifies them across
+  sources into one navigable knowledge graph.
+- **Open standards & APIs.** DataHub GraphQL, OpenLineage-style lineage, and
+  URN conventions mean Synodic plugs in along open seams — no proprietary
+  import/export, no lock-in, and an upgrade path as the OSS ecosystem
+  improves.
+
+**Strategic consequence:** the open-source catalog community's roadmap
+becomes *our* tailwind. Every connector DataHub adds, every governance
+feature OpenMetadata ships, every performance gain in FalkorDB/Neo4j makes
+Synodic better at zero marginal cost to us — a leverage profile no
+proprietary tool (Solidatus, Collibra) can match, because they must build
+and fund all of it alone.
+
 ---
 
 ## 6. Scalability & Performance (built ground-up)
