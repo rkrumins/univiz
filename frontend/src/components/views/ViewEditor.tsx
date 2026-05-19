@@ -14,6 +14,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import * as LucideIcons from 'lucide-react'
 import { useSchemaStore } from '@/store/schema'
 import { generateIconFallback } from '@/lib/type-visuals'
+import { resolveEntityIcon } from '@/lib/entityIcon'
 import type { ViewConfiguration, EntityTypeSchema, ViewLayerConfig, LayerAssignmentRuleConfig, LogicalNodeConfig } from '@/types/schema'
 import { cn } from '@/lib/utils'
 import { EntityAssignmentPanel } from './EntityAssignmentPanel'
@@ -21,10 +22,10 @@ import { LayerDropZoneRow } from './LayerDropZone'
 import { ReferenceModelBuilder } from './ReferenceModelBuilder'
 import { useInstanceAssignments } from '@/store/referenceModelStore'
 
-// Dynamic icon component
+// Dynamic icon component — validates the Lucide lookup is renderable
+// (forwardRef object or function component), else falls back to Box.
 function DynamicIcon({ name, className, style }: { name: string; className?: string; style?: React.CSSProperties }) {
-  const IconComponent = (LucideIcons as unknown as Record<string, React.ComponentType<{ className?: string; style?: React.CSSProperties }>>)[name]
-  if (!IconComponent) return <LucideIcons.Box className={className} style={style} />
+  const IconComponent = resolveEntityIcon(name)
   return <IconComponent className={className} style={style} />
 }
 

@@ -95,6 +95,21 @@ class EdgeQuery(BaseModel):
     class Config:
         populate_by_name = True
 
+
+class DescendantPreviewQuery(BaseModel):
+    # Server-side preview of descendants under a parent URN, used by the
+    # ViewWizard to show "this scoped rule will match N entities" before
+    # the user saves the rule. Filters mirror the rule conditions so
+    # preview semantics match engine enforcement.
+    name_substring: Optional[str] = Field(None, alias="nameSubstring")
+    entity_types: Optional[List[str]] = Field(None, alias="entityTypes")
+    property_filter: Optional[PropertyFilter] = Field(None, alias="propertyFilter")
+    sample_limit: int = Field(50, alias="sampleLimit", ge=0, le=500)
+    hard_cap: int = Field(5000, alias="hardCap", ge=1, le=20000)
+
+    class Config:
+        populate_by_name = True
+
 # ============================================
 # Result Models
 # ============================================
@@ -343,6 +358,15 @@ class TopLevelNodesResult(BaseModel):
     next_cursor: Optional[str] = Field(None, alias="nextCursor")
     root_type_count: int = Field(0, alias="rootTypeCount")
     orphan_count: int = Field(0, alias="orphanCount")
+
+    class Config:
+        populate_by_name = True
+
+
+class DescendantPreviewResult(BaseModel):
+    total: int
+    sample: List[GraphNode] = Field(default_factory=list)
+    truncated: bool = False
 
     class Config:
         populate_by_name = True

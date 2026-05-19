@@ -13,12 +13,10 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { motion, AnimatePresence } from 'framer-motion'
-import * as LucideIcons from 'lucide-react'
 import {
     Search,
     ChevronRight,
     GripVertical,
-    Box,
     X,
     AlertTriangle,
     CheckSquare,
@@ -27,13 +25,14 @@ import {
     Loader2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { resolveEntityIcon } from '@/lib/entityIcon'
 import {
     useReferenceModelStore,
     useInstanceAssignments,
     useAssignmentConflicts,
     useEffectiveAssignments
 } from '@/store/referenceModelStore'
-import type { ViewLayerConfig, AssignmentConflict } from '@/types/schema'
+import type { ViewLayerConfig, LogicalNodeConfig, LayerAssignmentRuleConfig, RuleCondition, AssignmentConflict } from '@/types/schema'
 import { useContainmentEdgeTypes, useEntityTypes, useSchemaIsLoading } from '@/store/schema'
 import { useGraphProvider } from '@/providers/GraphProviderContext'
 import type { ActiveTarget } from '@/components/views/LayerHierarchyPanel'
@@ -67,9 +66,11 @@ interface WizardAssignmentTreeProps {
     /** Active drop target from the Layer Studio (shows strip indicator) */
     activeTarget?: ActiveTarget | null
     /** Callback when assignment changes */
-    onAssignmentChange?: (entityId: string, layerId: string | null) => void
+    onAssignmentChange?: (entityId: string, layerId: string | null, logicalNodeId?: string | null) => void
     /** Callback for bulk assignment */
-    onBulkAssign?: (layerId: string, entityIds: string[]) => void
+    onBulkAssign?: (layerId: string, entityIds: string[], logicalNodeId?: string | null) => void
+    /** Author a LayerAssignmentRuleConfig scoped under the selected entity. */
+    onApplyRule?: (layerId: string, logicalNodeId: string | null, rule: LayerAssignmentRuleConfig) => void
     /** Callback when the containment parentMap changes (for AssignmentStep inheritance) */
     onParentMapChange?: (map: Map<string, string>) => void
     /** Additional class name */
@@ -134,10 +135,8 @@ function TreeRow({
     const hasChildren = node.childCount > 0 || node.children.length > 0
     const typeLower = node.type.toLowerCase()
     const visual = entityVisualMap[typeLower]
-    const icon = (() => {
-        const Cmp = visual?.icon ? (LucideIcons as Record<string, any>)[visual.icon] : null
-        return Cmp ? <Cmp className="w-4 h-4" /> : <Box className="w-4 h-4" />
-    })()
+    const TypeIcon = resolveEntityIcon(visual?.icon)
+    const icon = <TypeIcon className="w-4 h-4" />
     const typeColor = visual?.color ?? '#94a3b8'
     const assignedLayer = layers.find(l => l.id === node.assignedLayerId)
 
@@ -339,6 +338,7 @@ export function WizardAssignmentTree({
     layers,
     onAssignmentChange,
     onBulkAssign,
+    onApplyRule,
     onParentMapChange,
     className
 }: WizardAssignmentTreeProps) {
@@ -398,6 +398,22 @@ export function WizardAssignmentTree({
     const [draggingNode, setDraggingNode] = useState<EntityTreeNode | null>(null)
     const [assignmentWarning, setAssignmentWarning] = useState<string | null>(null)
     const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+    // Scoped-rule filter state for the single-entity bulk panel. Operators are
+    // restricted to those that exist in both FilterOperator (preview Cypher)
+    // and RuleOperator (engine enforcement) so the preview count is faithful.
+    type FilterOp = 'equals' | 'contains' | 'startsWith' | 'endsWith' | 'exists'
+    const [filterName, setFilterName] = useState('')
+    const [filterField, setFilterField] = useState('')
+    const [filterOp, setFilterOp] = useState<FilterOp>('equals')
+    const [filterValue, setFilterValue] = useState('')
+    const [previewCount, setPreviewCount] = useState<number | null>(null)
+    const [previewTruncated, setPreviewTruncated] = useState(false)
+    const [previewLoading, setPreviewLoading] = useState(false)
+    const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    const [assignTarget, setAssignTarget] = useState('')
+
+    const filterIsActive = Boolean(filterName.trim() || (filterField.trim() && (filterOp === 'exists' || filterValue.trim())))
 
     const parentRef = useRef<HTMLDivElement>(null)
     const searchInputRef = useRef<HTMLInputElement>(null)
@@ -676,12 +692,12 @@ export function WizardAssignmentTree({
         }
     }, [assignEntityToLayer, removeEntityAssignment, onAssignmentChange, instanceAssignments, flattenedNodes, showAssignmentWarning])
 
-    const handleBulkAssign = useCallback((layerId: string) => {
+    const handleBulkAssign = useCallback((layerId: string, logicalNodeId?: string | null) => {
         const ids = Array.from(selectedIds)
         if (ids.length === 0) return
 
         if (onBulkAssign) {
-            onBulkAssign(layerId, ids)
+            onBulkAssign(layerId, ids, logicalNodeId ?? null)
             // Clear selection after bulk action
             setSelectedIds(new Set())
             return
@@ -699,7 +715,7 @@ export function WizardAssignmentTree({
                     blockedCount++
                     return
                 }
-                onAssignmentChange?.(entityId, layerId)
+                onAssignmentChange?.(entityId, layerId, logicalNodeId ?? null)
             }
         })
         if (blockedCount > 0) {
@@ -710,26 +726,132 @@ export function WizardAssignmentTree({
         setSelectedIds(new Set())
     }, [selectedIds, onBulkAssign, onAssignmentChange, removeEntityAssignment, assignEntityToLayer, showAssignmentWarning])
 
-    const handleSelectAllChildren = useCallback(() => {
+    // Flatten layers -> top-level logical nodes so the target selector can offer
+    // "layer" and "layer / group" targets in one dropdown.
+    const targetOptions = useMemo(() => {
+        const opts: { value: string; label: string }[] = []
+        for (const layer of layers) {
+            opts.push({ value: layer.id, label: layer.name })
+            const walk = (nodes: LogicalNodeConfig[] | undefined, depth: number) => {
+                if (!nodes) return
+                for (const n of nodes) {
+                    opts.push({
+                        value: `${layer.id}::${n.id}`,
+                        label: `${layer.name} / ${'  '.repeat(depth)}${n.name}`,
+                    })
+                    walk(n.children, depth + 1)
+                }
+            }
+            walk(layer.logicalNodes, 0)
+        }
+        return opts
+    }, [layers])
+
+    const parseTarget = useCallback((raw: string): { layerId: string; logicalNodeId: string | null } => {
+        if (!raw) return { layerId: '', logicalNodeId: null }
+        if (raw === '__unassign__') return { layerId: '', logicalNodeId: null }
+        const [layerId, logicalNodeId] = raw.split('::')
+        return { layerId, logicalNodeId: logicalNodeId || null }
+    }, [])
+
+    const handleAssignParent = useCallback((targetRaw: string) => {
         if (selectedIds.size !== 1) return
-        const selectedId = Array.from(selectedIds)[0]
-        const node = flattenedNodes.find(n => n.id === selectedId)
-        if (!node) return
+        const entityId = Array.from(selectedIds)[0]
+        const { layerId, logicalNodeId } = parseTarget(targetRaw)
+        if (!layerId) {
+            removeEntityAssignment(entityId)
+            onAssignmentChange?.(entityId, null)
+        } else {
+            const result = assignEntityToLayer(entityId, layerId, { inheritsChildren: true })
+            if (!result.success && result.conflict?.type === 'containment_locked') {
+                showAssignmentWarning(result.conflict.message)
+                return
+            }
+            onAssignmentChange?.(entityId, layerId, logicalNodeId)
+        }
+        // Reset the panel after action
+        setAssignTarget('')
+        setSelectedIds(new Set())
+    }, [selectedIds, parseTarget, removeEntityAssignment, assignEntityToLayer, onAssignmentChange, showAssignmentWarning])
 
-        const collectChildren = (n: EntityTreeNode): string[] => {
-            return [n.id, ...n.children.flatMap(collectChildren)]
+    const handleApplyScopedRule = useCallback((targetRaw: string) => {
+        if (selectedIds.size !== 1 || !onApplyRule) return
+        const entityId = Array.from(selectedIds)[0]
+        const { layerId, logicalNodeId } = parseTarget(targetRaw)
+        if (!layerId) return
+
+        // Build the rule conditions from name + property filter. RuleCondition
+        // operators are a subset of FilterOperator that the engine evaluates,
+        // so preview semantics match enforcement.
+        const conditions: RuleCondition[] = []
+        if (filterName.trim()) {
+            conditions.push({ field: 'displayName', operator: 'contains', value: filterName.trim() })
+        }
+        if (filterField.trim() && (filterOp === 'exists' || filterValue.trim())) {
+            conditions.push({
+                field: filterField.trim(),
+                operator: filterOp,
+                value: filterOp === 'exists' ? undefined : filterValue.trim(),
+            })
         }
 
-        const originalNode = entityTree.find(function findNode(t): t is EntityTreeNode {
-            if (t.id === selectedId) return true
-            return t.children.some(findNode)
-        })
-
-        if (originalNode) {
-            const allIds = collectChildren(originalNode)
-            setSelectedIds(new Set(allIds))
+        const rule: LayerAssignmentRuleConfig = {
+            id: `rule_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            priority: 1000,
+            scopeRootUrn: entityId,
+            entityTypes: browser.typeFilter ? [browser.typeFilter] : undefined,
+            conditions: conditions.length > 0 ? conditions : undefined,
+            inheritsFromParent: true,
         }
-    }, [selectedIds, flattenedNodes, entityTree])
+        onApplyRule(layerId, logicalNodeId, rule)
+        // Reset panel state
+        setFilterName('')
+        setFilterField('')
+        setFilterValue('')
+        setAssignTarget('')
+        setPreviewCount(null)
+        setPreviewTruncated(false)
+        setSelectedIds(new Set())
+    }, [selectedIds, onApplyRule, parseTarget, filterName, filterField, filterOp, filterValue, browser.typeFilter])
+
+    // Debounced live preview of how many descendants the current filter matches.
+    useEffect(() => {
+        if (previewTimerRef.current) clearTimeout(previewTimerRef.current)
+        if (selectedIds.size !== 1 || !filterIsActive) {
+            setPreviewCount(null)
+            setPreviewTruncated(false)
+            setPreviewLoading(false)
+            return
+        }
+        const entityId = Array.from(selectedIds)[0]
+        setPreviewLoading(true)
+        previewTimerRef.current = setTimeout(async () => {
+            try {
+                const result = await browser.previewDescendants(entityId, {
+                    nameSubstring: filterName.trim() || undefined,
+                    entityTypes: browser.typeFilter ? [browser.typeFilter] : undefined,
+                    propertyFilter: filterField.trim()
+                        ? {
+                              field: filterField.trim(),
+                              operator: filterOp,
+                              value: filterOp === 'exists' ? null : filterValue.trim(),
+                          }
+                        : undefined,
+                })
+                setPreviewCount(result.total)
+                setPreviewTruncated(result.truncated)
+            } catch (err) {
+                console.error('[WizardAssignmentTree] descendant preview failed:', err)
+                setPreviewCount(null)
+                setPreviewTruncated(false)
+            } finally {
+                setPreviewLoading(false)
+            }
+        }, 300)
+        return () => {
+            if (previewTimerRef.current) clearTimeout(previewTimerRef.current)
+        }
+    }, [selectedIds, filterIsActive, filterName, filterField, filterOp, filterValue, browser])
 
     // Drag & Drop
     const handleDragStart = useCallback((e: React.DragEvent, node: EntityTreeNode) => {
@@ -890,8 +1012,8 @@ export function WizardAssignmentTree({
                         >
                             {(() => {
                                 const vis = entityVisualMap[type.toLowerCase()]
-                                const Cmp = vis?.icon ? (LucideIcons as Record<string, any>)[vis.icon] : null
-                                return Cmp ? <Cmp className="w-3 h-3" /> : <Box className="w-3 h-3" />
+                                const PillIcon = resolveEntityIcon(vis?.icon)
+                                return <PillIcon className="w-3 h-3" />
                             })()}
                             {type}
                         </button>
@@ -908,49 +1030,135 @@ export function WizardAssignmentTree({
                         exit={{ height: 0, opacity: 0 }}
                         className="overflow-hidden"
                     >
-                        <div className="flex items-center gap-3 px-4 py-3 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-900/30 dark:to-indigo-900/30 border-b border-blue-100 dark:border-blue-800">
-                            <span className="text-sm font-semibold text-blue-700 dark:text-blue-300">
-                                {selectedIds.size} selected
-                            </span>
-
-                            <div className="flex-1" />
-
-                            {selectedIds.size === 1 && (
+                        <div className="flex flex-col gap-2 px-4 py-3 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-900/30 dark:to-indigo-900/30 border-b border-blue-100 dark:border-blue-800">
+                            <div className="flex items-center gap-3">
+                                <span className="text-sm font-semibold text-blue-700 dark:text-blue-300">
+                                    {selectedIds.size} selected
+                                </span>
+                                <div className="flex-1" />
+                                {selectedIds.size === 1 && filterIsActive && (
+                                    <span className="text-xs px-2 py-1 rounded-md bg-white/70 dark:bg-slate-800/70 text-slate-600 dark:text-slate-300">
+                                        {previewLoading
+                                            ? 'Matching…'
+                                            : previewCount !== null
+                                            ? `Matches ${previewCount}${previewTruncated ? '+ (capped)' : ''} descendants`
+                                            : ''}
+                                    </span>
+                                )}
                                 <button
-                                    onClick={handleSelectAllChildren}
-                                    className="text-xs px-3 py-1.5 bg-white dark:bg-slate-800 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors"
+                                    onClick={() => setSelectedIds(new Set())}
+                                    className="p-1.5 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
                                 >
-                                    Select all children
+                                    <X className="w-4 h-4 text-blue-500" />
                                 </button>
+                            </div>
+
+                            {selectedIds.size === 1 ? (
+                                <div className="flex flex-col gap-2">
+                                    {/* Scope-by-filter inputs */}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <input
+                                            type="text"
+                                            value={filterName}
+                                            onChange={e => setFilterName(e.target.value)}
+                                            placeholder="Name contains…"
+                                            className="text-xs px-2 py-1 rounded-md bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 w-40"
+                                        />
+                                        <input
+                                            type="text"
+                                            value={filterField}
+                                            onChange={e => setFilterField(e.target.value)}
+                                            placeholder="Property field"
+                                            className="text-xs px-2 py-1 rounded-md bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 w-36"
+                                        />
+                                        <select
+                                            value={filterOp}
+                                            onChange={e => setFilterOp(e.target.value as FilterOp)}
+                                            className="text-xs px-2 py-1 rounded-md bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                                        >
+                                            <option value="equals">equals</option>
+                                            <option value="contains">contains</option>
+                                            <option value="startsWith">starts with</option>
+                                            <option value="endsWith">ends with</option>
+                                            <option value="exists">exists</option>
+                                        </select>
+                                        {filterOp !== 'exists' && (
+                                            <input
+                                                type="text"
+                                                value={filterValue}
+                                                onChange={e => setFilterValue(e.target.value)}
+                                                placeholder="Value"
+                                                className="text-xs px-2 py-1 rounded-md bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 w-36"
+                                            />
+                                        )}
+                                    </div>
+
+                                    {/* Target + action */}
+                                    <div className="flex items-center gap-2">
+                                        <select
+                                            value={assignTarget}
+                                            onChange={e => setAssignTarget(e.target.value)}
+                                            className="text-sm bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 flex-1 min-w-0"
+                                        >
+                                            <option value="">Assign to layer / group…</option>
+                                            {targetOptions.map(opt => (
+                                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                            ))}
+                                            <option value="__unassign__">Remove assignment</option>
+                                        </select>
+                                        <button
+                                            disabled={!assignTarget || (filterIsActive && !onApplyRule)}
+                                            onClick={() => {
+                                                if (assignTarget === '__unassign__') {
+                                                    handleAssignParent('')
+                                                    return
+                                                }
+                                                if (filterIsActive) {
+                                                    handleApplyScopedRule(assignTarget)
+                                                } else {
+                                                    handleAssignParent(assignTarget)
+                                                }
+                                            }}
+                                            className={cn(
+                                                'text-xs px-3 py-1.5 rounded-lg font-medium transition-colors whitespace-nowrap',
+                                                'bg-blue-500 text-white hover:bg-blue-600',
+                                                'disabled:bg-slate-200 dark:disabled:bg-slate-700 disabled:text-slate-400 disabled:cursor-not-allowed'
+                                            )}
+                                        >
+                                            {filterIsActive ? 'Apply scoped rule' : 'Assign entity & descendants'}
+                                        </button>
+                                    </div>
+                                    {filterIsActive && !onApplyRule && (
+                                        <p className="text-[11px] text-slate-500">
+                                            Filtered rule authoring is not enabled in this context.
+                                        </p>
+                                    )}
+                                </div>
+                            ) : (
+                                <div className="flex items-center gap-2">
+                                    <select
+                                        className="text-sm bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 flex-1"
+                                        defaultValue=""
+                                        onChange={e => {
+                                            const raw = e.target.value
+                                            if (!raw) return
+                                            if (raw === '__unassign__') {
+                                                handleBulkAssign('', null)
+                                            } else {
+                                                const { layerId, logicalNodeId } = parseTarget(raw)
+                                                handleBulkAssign(layerId, logicalNodeId)
+                                            }
+                                            e.target.value = ''
+                                        }}
+                                    >
+                                        <option value="">Assign to layer / group…</option>
+                                        {targetOptions.map(opt => (
+                                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                        ))}
+                                        <option value="__unassign__">Remove assignment</option>
+                                    </select>
+                                </div>
                             )}
-
-                            <select
-                                className="text-sm bg-white dark:bg-slate-800 border border-blue-200 dark:border-blue-700 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
-                                defaultValue=""
-                                onChange={e => {
-                                    if (e.target.value === '__unassign__') {
-                                        handleBulkAssign('')
-                                    } else if (e.target.value) {
-                                        handleBulkAssign(e.target.value)
-                                    }
-                                    e.target.value = ''
-                                }}
-                            >
-                                <option value="">Assign to layer...</option>
-                                {layers.map(layer => (
-                                    <option key={layer.id} value={layer.id}>
-                                        {layer.name}
-                                    </option>
-                                ))}
-                                <option value="__unassign__">Remove assignment</option>
-                            </select>
-
-                            <button
-                                onClick={() => setSelectedIds(new Set())}
-                                className="p-1.5 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-800 transition-colors"
-                            >
-                                <X className="w-4 h-4 text-blue-500" />
-                            </button>
                         </div>
                     </motion.div>
                 )}

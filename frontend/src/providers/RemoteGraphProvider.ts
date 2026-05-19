@@ -29,6 +29,8 @@ import type {
     CreateNodeResult,
     TopLevelNodesQuery,
     TopLevelNodesResult,
+    DescendantPreviewQuery,
+    DescendantPreviewResult,
 } from './GraphDataProvider'
 import type { TraceMeta } from '@/services/traceApi'
 
@@ -363,6 +365,24 @@ export class RemoteGraphProvider implements GraphDataProvider {
         }
 
         return await this.fetch(`/nodes/${encodeURIComponent(parentUrn)}/children-with-edges?${params.toString()}`, {
+            timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
+        })
+    }
+
+    async getDescendantsPreview(
+        parentUrn: URN,
+        query: DescendantPreviewQuery,
+        options?: { edgeTypes?: string[] }
+    ): Promise<DescendantPreviewResult> {
+        const search = new URLSearchParams()
+        if (options?.edgeTypes?.length) {
+            options.edgeTypes.forEach(t => search.append('edgeTypes', t))
+        }
+        const qs = search.toString()
+        const path = `/nodes/${encodeURIComponent(parentUrn)}/descendants/preview${qs ? `?${qs}` : ''}`
+        return await this.fetch<DescendantPreviewResult>(path, {
+            method: 'POST',
+            body: JSON.stringify(query),
             timeoutMs: TIMEOUTS.GET_CHILDREN_MS,
         })
     }

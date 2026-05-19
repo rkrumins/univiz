@@ -317,6 +317,20 @@ export interface PropertyFilter {
     value: unknown
 }
 
+export interface DescendantPreviewQuery {
+    nameSubstring?: string
+    entityTypes?: EntityType[]
+    propertyFilter?: PropertyFilter
+    sampleLimit?: number
+    hardCap?: number
+}
+
+export interface DescendantPreviewResult {
+    total: number
+    sample: GraphNode[]
+    truncated: boolean
+}
+
 export interface TagFilter {
     mode: 'any' | 'all' | 'none'
     tags: string[]
@@ -643,6 +657,19 @@ export interface GraphDataProvider {
         hasMore: boolean
         nextCursor?: string | null
     }>
+
+    /**
+     * Server-side preview of descendants under `parentUrn` matching the filter.
+     * Used by the ViewWizard to show "this scoped rule will match N entities"
+     * before authoring a LayerAssignmentRuleConfig. Filters mirror the
+     * backend rule semantics so the preview count reflects what the
+     * AssignmentEngine will actually resolve.
+     */
+    getDescendantsPreview(
+        parentUrn: URN,
+        query: DescendantPreviewQuery,
+        options?: { edgeTypes?: string[] }
+    ): Promise<DescendantPreviewResult>
 
     /**
      * Get parent of a node (inverse of CONTAINS)

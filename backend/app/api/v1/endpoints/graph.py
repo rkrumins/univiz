@@ -19,6 +19,7 @@ from backend.app.models.graph import (
     CreateEdgeRequest, UpdateEdgeRequest, EdgeMutationResult,
     BatchCommandRequest, BatchCommandResult, BatchResponse,
     ChildrenWithEdgesResult, TopLevelNodesResult,
+    DescendantPreviewQuery, DescendantPreviewResult,
     TraceRequest, TraceResult, ExpandRequest,
 )
 from backend.common.interfaces.provider import ProviderConfigurationError
@@ -510,6 +511,27 @@ async def get_children_with_edges(
         compute=compute,
         model_cls=ChildrenWithEdgesResult,
     )
+
+
+@router.post(
+    "/nodes/{urn}/descendants/preview",
+    response_model=DescendantPreviewResult,
+    response_model_by_alias=True,
+)
+async def preview_node_descendants(
+    urn: str,
+    query: DescendantPreviewQuery,
+    edge_types: Optional[List[str]] = Query(None, alias="edgeTypes"),
+    engine: ContextEngine = Depends(get_context_engine),
+):
+    """Server-side preview of descendants under `urn` matching the filter.
+
+    Used by the ViewWizard to show a live "this scoped rule will match N
+    entities" badge before the user authors a rule. Filters mirror the
+    semantics of LayerAssignmentRuleConfig.conditions so the preview
+    count matches what AssignmentEngine will actually resolve.
+    """
+    return await engine.get_descendants_preview(urn, query, edge_types=edge_types)
 
 
 @router.post("/search", response_model=List[GraphNode], response_model_by_alias=True)

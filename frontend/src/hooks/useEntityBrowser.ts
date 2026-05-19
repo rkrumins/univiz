@@ -31,6 +31,8 @@ import type {
     GraphDataProvider,
     GraphNode,
     EntityTypeDefinition,
+    DescendantPreviewQuery,
+    DescendantPreviewResult,
 } from '@/providers/GraphDataProvider'
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -104,6 +106,14 @@ export interface UseEntityBrowserResult {
     setSearch: (query: string) => void
     setTypeFilter: (typeId: string | null) => void
     refresh: () => Promise<void>
+
+    /**
+     * Server-side preview of descendants under `parentId` matching the
+     * filter. Used by the wizard's bulk-assign panel to show a live
+     * "matches N entities" count before the user saves a scoped rule.
+     * Does not touch selection or the lazy-loaded tree.
+     */
+    previewDescendants: (parentId: string, query: DescendantPreviewQuery) => Promise<DescendantPreviewResult>
 }
 
 // ─── Hook ───────────────────────────────────────────────────────────────────
@@ -490,6 +500,17 @@ export function useEntityBrowser(options: UseEntityBrowserOptions): UseEntityBro
         }
     }, [searchQuery, setSearch, loadTopLevel])
 
+    // ─── previewDescendants ───
+
+    const previewDescendants = useCallback(
+        async (parentId: string, query: DescendantPreviewQuery): Promise<DescendantPreviewResult> => {
+            return provider.getDescendantsPreview(parentId, query, {
+                edgeTypes: containmentEdgeTypes.length > 0 ? containmentEdgeTypes : undefined,
+            })
+        },
+        [provider, containmentEdgeTypes],
+    )
+
     // ─── refresh ───
 
     const refresh = useCallback(async () => {
@@ -528,5 +549,6 @@ export function useEntityBrowser(options: UseEntityBrowserOptions): UseEntityBro
         setSearch,
         setTypeFilter,
         refresh,
+        previewDescendants,
     }
 }

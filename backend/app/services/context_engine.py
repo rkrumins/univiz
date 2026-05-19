@@ -9,6 +9,7 @@ from ..models.graph import (
     GraphSchema, EntityTypeDefinition, RelationshipTypeDefinition, EntityVisualSchema, EntityHierarchySchema, EntityBehaviorSchema,
     RelationshipVisualSchema, FieldSchema, AggregatedEdgeRequest, AggregatedEdgeResult, AggregatedEdgeInfo,
     CreateNodeRequest, CreateNodeResult, ChildrenWithEdgesResult, TopLevelNodesResult,
+    DescendantPreviewQuery, DescendantPreviewResult,
     TraceRequest, TraceResult, ExpandRequest,
 )
 from backend.common.models.graph import (
@@ -386,6 +387,17 @@ class ContextEngine:
             search_query=search_query, limit=limit, offset=offset,
             include_lineage_edges=include_lineage_edges,
             sort_property=sort_property, cursor=cursor,
+        )
+
+    async def get_descendants_preview(
+        self,
+        urn: str,
+        query: DescendantPreviewQuery,
+        edge_types: Optional[List[str]] = None,
+    ) -> DescendantPreviewResult:
+        edge_types = await self._ensure_containment_edge_types(edge_types)
+        return await self.provider.get_descendants_preview(
+            urn, query=query, edge_types=edge_types,
         )
 
     async def get_top_level_or_orphan_nodes(

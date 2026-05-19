@@ -17,7 +17,6 @@
 
 import { useState, useCallback, useMemo } from 'react'
 import { motion, AnimatePresence, Reorder, useDragControls } from 'framer-motion'
-import * as LucideIcons from 'lucide-react'
 import {
     ChevronRight,
     ChevronDown,
@@ -29,11 +28,11 @@ import {
     FolderOpen,
     Layers,
     FolderPlus,
-    Box,
     Loader2,
     X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { resolveEntityIcon } from '@/lib/entityIcon'
 import type { ViewLayerConfig, LogicalNodeConfig, EntityAssignmentConfig } from '@/types/schema'
 import type { UseLogicalNodesReturn } from '@/hooks/useLogicalNodes'
 import { useCanvasStore } from '@/store/canvas'
@@ -168,10 +167,8 @@ function AssignedEntityItem({
         () => schemaEntityTypes.find(et => et.id.toLowerCase() === typeLower)?.visual,
         [schemaEntityTypes, typeLower]
     )
-    const icon = (() => {
-        const Cmp = visual?.icon ? (LucideIcons as Record<string, any>)[visual.icon] : null
-        return Cmp ? <Cmp className="w-3 h-3" /> : <Box className="w-3 h-3" />
-    })()
+    const TypeIcon = resolveEntityIcon(visual?.icon)
+    const icon = <TypeIcon className="w-3 h-3" />
     const color = visual?.color ?? '#94a3b8'
 
     return (

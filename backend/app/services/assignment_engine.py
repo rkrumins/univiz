@@ -6,7 +6,7 @@ from backend.app.models.graph import GraphNode, GraphEdge
 from backend.app.models.assignment import (
     LayerAssignmentRequest, LayerAssignmentResult, EntityAssignment,
     ViewLayerConfig, LayerAssignmentRuleConfig, LayerAssignmentStats,
-    EntityAssignmentConfig
+    EntityAssignmentConfig, RuleCondition, RuleOperator,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +74,8 @@ class AssignmentEngine:
             parent_assignment = assignments.get(parent_id) if parent_id else None
 
             result = self._resolve_assignment(
-                node, parent_id, parent_assignment, rule_index, request.layers, layer_sequence_map
+                node, parent_id, parent_assignment, rule_index, request.layers, layer_sequence_map,
+                parent_cache=parent_cache,
             )
 
             if result:
@@ -105,6 +106,10 @@ class AssignmentEngine:
         by_type: Dict[str, List[Tuple[str, LayerAssignmentRuleConfig]]] = {}
         by_tag: Dict[str, List[Tuple[str, LayerAssignmentRuleConfig]]] = {}
         patterns: List[Tuple[str, LayerAssignmentRuleConfig, Any]] = [] # (layerId, rule, regex)
+        # Scoped rules that match purely via scope_root_urn / conditions
+        # (no type, tag, or urn_pattern selector). These are checked for
+        # every candidate node — there is no faster index.
+        scoped: List[Tuple[str, LayerAssignmentRuleConfig]] = []
         instances: Dict[str, Tuple[str, EntityAssignmentConfig]] = {}
 
         for layer in layers:
@@ -116,18 +121,21 @@ class AssignmentEngine:
             # Index rules
             if layer.rules:
                 for rule in layer.rules:
+                    indexed = False
                     # Index by Entity Type
                     if rule.entity_types:
                         for type_ in rule.entity_types:
                             if type_ not in by_type: by_type[type_] = []
                             by_type[type_].append((layer.id, rule))
-                    
+                        indexed = True
+
                     # Index by Tag
                     if rule.tags:
                         for tag in rule.tags:
                             if tag not in by_tag: by_tag[tag] = []
                             by_tag[tag].append((layer.id, rule))
-                    
+                        indexed = True
+
                     # Compile Patterns
                     if rule.urn_pattern:
                         try:
@@ -135,9 +143,14 @@ class AssignmentEngine:
                             pattern = rule.urn_pattern.replace('.', r'\.').replace('*', '.*').replace('?', '.')
                             regex = re.compile(f"^{pattern}$", re.IGNORECASE)
                             patterns.append((layer.id, rule, regex))
+                            indexed = True
                         except Exception as e:
                             logger.warning(f"Invalid regex pattern {rule.urn_pattern}: {e}")
-            
+
+                    # Scoped-only rule: scope_root_urn and/or conditions, no selector
+                    if not indexed and (rule.scope_root_urn or rule.conditions):
+                        scoped.append((layer.id, rule))
+
             # Synthetic rules for layer.entityTypes (legacy support / basic config)
             if layer.entity_types:
                 for type_ in layer.entity_types:
@@ -154,6 +167,7 @@ class AssignmentEngine:
             "by_type": by_type,
             "by_tag": by_tag,
             "patterns": patterns,
+            "scoped": scoped,
             "instances": instances
         }
 
@@ -217,6 +231,70 @@ class AssignmentEngine:
     # Logic
     # ==========================================
 
+    def _ancestor_set(self, entity_id: str, parent_cache: Dict[str, Any]) -> Set[str]:
+        parent_map = parent_cache["parent_map"]
+        ancestors: Set[str] = set()
+        current = entity_id
+        visited: Set[str] = set()
+        while current in parent_map and current not in visited:
+            visited.add(current)
+            parent = parent_map[current]
+            ancestors.add(parent)
+            current = parent
+        return ancestors
+
+    def _match_condition(self, node: GraphNode, cond: RuleCondition) -> bool:
+        # Pull the value from node.properties first; fall back to a few
+        # common top-level fields for ergonomics so authors can target
+        # displayName / entityType / urn without prefixing "properties.".
+        field = cond.field
+        if node.properties and field in node.properties:
+            value = node.properties[field]
+        elif field == "displayName":
+            value = node.display_name
+        elif field == "entityType":
+            value = node.entity_type
+        elif field == "urn":
+            value = node.urn
+        else:
+            value = None
+
+        op = cond.operator
+        if op == RuleOperator.EXISTS:
+            return value is not None
+        if value is None:
+            # Every operator except EXISTS treats a missing field as no match.
+            return False
+
+        target = cond.value
+        if op == RuleOperator.EQUALS:
+            return value == target
+        if op == RuleOperator.NOT_EQUALS:
+            return value != target
+        sv = str(value).lower()
+        st = str(target).lower() if target is not None else ""
+        if op == RuleOperator.CONTAINS:
+            return st in sv
+        if op == RuleOperator.STARTS_WITH:
+            return sv.startswith(st)
+        if op == RuleOperator.ENDS_WITH:
+            return sv.endswith(st)
+        return False
+
+    def _rule_predicates_pass(
+        self,
+        rule: LayerAssignmentRuleConfig,
+        node: GraphNode,
+        ancestors: Set[str],
+    ) -> bool:
+        if rule.scope_root_urn and rule.scope_root_urn not in ancestors:
+            return False
+        if rule.conditions:
+            for c in rule.conditions:
+                if not self._match_condition(node, c):
+                    return False
+        return True
+
     def _resolve_assignment(
         self,
         node: GraphNode,
@@ -224,9 +302,10 @@ class AssignmentEngine:
         parent_assignment: Optional[EntityAssignment],
         index: Dict[str, Any],
         layers: List[ViewLayerConfig],
-        layer_sequence_map: Dict[str, int]
+        layer_sequence_map: Dict[str, int],
+        parent_cache: Optional[Dict[str, Any]] = None,
     ) -> Optional[EntityAssignment]:
-        
+
         entity_id = node.urn
         entity_type = node.entity_type
         entity_tags = node.tags or []
@@ -248,7 +327,7 @@ class AssignmentEngine:
             # Check if parent assignment allows inheritance (check origin rule?)
             # For simplicity, if parent is assigned, we try to inherit.
             # We assume "inheritsChildren" is true by default or checked when parent was assigned
-            
+
             # Note: We need to know if the parent matched via a rule that implies inheritance.
             # The simplified logic: If parent is assigned, child belongs to same layer unless overridden.
             return EntityAssignment(
@@ -260,24 +339,33 @@ class AssignmentEngine:
                 confidence=parent_assignment.confidence
             )
 
-        # 3. Rule Matching
+        # 3. Rule Matching — scope_root_urn and conditions gate every candidate
+        ancestors = self._ancestor_set(entity_id, parent_cache) if parent_cache else set()
         candidates = []
+
+        def _try_add(layer_id: str, rule: LayerAssignmentRuleConfig) -> None:
+            if self._rule_predicates_pass(rule, node, ancestors):
+                candidates.append((layer_id, rule, rule.priority))
 
         # 3a. Type Rules
         if entity_type in index["by_type"]:
             for layer_id, rule in index["by_type"][entity_type]:
-                candidates.append((layer_id, rule, rule.priority))
+                _try_add(layer_id, rule)
 
         # 3b. Tag Rules
         for tag in entity_tags:
             if tag in index["by_tag"]:
                 for layer_id, rule in index["by_tag"][tag]:
-                    candidates.append((layer_id, rule, rule.priority))
+                    _try_add(layer_id, rule)
 
         # 3c. Pattern Rules
         for layer_id, rule, regex in index["patterns"]:
             if regex.match(entity_id):
-                 candidates.append((layer_id, rule, rule.priority))
+                _try_add(layer_id, rule)
+
+        # 3d. Scoped-only rules (scope_root_urn / conditions, no other selector)
+        for layer_id, rule in index.get("scoped", []):
+            _try_add(layer_id, rule)
 
         # Pick Winner
         if candidates:

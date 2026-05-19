@@ -19,6 +19,7 @@ from ..models.graph import (
     OntologyMetadata, EdgeTypeMetadata, EntityTypeHierarchy,
     AggregatedEdgeResult, AggregatedEdgeInfo,
     ChildrenWithEdgesResult, TopLevelNodesResult,
+    DescendantPreviewQuery, DescendantPreviewResult,
     TraceResult, TraceFocus,
 )
 from .base import GraphDataProvider
@@ -39,6 +40,83 @@ class AggregationBatchAbort(Exception):
 def _sanitize_label(s: str) -> str:
     """Sanitize string for use as FalkorDB label/relationship type (alphanumeric + underscore)."""
     return "".join(c if c.isalnum() or c == "_" else "_" for c in str(s))
+
+
+def _build_descendant_preview_cypher(
+    rel_list: List[str],
+    name_substring: Optional[str],
+    entity_types: Optional[List[str]],
+    property_filter: Optional[PropertyFilter],
+    sample_limit: int,
+    hard_cap: int,
+) -> Tuple[str, Dict[str, Any]]:
+    """Build a recursive-descendant preview query against FalkorDB.
+
+    Returns (cypher, params). FalkorDB cannot parameterize relationship types,
+    so containment types are interpolated via _sanitize_label after being
+    sourced from the ontology (never user input). Filter field is also
+    sanitized; filter value is always parameterized.
+
+    The query returns (total, sample[..sample_limit]) in a single round-trip
+    via WITH DISTINCT d. Truncation against hard_cap is computed by the
+    caller from `total`.
+    """
+    rels = "|".join(_sanitize_label(t) for t in rel_list)
+    where_parts: List[str] = ["p.urn = $parent"]
+    params: Dict[str, Any] = {
+        "parent": "",  # set by caller
+        "sampleLimit": int(sample_limit),
+        "hardCap": int(hard_cap),
+    }
+
+    if name_substring:
+        where_parts.append(
+            "(toLower(d.displayName) CONTAINS toLower($nameSub) "
+            "OR toLower(d.urn) CONTAINS toLower($nameSub))"
+        )
+        params["nameSub"] = name_substring
+
+    if entity_types:
+        where_parts.append("d.entityType IN $entityTypes")
+        params["entityTypes"] = list(entity_types)
+
+    if property_filter is not None:
+        safe_field = _sanitize_label(property_filter.field)
+        op = property_filter.operator
+        params["pfv"] = property_filter.value
+        if op == FilterOperator.EQUALS:
+            where_parts.append(f"d.{safe_field} = $pfv")
+        elif op == FilterOperator.CONTAINS:
+            where_parts.append(f"toLower(toString(d.{safe_field})) CONTAINS toLower(toString($pfv))")
+        elif op == FilterOperator.STARTS_WITH:
+            where_parts.append(f"toLower(toString(d.{safe_field})) STARTS WITH toLower(toString($pfv))")
+        elif op == FilterOperator.ENDS_WITH:
+            where_parts.append(f"toLower(toString(d.{safe_field})) ENDS WITH toLower(toString($pfv))")
+        elif op == FilterOperator.GT:
+            where_parts.append(f"d.{safe_field} > $pfv")
+        elif op == FilterOperator.LT:
+            where_parts.append(f"d.{safe_field} < $pfv")
+        elif op == FilterOperator.IN:
+            where_parts.append(f"d.{safe_field} IN $pfv")
+        elif op == FilterOperator.NOT_IN:
+            where_parts.append(f"NOT d.{safe_field} IN $pfv")
+        elif op == FilterOperator.EXISTS:
+            where_parts.append(f"d.{safe_field} IS NOT NULL")
+            params.pop("pfv", None)
+        elif op == FilterOperator.NOT_EXISTS:
+            where_parts.append(f"d.{safe_field} IS NULL")
+            params.pop("pfv", None)
+        else:
+            raise ValueError(f"Unsupported FilterOperator: {op}")
+
+    where_clause = " AND ".join(where_parts)
+    cypher = (
+        f"MATCH (p)-[:{rels}*1..]->(d) "
+        f"WHERE {where_clause} "
+        f"WITH DISTINCT d "
+        f"RETURN count(d) AS total, collect(d)[..$sampleLimit] AS sample"
+    )
+    return cypher, params
 
 
 def _node_from_props(props: Dict[str, Any], entity_type_str: Optional[str] = None) -> Optional[GraphNode]:
@@ -1493,6 +1571,51 @@ class FalkorDBProvider(GraphDataProvider):
             totalChildren=total,
             hasMore=has_more,
             nextCursor=next_cursor,
+        )
+
+    async def get_descendants_preview(
+        self,
+        parent_urn: str,
+        query: DescendantPreviewQuery,
+        edge_types: Optional[List[str]] = None,
+    ) -> DescendantPreviewResult:
+        await self._ensure_connected()
+        target_edge_types = (
+            set(edge_types) if edge_types is not None else set(self._get_containment_edge_types())
+        )
+        rel_list = list(target_edge_types)
+        if not rel_list:
+            return DescendantPreviewResult(total=0, sample=[], truncated=False)
+
+        cypher, params = _build_descendant_preview_cypher(
+            rel_list=rel_list,
+            name_substring=query.name_substring,
+            entity_types=query.entity_types,
+            property_filter=query.property_filter,
+            sample_limit=query.sample_limit,
+            hard_cap=query.hard_cap,
+        )
+        params["parent"] = parent_urn
+
+        from ..config.resilience import FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS
+        result = await self._ro_query(
+            cypher, params=params, timeout=FALKORDB_CHILDREN_QUERY_TIMEOUT_SECS
+        )
+
+        total = 0
+        sample: List[GraphNode] = []
+        for row in (result.result_set or []):
+            total = int(row[0] or 0)
+            for raw in (row[1] or []):
+                n = self._extract_node_from_result(raw)
+                if n is not None:
+                    sample.append(n)
+            break  # single aggregate row expected
+
+        return DescendantPreviewResult(
+            total=total,
+            sample=sample,
+            truncated=total > query.hard_cap,
         )
 
     async def get_parent(self, child_urn: str) -> Optional[GraphNode]:

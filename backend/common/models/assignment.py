@@ -25,6 +25,11 @@ class LayerAssignmentRuleConfig(BaseModel):
     entity_types: Optional[List[str]] = Field(None, alias="entityTypes")
     tags: Optional[List[str]] = None
     urn_pattern: Optional[str] = Field(None, alias="urnPattern")
+    # Restricts the rule to descendants of this URN via the containment
+    # parent chain computed by AssignmentEngine. Lets a rule target
+    # "all <T> under entity P" without flattening the subtree into
+    # explicit EntityAssignmentConfig rows.
+    scope_root_urn: Optional[str] = Field(None, alias="scopeRootUrn")
     conditions: Optional[List[RuleCondition]] = None
 
     class Config:

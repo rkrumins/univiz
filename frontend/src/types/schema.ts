@@ -369,6 +369,13 @@ export interface LayerAssignmentRuleConfig {
   entityTypes?: string[];
   tags?: string[];
   urnPattern?: string;
+  /**
+   * Restricts this rule to descendants of `scopeRootUrn` via the containment
+   * parent chain computed by the backend AssignmentEngine. Lets a rule target
+   * "all <type> under entity P" without materializing per-entity
+   * EntityAssignmentConfig rows.
+   */
+  scopeRootUrn?: string;
   propertyMatch?: {
     field: string;
     operator: 'equals' | 'contains' | 'startsWith' | 'exists';

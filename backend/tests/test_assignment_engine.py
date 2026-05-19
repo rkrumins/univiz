@@ -10,9 +10,11 @@ from backend.app.services.assignment_engine import AssignmentEngine
 from backend.common.models.assignment import (
     EntityAssignmentConfig,
     LayerAssignmentRuleConfig,
+    RuleCondition,
+    RuleOperator,
     ViewLayerConfig,
 )
-from backend.common.models.graph import GraphEdge
+from backend.common.models.graph import GraphEdge, GraphNode
 
 
 # ---------------------------------------------------------------------------
@@ -172,3 +174,204 @@ class TestBuildRuleIndex:
         assert index["by_tag"] == {}
         assert index["patterns"] == []
         assert index["instances"] == {}
+        assert index["scoped"] == []
+
+    def test_scope_only_rule_lands_in_scoped_bucket(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r-scope", priority=10, scopeRootUrn="urn:p"
+        )
+        layer = ViewLayerConfig(
+            id="L1", name="L1", color="#fff", order=0, rules=[rule]
+        )
+        index = self.engine._build_rule_index([layer])
+        assert ("L1", rule) in index["scoped"]
+        assert index["by_type"] == {} and index["by_tag"] == {} and index["patterns"] == []
+
+
+# ---------------------------------------------------------------------------
+# _match_condition / _rule_predicates_pass
+# ---------------------------------------------------------------------------
+
+
+def _node(urn: str, *, entity_type: str = "dataset", display_name: str = "n",
+          properties=None, tags=None) -> GraphNode:
+    return GraphNode(
+        urn=urn,
+        entityType=entity_type,
+        displayName=display_name,
+        properties=properties or {},
+        tags=tags or [],
+    )
+
+
+class TestMatchCondition:
+    def setup_method(self):
+        self.engine = AssignmentEngine()
+
+    def test_equals_on_property(self):
+        node = _node("urn:a", properties={"owner": "team-a"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.EQUALS, value="team-a")
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_not_equals_on_property(self):
+        node = _node("urn:a", properties={"owner": "team-a"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.NOT_EQUALS, value="team-b")
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_contains_case_insensitive(self):
+        node = _node("urn:a", properties={"owner": "Team-Alpha"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.CONTAINS, value="alpha")
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_starts_with(self):
+        node = _node("urn:a", properties={"owner": "team-a"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.STARTS_WITH, value="team")
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_ends_with(self):
+        node = _node("urn:a", properties={"owner": "team-a"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.ENDS_WITH, value="-a")
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_exists_true_when_property_present(self):
+        node = _node("urn:a", properties={"owner": "team-a"})
+        cond = RuleCondition(field="owner", operator=RuleOperator.EXISTS)
+        assert self.engine._match_condition(node, cond) is True
+
+    def test_exists_false_when_missing(self):
+        node = _node("urn:a")
+        cond = RuleCondition(field="owner", operator=RuleOperator.EXISTS)
+        assert self.engine._match_condition(node, cond) is False
+
+    def test_missing_property_is_no_match_for_non_exists(self):
+        node = _node("urn:a")
+        cond = RuleCondition(field="owner", operator=RuleOperator.EQUALS, value="team-a")
+        assert self.engine._match_condition(node, cond) is False
+
+    def test_field_falls_back_to_displayName(self):
+        node = _node("urn:a", display_name="Foo")
+        cond = RuleCondition(field="displayName", operator=RuleOperator.EQUALS, value="Foo")
+        assert self.engine._match_condition(node, cond) is True
+
+
+class TestRulePredicatesPass:
+    def setup_method(self):
+        self.engine = AssignmentEngine()
+
+    def test_scope_requires_ancestor_match(self):
+        rule = LayerAssignmentRuleConfig(id="r", priority=1, scopeRootUrn="urn:p")
+        node = _node("urn:c")
+        assert self.engine._rule_predicates_pass(rule, node, ancestors=set()) is False
+        assert self.engine._rule_predicates_pass(rule, node, ancestors={"urn:p"}) is True
+
+    def test_conditions_all_must_pass(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r", priority=1,
+            conditions=[
+                RuleCondition(field="owner", operator=RuleOperator.EQUALS, value="team-a"),
+                RuleCondition(field="env", operator=RuleOperator.EQUALS, value="prod"),
+            ],
+        )
+        n_match = _node("urn:c", properties={"owner": "team-a", "env": "prod"})
+        n_partial = _node("urn:c", properties={"owner": "team-a", "env": "dev"})
+        assert self.engine._rule_predicates_pass(rule, n_match, ancestors=set()) is True
+        assert self.engine._rule_predicates_pass(rule, n_partial, ancestors=set()) is False
+
+    def test_scope_and_conditions_combined(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r", priority=1, scopeRootUrn="urn:p",
+            conditions=[RuleCondition(field="owner", operator=RuleOperator.EQUALS, value="team-a")],
+        )
+        node = _node("urn:c", properties={"owner": "team-a"})
+        assert self.engine._rule_predicates_pass(rule, node, ancestors={"urn:p"}) is True
+        assert self.engine._rule_predicates_pass(rule, node, ancestors=set()) is False
+
+
+# ---------------------------------------------------------------------------
+# _resolve_assignment — scoped/conditions interaction with inheritance
+# ---------------------------------------------------------------------------
+
+
+class TestResolveAssignmentScoped:
+    def setup_method(self):
+        self.engine = AssignmentEngine()
+
+    def _index(self, layers):
+        return self.engine._build_rule_index(layers)
+
+    def test_scoped_rule_assigns_descendant(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r1", priority=100, entityTypes=["dataset"], scopeRootUrn="urn:p",
+        )
+        layer = ViewLayerConfig(id="L1", name="L1", color="#fff", order=0, rules=[rule])
+        index = self._index([layer])
+        parent_cache = {"parent_map": {"urn:c": "urn:p"}}
+        node = _node("urn:c", entity_type="dataset")
+        result = self.engine._resolve_assignment(
+            node, parent_id="urn:p", parent_assignment=None,
+            index=index, layers=[layer], layer_sequence_map={"L1": 0},
+            parent_cache=parent_cache,
+        )
+        assert result is not None and result.layer_id == "L1" and result.rule_id == "r1"
+
+    def test_scoped_rule_skips_non_descendant(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r1", priority=100, entityTypes=["dataset"], scopeRootUrn="urn:p",
+        )
+        layer = ViewLayerConfig(id="L1", name="L1", color="#fff", order=0, rules=[rule])
+        index = self._index([layer])
+        parent_cache = {"parent_map": {}}
+        node = _node("urn:other", entity_type="dataset")
+        result = self.engine._resolve_assignment(
+            node, parent_id=None, parent_assignment=None,
+            index=index, layers=[layer], layer_sequence_map={"L1": 0},
+            parent_cache=parent_cache,
+        )
+        # Falls back to default (first layer at confidence 0.5), not the scoped rule.
+        assert result is not None and result.rule_id is None and result.confidence == 0.5
+
+    def test_conditions_filter_rule_match(self):
+        rule = LayerAssignmentRuleConfig(
+            id="r1", priority=100, entityTypes=["dataset"], scopeRootUrn="urn:p",
+            conditions=[RuleCondition(field="owner", operator=RuleOperator.EQUALS, value="team-a")],
+        )
+        layer = ViewLayerConfig(id="L1", name="L1", color="#fff", order=0, rules=[rule])
+        index = self._index([layer])
+        parent_cache = {"parent_map": {"urn:c": "urn:p"}}
+        n_match = _node("urn:c", entity_type="dataset", properties={"owner": "team-a"})
+        n_skip = _node("urn:c2", entity_type="dataset", properties={"owner": "team-b"})
+        r1 = self.engine._resolve_assignment(
+            n_match, parent_id="urn:p", parent_assignment=None,
+            index=index, layers=[layer], layer_sequence_map={"L1": 0},
+            parent_cache={"parent_map": {"urn:c": "urn:p"}},
+        )
+        r2 = self.engine._resolve_assignment(
+            n_skip, parent_id="urn:p", parent_assignment=None,
+            index=index, layers=[layer], layer_sequence_map={"L1": 0},
+            parent_cache={"parent_map": {"urn:c2": "urn:p"}},
+        )
+        assert r1.rule_id == "r1"
+        assert r2.rule_id is None  # filtered out, falls to default
+
+    def test_inheritance_pre_empts_scoped_rule(self):
+        # If the parent is assigned, the child inherits before rules are consulted —
+        # documented intended interaction.
+        from backend.common.models.assignment import EntityAssignment
+        rule = LayerAssignmentRuleConfig(
+            id="r1", priority=100, entityTypes=["dataset"], scopeRootUrn="urn:p",
+        )
+        layer_a = ViewLayerConfig(id="LA", name="LA", color="#fff", order=0)
+        layer_b = ViewLayerConfig(id="LB", name="LB", color="#000", order=1, rules=[rule])
+        index = self._index([layer_a, layer_b])
+        parent_cache = {"parent_map": {"urn:c": "urn:p"}}
+        parent_assignment = EntityAssignment(
+            entityId="urn:p", layerId="LA", isInherited=False, confidence=1.0
+        )
+        node = _node("urn:c", entity_type="dataset")
+        result = self.engine._resolve_assignment(
+            node, parent_id="urn:p", parent_assignment=parent_assignment,
+            index=index, layers=[layer_a, layer_b], layer_sequence_map={"LA": 0, "LB": 1},
+            parent_cache=parent_cache,
+        )
+        # Inherits from parent (LA), not the scoped rule's LB
+        assert result is not None and result.layer_id == "LA" and result.is_inherited is True

@@ -13,6 +13,7 @@ import { useReferenceModelStore } from '@/store/referenceModelStore'
 import { useCanvasStore } from '@/store/canvas'
 import { useContainmentEdgeTypes, normalizeEdgeType, isContainmentEdgeType } from '@/store/schema'
 import type { AssignmentStepProps } from './AssignmentStep'
+import type { LogicalNodeConfig, LayerAssignmentRuleConfig } from '@/types/schema'
 
 export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentStepProps) {
     // NOTE: We intentionally do NOT sync formData.layers to the store here.
@@ -109,7 +110,7 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
     } | null>(null)
 
     /** Commit entity + descendants to a layer (local formData only) */
-    const commitAssignment = useCallback((entityIds: string[], descendantsToMove: string[], layerId: string) => {
+    const commitAssignment = useCallback((entityIds: string[], descendantsToMove: string[], layerId: string, logicalNodeId?: string | null) => {
         if (!formData.layers) return
         const allMovedIds = new Set([...entityIds, ...descendantsToMove])
         const updatedLayers = formData.layers.map(layer => {
@@ -119,8 +120,8 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
                     ...layer,
                     entityAssignments: [
                         ...filtered,
-                        ...entityIds.map(id => ({ entityId: id, layerId: layer.id, inheritsChildren: true, priority: 1000, assignedBy: 'user' as const, assignedAt: new Date().toISOString() })),
-                        ...descendantsToMove.map(dId => ({ entityId: dId, layerId: layer.id, inheritsChildren: true, priority: 999, assignedBy: 'rule' as const, assignedAt: new Date().toISOString() })),
+                        ...entityIds.map(id => ({ entityId: id, layerId: layer.id, logicalNodeId: logicalNodeId ?? undefined, inheritsChildren: true, priority: 1000, assignedBy: 'user' as const, assignedAt: new Date().toISOString() })),
+                        ...descendantsToMove.map(dId => ({ entityId: dId, layerId: layer.id, logicalNodeId: logicalNodeId ?? undefined, inheritsChildren: true, priority: 999, assignedBy: 'rule' as const, assignedAt: new Date().toISOString() })),
                     ],
                 }
             }
@@ -130,9 +131,9 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
     }, [formData.layers, updateFormData])
 
     /** Show confirmation dialog if descendants need moving, otherwise commit immediately */
-    const confirmOrCommit = useCallback((entityIds: string[], descendantsToMove: string[], layerId: string) => {
+    const confirmOrCommit = useCallback((entityIds: string[], descendantsToMove: string[], layerId: string, logicalNodeId?: string | null) => {
         if (descendantsToMove.length === 0) {
-            commitAssignment(entityIds, [], layerId)
+            commitAssignment(entityIds, [], layerId, logicalNodeId)
             return
         }
         const info: ChildReassignInfo = {
@@ -145,11 +146,11 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
         }
         setPendingReassign({
             info,
-            commit: () => { commitAssignment(entityIds, descendantsToMove, layerId); setPendingReassign(null) },
+            commit: () => { commitAssignment(entityIds, descendantsToMove, layerId, logicalNodeId); setPendingReassign(null) },
         })
     }, [commitAssignment, nodeNameMap, layerAssignmentMap])
 
-    const handleAssignmentChange = useCallback((entityId: string, layerId: string | null) => {
+    const handleAssignmentChange = useCallback((entityId: string, layerId: string | null, logicalNodeId?: string | null) => {
         if (!formData.layers) return
 
         if (layerId) {
@@ -167,11 +168,11 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
         if (!layerId) {
             commitAssignment([entityId], [], '')
         } else {
-            confirmOrCommit([entityId], descendantsToMove, layerId)
+            confirmOrCommit([entityId], descendantsToMove, layerId, logicalNodeId)
         }
     }, [formData.layers, parentMap, layerAssignmentMap, getDescendantsInDifferentLayer, showAssignmentWarning, confirmOrCommit, commitAssignment])
 
-    const handleBulkAssignment = useCallback((layerId: string, entityIds: string[]) => {
+    const handleBulkAssignment = useCallback((layerId: string, entityIds: string[], logicalNodeId?: string | null) => {
         if (!formData.layers) return
 
         const allowed = entityIds.filter(id => {
@@ -189,8 +190,30 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
         const allDescendantsToMove: string[] = []
         allowed.forEach(id => allDescendantsToMove.push(...getDescendantsInDifferentLayer(id, layerId)))
 
-        confirmOrCommit(allowed, allDescendantsToMove, layerId)
+        confirmOrCommit(allowed, allDescendantsToMove, layerId, logicalNodeId)
     }, [formData.layers, parentMap, layerAssignmentMap, getDescendantsInDifferentLayer, showAssignmentWarning, confirmOrCommit])
+
+    /** Append a scoped rule to a layer (or to a logical node within a layer). */
+    const handleApplyRule = useCallback((layerId: string, logicalNodeId: string | null, rule: LayerAssignmentRuleConfig) => {
+        if (!formData.layers) return
+        const attachToLogicalNode = (nodes: LogicalNodeConfig[] | undefined): LogicalNodeConfig[] | undefined => {
+            if (!nodes) return nodes
+            return nodes.map(n => {
+                if (n.id === logicalNodeId) {
+                    return { ...n, rules: [...(n.rules ?? []), rule] }
+                }
+                return { ...n, children: attachToLogicalNode(n.children) }
+            })
+        }
+        const updatedLayers = formData.layers.map(layer => {
+            if (layer.id !== layerId) return layer
+            if (logicalNodeId) {
+                return { ...layer, logicalNodes: attachToLogicalNode(layer.logicalNodes) }
+            }
+            return { ...layer, rules: [...(layer.rules ?? []), rule] }
+        })
+        updateFormData({ layers: updatedLayers })
+    }, [formData.layers, updateFormData])
 
     return (
         <div className="flex flex-col h-[650px] gap-2">
@@ -207,6 +230,7 @@ export function AssignmentStepLegacy({ formData, updateFormData }: AssignmentSte
                         layers={formData.layers || []}
                         onAssignmentChange={handleAssignmentChange}
                         onBulkAssign={handleBulkAssignment}
+                        onApplyRule={handleApplyRule}
                         onParentMapChange={setBrowserParentMap}
                         className="h-full"
                     />
